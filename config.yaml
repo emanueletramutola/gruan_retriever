@@ -1,0 +1,54 @@
+# File paths for different radiosonde data types
+paths:
+  rs92: "/Data/GRUAN/RS92-GDP_002"  # Root directory for RS92 radiosonde data files
+  rs41: "/Data/GRUAN/RS41-GDP_001"  # Root directory for RS41 radiosonde data files
+  ims100: "/Data/GRUAN/IMS-100-GDP_002"  # Root directory for ims100 radiosonde data files
+  rs11g: "/Data/GRUAN/RS-11G-GDP_001"  # Root directory for RS11G radiosonde data files
+
+# Database connection configuration
+database:
+  configuration:
+    dbname: "gruan"               # PostgreSQL database name
+    user: "gruan_user"            # Database username
+    password: "${GRUAN_USER_PSW}" # Database password from environment variable
+    host: "localhost"             # Database server host
+    port: 5432                    # Database server port
+
+  # Table names for different radiosonde types
+  table_names:
+    rs41: [ "header", "data" ]
+    rs92: [ "header", "data" ]
+    rs11g: [ "header", "data" ]
+    ims100: [ "header", "data" ]
+
+# Logging configuration
+logging:
+  version: 1  # Logging configuration version
+  disable_existing_loggers: False  # Keep existing loggers enabled
+
+  # Log message format definitions
+  formatters:
+    standard:
+      format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"  # Standard log format with timestamp, level, logger name and message
+
+  # Log output handlers
+  handlers:
+    console:
+      class: logging.StreamHandler  # Output to console/stdout
+      formatter: standard           # Use standard formatter
+      level: INFO                   # Minimum log level: INFO
+      stream: ext://sys.stdout      # Output stream
+
+    file:
+      class: logging.FileHandler    # Output to file
+      formatter: standard           # Use standard formatter
+      level: INFO                   # Minimum log level: INFO
+      filename: "gruan_retriever.log"  # Log file name
+      mode: "a"                     # Append mode (do not overwrite existing log)
+
+  # Logger configurations
+  loggers:
+    "": # Root logger configuration (applies to all loggers)
+      level: INFO                    # Minimum log level for all loggers
+      handlers: [ console, file ]      # Use both console and file handlers
+      propagate: no                  # Prevent log messages from propagating to root logger

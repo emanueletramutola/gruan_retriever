@@ -1,0 +1,233 @@
+global_attributes:
+  contactemail: https://support.ecmwf.int
+  licence_list:
+    - 20180314_Copernicus_License_V1.1
+    - gruan-data-policy
+  responsible_organisation: ECMWF
+sources:
+  GRUAN:
+    cdm_mapping:
+      melt_columns:
+        uncertainty:
+          total_uncertainty:
+          - name: pressure_total_uncertainty
+            main_variable: pressure
+            units: Pa
+          - name: air_temperature_total_uncertainty
+            main_variable: air_temperature
+            units: K
+          - name: altitude_total_uncertainty
+            main_variable: altitude
+            units: m
+          - name: relative_humidity_total_uncertainty
+            main_variable: relative_humidity
+            units: '%'
+          - name: shortwave_radiation_total_uncertainty
+            main_variable: shortwave_radiation
+            units: W m-2
+          - name: wind_from_direction_total_uncertainty
+            main_variable: wind_from_direction
+            units: degree
+          - name: wind_speed_total_uncertainty
+            main_variable: wind_speed
+            units: m s-1
+          random_uncertainty:
+          - name: air_temperature_random_uncertainty
+            main_variable: air_temperature
+            units: K
+          - name: relative_humidity_random_uncertainty
+            main_variable: relative_humidity
+            units: '%'
+          systematic_uncertainty:
+          - name: air_temperature_systematic_uncertainty
+            main_variable: air_temperature
+            units: K
+          - name: relative_humidity_systematic_uncertainty
+            main_variable: relative_humidity
+            units: '%'
+
+      rename:
+        alt: altitude
+        asc_: vertical_speed_of_radiosonde
+        date_of_observation: report_timestamp
+        fp: frost_point_temperature
+        g_general_site_code: primary_station_id
+        g_measuring_system_altitude: height_of_station_above_sea_level
+        geopot: geopotential_height
+        gruan_data_header_id: report_id
+        lat: latitude|observations_table
+        lon: longitude|observations_table
+        g_measuring_system_latitude: latitude|station_configuration
+        g_measuring_system_longitude: longitude|station_configuration
+        press: pressure
+        res_rh: air_relative_humidity_effective_vertical_resolution
+        rh: relative_humidity
+        swrad: shortwave_radiation
+        temp: air_temperature
+        time: time_since_launch
+        u: eastward_wind_speed
+        u_alt: altitude_total_uncertainty
+        u_cor_rh: relative_humidity_systematic_uncertainty
+        u_cor_temp: air_temperature_systematic_uncertainty
+        u_press: pressure_total_uncertainty
+        u_rh: relative_humidity_total_uncertainty
+        u_std_rh: relative_humidity_random_uncertainty
+        u_std_temp: air_temperature_random_uncertainty
+        u_swrad: shortwave_radiation_total_uncertainty
+        u_temp: air_temperature_total_uncertainty
+        u_wdir: wind_from_direction_total_uncertainty
+        u_wspeed: wind_speed_total_uncertainty
+        v: northward_wind_speed
+        wdir: wind_from_direction
+        wspeed: wind_speed
+        wvmr: water_vapour_mixing_ratio
+    header_table: gruan_data_header
+    join_ids:
+      data: gruan_data_header_id
+      header: g_product_id
+    data_table: gruan_data_value
+    main_variables:
+    - air_temperature
+    - relative_humidity
+    - wind_from_direction
+    - wind_speed
+    - eastward_wind_speed
+    - northward_wind_speed
+    - water_vapour_mixing_ratio
+    - vertical_speed_of_radiosonde
+    - geopotential_height
+    - frost_point_temperature
+    - air_relative_humidity_effective_vertical_resolution
+    - shortwave_radiation
+    - altitude
+    - pressure
+    - time_since_launch
+    descriptions:
+      pressure:
+        description: Barometric air pressure using silicon sensor up to 15.4 km, derived from GPS-altitude above
+        dtype: float32
+        units: Pa
+      uncertainty_valueN:
+        description: "Uncertainty value N. Available uncertainty types are: 1 (random), 2 (systematic) and 5  (total)"
+        dtype: float32
+        units: Defined in uncertainty_unitsN
+      uncertainty_typeN:
+        description: Uncertainty type N
+        dtype: uint8
+      uncertainty_unitsN:
+        description: Units for uncertainty type N.
+        dtype: object
+      air_relative_humidity_effective_vertical_resolution:
+        description: Resolution (defined by 1 / cut-off frequency) of the relative humidity time in terms
+        dtype: float32
+        units: s
+      air_temperature:
+        description: Temperature in the atmosphere at the observed height. Temperature measured in Kelvin can be converted to degrees Celsius by subtracting 273.15. Its uncertainty is estimated with a GRUAN correction scheme.
+        dtype: float32
+        units: K
+      altitude:
+        description: Geometric altitude above sea level calculated from air pressure and GPS altitude
+        dtype: float32
+        units: m
+      eastward_wind_speed:
+        description: Wind towards the east
+        dtype: float32
+        units: m s-1
+      frost_point_temperature:
+        description: Frost point temperature calculated from relative_humidity  using vapor pressure formula HylandWexler based on the water vapor HylandWexler pressure fomula, corrected by GRUAN correction scheme
+        dtype: float32
+        units: K
+      geopotential_height:
+        description: Geopotential altitude from corrected pressure product
+        dtype: float32
+        units: m
+      height_of_station_above_sea_level:
+        description: altitude above means sea level [....reference...]
+        dtype: float32
+      latitude|station_configuration:
+        description: Latitude deg. North
+        dtype: float32
+        units: degree_north
+      longitude|station_configuration:
+        description: Longitude deg. Est
+        dtype: float32
+        units: degree_east
+      latitude|observations_table:
+        description: Latitude deg. North
+        dtype: float32
+        units: degree_north
+      longitude|observations_table:
+        description: Longitude deg. Est
+        dtype: float32
+        units: degree_east
+      northward_wind_speed:
+        description: Wind towards the north
+        dtype: float32
+        units: m s-1
+      relative_humidity:
+        description: Relative humidity collated from U1 and U2 based on the water vapor HylandWexler pressure fomula, corrected by GRUAN correction scheme
+        dtype: float32
+        units: '%'
+      report_id:
+        description: Identifier in the GRUAN meta-database
+        dtype: object
+      report_timestamp:
+        description: observation date time UTC
+        dtype: datetime64[ns]
+      shortwave_radiation:
+        description: Short wave radiation field (actinic flux) derived from model for given sun elevation (mean between a cloudy and cloudfree case)
+        dtype: float32
+        units: W m-2
+      primary_station_id:
+        description: station identifier according to [...to_do...]
+        dtype: object
+      time_since_launch:
+        description: Time after launch
+        dtype: float32
+        units: s
+      vertical_speed_of_radiosonde:
+        description: the ascent speed radiosonde calculated from altitude
+        dtype: float32
+        units: m s-1
+      water_vapour_mixing_ratio:
+        description: Volume mixing ratio (mol/mol) of water vapor calculated from relative_humidity  using vapor pressure formula HylandWexler based on the water vapor HylandWexler pressure fomula, corrected by GRUAN correction scheme
+        dtype: float32
+        units: mol mol-1
+      wind_from_direction:
+        description: "Wind direction with 0°:north, 90°:east, 180°:south, 270°:west"
+        dtype: float32
+        units: degree
+      wind_speed:
+        description: Wind speed
+        dtype: float32
+        units: m s-1
+      z_coordinate:
+        description: z coordinate of observation
+        dtype: float32
+        units: m
+      z_coordinate_type:
+        description: Type of z coordinate
+        dtype: uint8
+    space_columns:
+      z: altitude
+      y: latitude|station_configuration
+      x: longitude|station_configuration
+    header_columns:
+    - primary_station_id
+    - report_timestamp
+    - height_of_station_above_sea_level
+    - latitude|station_configuration
+    - longitude|station_configuration
+    columns_to_drop:
+    - cor_temp
+    - cor_rh
+    mandatory_columns:
+    - primary_station_id
+    - report_timestamp
+    - time_since_launch
+    - report_id
+    - height_of_station_above_sea_level
+    - latitude|station_configuration
+    - latitude|station_configuration
+    - air_pressure
+    - air_pressure_total_uncertainty

@@ -1,0 +1,13 @@
+beautifulsoup4
+requests
+numpy
+pandas
+netCDF4
+sqlalchemy
+psycopg2
+pyyaml
+pytest
+pytest-mock
+pytest-cov
+pytest-asyncio
+psutil

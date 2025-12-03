@@ -1,0 +1,6 @@
+[flake8]
+exclude =
+	.idea
+	.venv
+	__pycache__
+	.pytest_cache
