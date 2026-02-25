@@ -2,9 +2,9 @@
 
 **Project / Activity Name:** GRUAN Radiosonde Data Processing System
 
-**Version:** 1.0.0
-
+**Document Version:** 1.0.1
 **Date:** 2025-12-03
+**Last Updated:** 2026-02-25
 
 **Author(s):** Emanuele Tramutola - CNR, C.I.A.O. Research Group, IMAA Institute, Tito Scalo (PZ), Italy
 
@@ -497,9 +497,3 @@ Contributions are welcome. Please ensure tests pass before submitting changes.
 - [x] Example datasets or data access instructions provided
 - [x] Citation information provided (if applicable)
 - [x] Technical specifications documented
-
----
-
-**Document Version:** 1.0.1
-**Date:** 2025-12-03
-**Last Updated:** 2026-02-25
