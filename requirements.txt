@@ -11,3 +11,5 @@ pytest-mock
 pytest-cov
 pytest-asyncio
 psutil
+metpy
+scipy

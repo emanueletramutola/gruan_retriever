@@ -1,8 +1,11 @@
 # ECMWF Software with Documentation (SD) Deliverable
 
 **Project / Activity Name:** GRUAN Radiosonde Data Processing System
+
 **Version:** 1.0.0
+
 **Date:** 2025-12-03
+
 **Author(s):** Emanuele Tramutola - CNR, C.I.A.O. Research Group, IMAA Institute, Tito Scalo (PZ), Italy
 
 ---
@@ -82,6 +85,8 @@ git clone git@github.com:emanueletramutola/gruan_retriever.git
 | `psycopg2` | PostgreSQL adapter |
 | `pyyaml` | Configuration file parsing |
 | `psutil` | System resource monitoring |
+| `metpy` | Atmospheric thermodynamics calculations |
+| `scipy` | Signal processing (smoothing) |
 
 **External Data Requirements:**
 
@@ -241,7 +246,113 @@ update_station_database()
 
 ---
 
-## 8. Automatic Tests
+## 8. Atmospheric Diagnostics Module
+
+The software includes a dedicated module for computing a wide range of thermodynamic and stability indices from radiosonde profiles. This module can be used independently after data retrieval (e.g., from the database or directly from NetCDF files) to derive quantities such as CAPE, CIN, LCL, LFC, EL, precipitable water, wind shear, and cloud base heights.
+
+### Dependencies
+
+The module relies on:
+- `numpy` – numerical operations
+- `scipy.ndimage.uniform_filter1d` – smoothing
+- `metpy` – unit-aware atmospheric calculations
+
+These libraries are included in `requirements.txt`.
+
+### Module Overview
+
+The module is designed to be imported and used in a Python script or interactive session. All inputs must be provided as **MetPy Quantities** with appropriate units.
+
+#### Utility Functions
+
+- `smooth(x, n=5)` – applies a uniform moving average filter to array `x` (size `n`) with `'nearest'` boundary handling.
+- `ensure_monotonic(p, *args)` – sorts all arrays in descending order of pressure `p` (high to low), ensuring monotonic profiles.
+
+#### Core Thermodynamics
+
+- `compute_basic_thermo(p, T, RH)` – returns dewpoint (`Td`), potential temperature (`theta`), and equivalent potential temperature (`theta_e`).
+
+#### Convection & Parcel Diagnostics
+
+- `compute_parcel_diagnostics(p, T, Td)` – computes the parcel profile, LCL, LFC, EL, CAPE, and CIN using the surface parcel (first level).
+
+#### Instability Indices
+
+- `compute_indices(p, T, Td)` – returns Lifted Index, K‑Index, Total Totals Index, and Showalter Index.
+
+#### Tropopause
+
+- `compute_tropopause(p, T)` – estimates the tropopause pressure and temperature.
+
+#### Wind Diagnostics
+
+- `compute_wind(p, z, u, v)` – calculates bulk wind shear over 0‑1 km, 0‑3 km, 0‑6 km and storm‑relative helicity (SRH) in the 0‑3 km layer.
+
+#### Other Diagnostics
+
+- `compute_misc(p, T, Td)` – precipitable water (PWAT) and the index of the first freezing level.
+
+#### Cloud Base Height
+
+Two methods are provided:
+- `cloud_base_low(z, RH, zmax=3000*m, rh_crit=0.95)` – finds the lowest level below `zmax` where relative humidity exceeds `rh_crit`.
+- `cloud_base_zhang(z, RH, T, zmin=4000*m, rh_min=0.75)` – applies a smoothed RH profile and detects local maxima above `zmin` (based on Zhang et al. 2010).
+
+The function `cloud_base_height(z, RH, T)` combines both, returning the cloud base height and a description of the method used.
+
+#### Master Function
+
+- `full_sounding_diagnostics(p, T, RH, u, v, z)` – orchestrates all calculations and returns a comprehensive dictionary with the following keys:
+  - `"Thermo"` – `Td`, `Theta`, `Theta_e`
+  - `"Parcel"` – parcel profile, LCL, LFC, EL, CAPE, CIN
+  - `"Indices"` – Lifted, K, Total Totals, Showalter
+  - `"Tropopause"` – tropopause pressure and temperature
+  - `"Wind"` – shear and SRH
+  - `"Misc"` – PWAT, freezing level index
+  - `"CloudBase"` – height and type
+
+### Usage Example
+
+After retrieving a profile from the database (or reading a NetCDF file), you can compute the diagnostics as follows:
+
+```python
+import numpy as np
+from metpy.units import units
+from utils.sounding_diagnostics import full_sounding_diagnostics   # module name suggested for integration
+
+# Example data (normally read from your data source)
+pressure = np.array([1000, 925, 850, 700, 500]) * units.hPa
+temperature = np.array([20, 15, 10, 0, -20]) * units.degC
+relative_humidity = np.array([80, 70, 60, 50, 40]) / 100.0   # dimensionless
+u_wind = np.array([5, 10, 15, 20, 25]) * units('m/s')
+v_wind = np.array([0, 2, 4, 6, 8]) * units('m/s')
+height = np.array([100, 1000, 2000, 3000, 5000]) * units.m
+
+results = full_sounding_diagnostics(
+    p=pressure,
+    T=temperature,
+    RH=relative_humidity,
+    u=u_wind,
+    v=v_wind,
+    z=height
+)
+
+# Access specific results
+print(f"CAPE: {results['Parcel']['CAPE']:.0f}")
+print(f"CIN: {results['Parcel']['CIN']:.0f}")
+print(f"Cloud base: {results['CloudBase']['Height']} ({results['CloudBase']['Type']})")
+print(f"Tropopause pressure: {results['Tropopause'][0]:.1f}")
+```
+
+The returned quantities are MetPy Quantities, so they retain units and can be converted or formatted as needed.
+
+### Integration with the Data Processing Pipeline
+
+While the module is independent, it can be seamlessly integrated into the main processing workflow. For instance, after importing a radiosonde file, you could call `full_sounding_diagnostics` on the retrieved profile and store the derived indices in separate database tables. Users are encouraged to adapt the module to their specific post‑processing needs.
+
+---
+
+## 9. Automatic Tests
 
 ### Purpose
 
@@ -319,7 +430,7 @@ tests/test_station_manager.py::TestStationManager::test_update_station_database 
 
 ---
 
-## 9. Known Limitations
+## 10. Known Limitations
 
 ### Current Limitations
 
@@ -337,7 +448,7 @@ See the issue tracker for a complete list of known bugs.
 
 ---
 
-## 10. Documentation Summary
+## 11. Documentation Summary
 
 ### Available Documentation
 
@@ -350,7 +461,7 @@ See the issue tracker for a complete list of known bugs.
 
 ---
 
-## 11. Support and Contact
+## 12. Support and Contact
 
 ### Reporting Issues
 
@@ -370,7 +481,7 @@ Contributions are welcome. Please ensure tests pass before submitting changes.
 
 ---
 
-## 12. Deliverable Compliance
+## 13. Deliverable Compliance
 
 - [x] Software placed in public repository
 - [x] Complete source code included
@@ -389,6 +500,6 @@ Contributions are welcome. Please ensure tests pass before submitting changes.
 
 ---
 
-**Document Version:** 1.0.0
+**Document Version:** 1.0.1
 **Date:** 2025-12-03
-**Last Updated:** 2025-12-03
+**Last Updated:** 2026-02-25
