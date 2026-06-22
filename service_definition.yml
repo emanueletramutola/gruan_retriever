@@ -1,0 +1,174 @@
+name: insitu-observations-gruan-reference-network
+lat_tile_size: 10.0
+lon_tile_size: 10.0
+reader: cdsobs.ingestion.readers.netcdf.read_flat_netcdfs
+reader_extra_args:
+  input_path: "/Data/owncloud/src/gruan_retriever/output/"
+global_attributes:
+  contactemail: https://support.ecmwf.int
+  licence_list: 20180314_Copernicus_License_V1.1
+  responsible_organisation: ECMWF
+sources:
+  GRUAN:
+    cdm_mapping: {}
+    data_table: gruan_data
+    main_variables:
+      - air_relative_humidity_effective_vertical_resolution
+      - air_temperature
+      - altitude
+      - eastward_wind_speed
+      - frost_point_temperature
+      - geopotential_height
+      - northward_wind_speed
+      - pressure
+      - relative_humidity
+      - shortwave_radiation
+      - vertical_speed_of_radiosonde
+      - water_vapour_mixing_ratio
+      - wind_from_direction
+      - wind_speed
+    descriptions:
+      height_of_station_above_sea_level:
+        description: Height of station above mean sea level (m), negative values for below sea level.
+        dtype: float32
+        units: m
+      uncertainty_value1:
+        description: Uncertainty value
+        dtype: float32
+        units: Defined in uncertainty_unitsN
+      uncertainty_type1:
+        description: Uncertainty type
+        dtype: uint8
+      uncertainty_units1:
+        description: Units for uncertainty
+        dtype: object
+      uncertainty_value2:
+        description: Uncertainty value
+        dtype: float32
+        units: Defined in uncertainty_unitsN
+      uncertainty_type2:
+        description: Uncertainty type
+        dtype: uint8
+      uncertainty_units2:
+        description: Units for uncertainty
+        dtype: object
+      uncertainty_value5:
+        description: Uncertainty value
+        dtype: float32
+        units: Defined in uncertainty_unitsN
+      uncertainty_type5:
+        description: Uncertainty type
+        dtype: uint8
+      uncertainty_units5:
+        description: Units for uncertainty
+        dtype: object
+      primary_station_id:
+        description: Primary station identifier
+        dtype: object
+      station_name|station_configuration:
+        description: e.g. OSCAR station name, ship name, site name etc
+        dtype: object
+      report_id:
+        description: Unique ID for report
+        dtype: object
+      observation_id:
+        description: unique ID for observation
+        dtype: object
+      report_meaning_of_timestamp:
+        description: Report meaning of timestamp
+        dtype: uint8
+      latitude|observations_table:
+        description: Latitude of the observed value
+        dtype: float32
+        units: degree
+      longitude|observations_table:
+        description: Longitude of the observed value
+        dtype: float32
+        units: degree
+      z_coordinate:
+        description: z coordinate of observation
+        dtype: float32
+        units: m
+      z_coordinate_type:
+        description: Type of z coordinate
+        dtype: uint8
+      air_relative_humidity_effective_vertical_resolution:
+        description: Resolution (defined by 1 / cut off frequency) of the relative humidity in terms of time
+        dtype: float32
+        units: s
+      air_temperature:
+        description: Air temperature
+        dtype: float32
+        units: K
+      altitude:
+        description: Altitude
+        dtype: float32
+        units: m
+      eastward_wind_speed:
+        description: Projection of the horizontal air velocity vector onto a horizontal unit velocity vector (1 m s^-1) that points towards the East.
+        dtype: float32
+        units: m s-1
+      frost_point_temperature:
+        description: Frost point temperature
+        dtype: float32
+        units: K
+      geopotential_height:
+        description: Height of a standard or significant pressure level in meters
+        dtype: float32
+        units: m
+      northward_wind_speed:
+        description: Projection of the horizontal air velocity vector onto a horizontal unit velocity vector (1 m s^-1) that points towards the North
+        dtype: float32
+        units: m s-1
+      pressure:
+        description: Pressure
+        dtype: float32
+        units: Pa
+      relative_humidity:
+        description: Relative humidity
+        dtype: float32
+        units: "1"
+      shortwave_radiation:
+        description: Shortwave radiation
+        dtype: float32
+        units: W m-2
+      vertical_speed_of_radiosonde:
+        description: Vertical speed of radiosonde ascent
+        dtype: float32
+        units: m s-1
+      water_vapour_mixing_ratio:
+        description: Volume mixing ratio (mol/mol) of water vapor
+        dtype: float32
+        units: mol mol-1
+      wind_from_direction:
+        description: Direction from which the wind is blowing
+        dtype: float32
+        units: degree
+      wind_speed:
+        description: Speed is the magnitude of velocity. Wind is defined as a two-dimensional (horizontal) air velocity vector, with no vertical component.
+        dtype: float32
+        units: m s-1
+      report_duration:
+        description: Report duration
+        dtype: int32
+      record_number:
+        description: Record number
+        dtype: int8
+      units:
+        description: abbreviated name of SI units of observation value, e.g. K, m/s or J/kg
+        dtype: int16
+    mandatory_columns:
+      - latitude|observations_table
+      - longitude|observations_table
+      - report_duration
+      - report_meaning_of_timestamp
+      - station_name|station_configuration
+    space_columns:
+      z: z_coordinate
+      y: latitude|station_configuration
+      x: longitude|station_configuration
+available_cdm_tables:
+  - header_table
+  - observations_table
+  - station_configuration
+  - uncertainty_table
