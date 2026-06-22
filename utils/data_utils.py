@@ -58,6 +58,12 @@ def clean_numeric_value(value, col_type):
         >>> clean_numeric_value('abc', 'integer')
         nan
     """
+    if isinstance(value, (np.ndarray, list)):
+        if len(value) > 0:
+            value = value[0]
+        else:
+            value = np.nan
+
     if pd.isna(value):
         return np.nan
 

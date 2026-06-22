@@ -1,14 +1,55 @@
+import json
 import logging
 import re
 import zipfile
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from config import PATH_CONFIG, TABLE_NAMES
 from converters.dataframe_converter import DataFrameConverter
 from database import get_connection
 from database.operations import DatabaseOperations
 from readers.netcdf_reader import read_netcdf
+from processors.sounding_diagnostics import enrich_data_with_diagnostics
 
 logger = logging.getLogger(__name__)
+
+
+class _MetadataEncoder(json.JSONEncoder):
+    """JSON encoder that handles types commonly found in NetCDF global attributes:
+    - pandas Timestamp / datetime-like  → ISO-8601 string
+    - numpy scalar integers/floats      → native Python int/float
+    - numpy arrays                      → list
+    - bytes                             → UTF-8 string
+    """
+
+    def default(self, obj):
+        if isinstance(obj, (pd.Timestamp,)):
+            return obj.isoformat()
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, bytes):
+            return obj.decode("utf-8", errors="replace")
+        return super().default(obj)
+
+# Root directory for parquet output files
+PARQUET_OUTPUT_ROOT = Path('/Data/GRUAN_TEST/output')
+
+# Mapping from internal sonde type codes to output folder names
+SONDE_TYPE_FOLDER_MAP = {
+    'RS92':   'RS92',
+    'RS41':   'RS41',
+    'RS11G':  'RS-11G',
+    'IMS100': 'IMS-100',
+}
 
 
 class GRUANProcessor:
@@ -300,6 +341,19 @@ class GRUANProcessor:
             # Read NetCDF data and metadata
             data, metadata = read_netcdf(zip_ref, filename)
 
+            conventions = metadata.get('Conventions', '')
+            if conventions in ['CF-1.4', 'RS-11G'] and 'rh' in data:
+                raw_rh = data['rh']
+
+                if np.nanmax(raw_rh) <= 1.1:
+                    data['rh'] = raw_rh * 100.0
+                    logger.info(
+                        f"Scaled RH from 0-1 to 0-100 for {filename} (Conventions: {conventions})")
+
+            # Compute and attach sounding diagnostics
+            # Profile variables are added to data; scalars go to metadata.
+            data, metadata = enrich_data_with_diagnostics(data, metadata)
+
             # Convert to structured DataFrames
             metadata_df, data_df, skip_reason = (
                 self.df_converter.convert_to_dataframe(
@@ -318,15 +372,99 @@ class GRUANProcessor:
                 logger.warning(warning_msg)
                 return False, warning_msg
 
+            # Export to parquet before saving to the database
+            # self.export_to_parquet(data, metadata, filename)
+
             # Save data to database
-            success = self.save_data_copy_method(metadata_df, data_df,
-                                                 jar_name)
+            success = self.save_data_copy_method(metadata_df, data_df, jar_name)
+
             return success, None if success else "Database save failed"
 
         except Exception as e:
             error_msg = f"Error processing {filename} in {jar_name}: {e}"
             logger.error(error_msg)
             return False, error_msg
+
+    def export_to_parquet(self, data, metadata, nc_filename):
+        """
+        Export raw NetCDF data and metadata to a single Parquet file.
+
+        The output path is::
+
+            /Data/GRUAN_TEST/output/<sonde_folder>/<nc_stem>.parquet
+
+        ``data`` (a dict of ``{variable_name: numpy_array}``) is stored as
+        the DataFrame body (columns).  ``metadata`` (a dict of global NetCDF
+        attributes) is serialised as JSON strings and attached to the Arrow
+        schema metadata of the Parquet file so that it can be retrieved
+        without reading the data columns.
+
+        Args:
+            data (dict): Variable arrays from the NetCDF file.
+            metadata (dict): Global attributes from the NetCDF file.
+            nc_filename (str): Path of the NetCDF file inside the JAR archive
+                               (e.g. ``rev003/GRUAN-..._RS92_rev003.nc``).
+        """
+        try:
+            folder_name = SONDE_TYPE_FOLDER_MAP.get(self.sonde_type,
+                                                    self.sonde_type)
+            output_dir = PARQUET_OUTPUT_ROOT / folder_name
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Build the output stem from the NetCDF filename (strip any
+            # leading directory components that may be present inside the JAR)
+            nc_stem = Path(nc_filename).stem  # e.g. "GRUAN-..._RS92_rev003"
+            output_path = output_dir / f"{nc_stem}.parquet"
+
+            # --- Build DataFrame from data variables ---
+            df = pd.DataFrame(data)
+
+            if df.empty:
+                logger.warning(
+                    f"Skipping parquet export: empty data for {nc_filename}")
+                return
+
+            logger.debug(
+                f"dtypes before parquet export ({nc_filename}):"
+                f"\n{df.dtypes.to_string()}")
+
+            # --- Attach metadata to Arrow schema ---
+            # Each metadata value is JSON-encoded so that non-string types
+            # (numbers, lists, …) are preserved faithfully.
+            arrow_meta = {
+                k: v if isinstance(v, str)
+                else json.dumps(v, cls=_MetadataEncoder)
+                for k, v in metadata.items()
+            }
+            table = pa.Table.from_pandas(df)
+            # Merge with any existing schema metadata (e.g. pandas descriptor)
+            existing_meta = table.schema.metadata or {}
+            merged_meta = {**existing_meta,
+                           **{k.encode(): v.encode()
+                              for k, v in arrow_meta.items()}}
+            table = table.replace_schema_metadata(merged_meta)
+
+            # --- Write and verify ---
+            rows_before = len(df)
+            pq.write_table(table, output_path)
+
+            # Verify row count by reading back only schema/metadata
+            pf = pq.ParquetFile(output_path)
+            rows_written = pf.metadata.num_rows
+            if rows_written != rows_before:
+                logger.error(
+                    f"Row count mismatch for {output_path}: "
+                    f"expected {rows_before}, got {rows_written}")
+            else:
+                logger.info(
+                    f"Parquet exported: {output_path} "
+                    f"({rows_written} rows, {len(metadata)} metadata keys)")
+
+        except Exception as e:
+            # Parquet export errors are logged but must not abort the DB save
+            logger.error(
+                f"Failed to export parquet for {nc_filename}: {e}",
+                exc_info=True)
 
     def save_data_copy_method(self, df_header, df_data, filename):
         """
