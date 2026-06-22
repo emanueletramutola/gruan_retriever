@@ -12,6 +12,10 @@ eggs/
 .eggs/
 lib/
 lib64/
+sample_netcdf/
+others/
+output/
+OLD/
 parts/
 sdist/
 var/
@@ -71,7 +75,7 @@ Thumbs.db
 .ipynb_checkpoints
 
 # Environment variables (if sensitive)
-# .env
+.env
 
 # Config (uncomment if contains sensitive data)
 # config.yaml
