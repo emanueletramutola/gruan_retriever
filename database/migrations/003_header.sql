@@ -5,7 +5,7 @@ CREATE TABLE header
     report_id                                           serial PRIMARY KEY,
     idstation_pk                                        int,
     report_timestamp                                    timestamp with time zone,
-    
+
     -- Basic metadata
     conventions                                         character varying(255),
     title                                               character varying(255),
@@ -14,7 +14,7 @@ CREATE TABLE header
     history                                             character varying(255),
     "references"                                        character varying(255),
     comment                                             character varying(255),
-    
+
     -- File metadata
     g_file_type                                         character varying(255),
     g_file_typeversion                                  character varying(255),
@@ -48,6 +48,7 @@ CREATE TABLE header
     g_general_sitename                                  character varying(255),
     g_general_sitewmoid                                 character varying(255),
     g_general_siteinstitution                           character varying(255),
+    g_site_comment                                      character varying(500),
 
     -- Measurement system
     g_measurementsystem_id                              character varying(255),
@@ -67,12 +68,14 @@ CREATE TABLE header
     g_measuringsystem_longitude                         real,
     g_measuringsystem_altitude                          real,
     g_measuringsystem_type                              character varying(255),
+    g_measurementsystem_comment                         character varying(255),
 
     -- Measurement setup
     g_measurementsetup_id                               character varying(255),
     g_measurementsetup_key                              character varying(255),
     g_measurementsetup_name                             character varying(255),
     g_measurementsetup_type                             character varying(255),
+    g_measurementsetup_comment                          character varying(255),
 
     -- Surface observations
     g_surfaceobs_pressure                               character varying(255),
@@ -101,6 +104,7 @@ CREATE TABLE header
     g_mainsonde_modelfamily                             character varying(255),
     g_mainsonde_type                                    character varying(255),
     g_mainsonde_manufacturer                            character varying(255),
+    g_mainsonde_comment                                 character varying(255),
 
     -- Telemetry sonde
     g_telemetrysonde_serialnumber                       character varying(255),
@@ -111,6 +115,7 @@ CREATE TABLE header
     g_telemetrysonde_manufacturer                       character varying(255),
     g_telemetrysonde_xdata                              character varying(255),
     g_telemetrysonde_xdatasensors                       character varying(255),
+    g_telemetrysonde_comment                            character varying(255),
 
     -- Ground system
     g_groundsystem_id                                   character varying(255),
@@ -122,6 +127,7 @@ CREATE TABLE header
     g_groundsystem_manufacturer                         character varying(255),
     g_groundsystem_software                             character varying(255),
     g_groundsystem_modelfamily                          character varying(255),
+    g_groundsystem_comment                              character varying(255),
 
     -- Product metadata
     g_product_id                                        character varying(255),
@@ -135,6 +141,7 @@ CREATE TABLE header
     g_product_producer                                  character varying(255),
     g_product_producertool                              character varying(255),
     g_product_producercontacat                          character varying(255),
+    g_product_producercontact                           character varying(255),
     g_product_timeresolution                            character varying(255),
     g_product_status                                    character varying(255),
     g_product_statusdescription                         character varying(255),
@@ -206,6 +213,7 @@ CREATE TABLE header
     g_measurement_tropopausedetected                    character varying(255),
     g_measurement_twilightcount                         character varying(255),
     g_measurement_burstpointsource                      character varying(255),
+    g_measurement_comment                               character varying(255),
 
     -- Ascent specific fields
     g_ascent_id                                         character varying(255),
@@ -227,10 +235,10 @@ CREATE TABLE header
     g_ascent_precipitablewatercolumn                    character varying(255),
     g_ascent_precipitablewatercolumnu                   character varying(255),
     g_ascent_comment                                    character varying(255),
-    
+
     -- Ground check data
     g_groundcheck_list                                  character varying(255),
-    
+
     -- RD08 ground check
     g_groundcheck_rd08_gc_m2_001_checkdate              timestamp with time zone,
     g_groundcheck_rd08_gc_m2_001_checktype              character varying(255),
@@ -239,16 +247,34 @@ CREATE TABLE header
     g_groundcheck_rd08_gc_m2_001_refrelativehumidity    character varying(255),
     g_groundcheck_rd08_gc_m2_001_sensortemperature      character varying(255),
     g_groundcheck_rd08_gc_m2_001_sensorrelativehumidity character varying(255),
-    
-    -- SHC ground check
-    g_groundcheck_shc_gc_16_001_checkdate               timestamp with time zone,
-    g_groundcheck_shc_gc_16_001_checktype               character varying(255),
-    g_groundcheck_shc_gc_16_001_checklength             character varying(255),
-    g_groundcheck_shc_gc_16_001_reftemperature          character varying(255),
-    g_groundcheck_shc_gc_16_001_refrelativehumidity     character varying(255),
-    g_groundcheck_shc_gc_16_001_sensortemperature       character varying(255),
-    g_groundcheck_shc_gc_16_001_sensorrelativehumidity  character varying(255),
-    
+
+    -- JMA SHC 0 ground check
+    g_groundcheck_gc_jma_shc_0_001_checkdate            character varying(255),
+    g_groundcheck_gc_jma_shc_0_001_checklength          character varying(255),
+    g_groundcheck_gc_jma_shc_0_001_checktype            character varying(255),
+    g_groundcheck_gc_jma_shc_0_001_refrelativehumidity  character varying(255),
+    g_groundcheck_gc_jma_shc_0_001_reftemperature       character varying(255),
+    g_groundcheck_gc_jma_shc_0_001_sensorrelativehumidity character varying(255),
+    g_groundcheck_gc_jma_shc_0_001_sensortemperature    character varying(255),
+
+    -- JMA SHC 100 ground check
+    g_groundcheck_gc_jma_shc_100_001_checkdate          character varying(255),
+    g_groundcheck_gc_jma_shc_100_001_checklength        character varying(255),
+    g_groundcheck_gc_jma_shc_100_001_checktype          character varying(255),
+    g_groundcheck_gc_jma_shc_100_001_refrelativehumidity character varying(255),
+    g_groundcheck_gc_jma_shc_100_001_reftemperature     character varying(255),
+    g_groundcheck_gc_jma_shc_100_001_sensorrelativehumidity character varying(255),
+    g_groundcheck_gc_jma_shc_100_001_sensortemperature  character varying(255),
+
+    -- RS 11G ground check
+    g_groundcheck_gc_rs_11g_001_checkdate               character varying(255),
+    g_groundcheck_gc_rs_11g_001_checklength             character varying(255),
+    g_groundcheck_gc_rs_11g_001_checktype               character varying(255),
+    g_groundcheck_gc_rs_11g_001_refrelativehumidity     character varying(255),
+    g_groundcheck_gc_rs_11g_001_reftemperature          character varying(255),
+    g_groundcheck_gc_rs_11g_001_sensorrelativehumidity  character varying(255),
+    g_groundcheck_gc_rs_11g_001_sensortemperature       character varying(255),
+
     -- RI41 ground check
     g_groundcheck_ri41_altitude                         character varying(255),
     g_groundcheck_ri41_available                        character varying(255),
@@ -260,8 +286,16 @@ CREATE TABLE header
     g_groundcheck_ri41_pressureqc                       character varying(255),
     g_groundcheck_ri41_refpressure                      character varying(255),
     g_groundcheck_ri41_sensorpressure                   character varying(255),
-    
+    g_groundcheck_ri41_comment                          character varying(255),
+
     -- SHC ground check
+    g_groundcheck_shc_gc_16_001_checkdate               timestamp with time zone,
+    g_groundcheck_shc_gc_16_001_checktype               character varying(255),
+    g_groundcheck_shc_gc_16_001_checklength             character varying(255),
+    g_groundcheck_shc_gc_16_001_reftemperature          character varying(255),
+    g_groundcheck_shc_gc_16_001_refrelativehumidity     character varying(255),
+    g_groundcheck_shc_gc_16_001_sensortemperature       character varying(255),
+    g_groundcheck_shc_gc_16_001_sensorrelativehumidity  character varying(255),
     g_groundcheck_shc_altitude                          character varying(255),
     g_groundcheck_shc_analysed                          character varying(255),
     g_groundcheck_shc_autodetected                      character varying(255),
@@ -317,5 +351,38 @@ CREATE TABLE header
     g_groundcheck_shc_sensortemperatureuc               character varying(255),
     g_groundcheck_shc_sensortemperatureucfinal          character varying(255),
     g_groundcheck_shc_temperatureqc                     character varying(255),
-    g_groundcheck_shelter_available                     character varying(255)
+    g_groundcheck_shc_comment                           character varying(255),
+
+    -- Shelter ground check
+    g_groundcheck_shelter_available                     character varying(255),
+    g_groundcheck_shelter_comment                       character varying(255),
+
+    -- Diagnostic data
+    diag_lcl_p                                          real,
+    diag_lcl_t                                          real,
+    diag_lfc_p                                          real,
+    diag_lfc_t                                          real,
+    diag_el_p                                           real,
+    diag_el_t                                           real,
+    diag_cape                                           real,
+    diag_cin                                            real,
+    diag_lifted_index                                   real,
+    diag_k_index                                        real,
+    diag_total_totals                                   real,
+    diag_showalter                                      real,
+    diag_tropopause_p                                   real,
+    diag_tropopause_t                                   real,
+    diag_pwat                                           real,
+    diag_freezing_level_index                           int,
+    diag_cloud_base_height                              real,
+    diag_cloud_base_type                                character varying(255),
+    diag_shear_0_1km_u                                  real,
+    diag_shear_0_1km_v                                  real,
+    diag_shear_0_3km_u                                  real,
+    diag_shear_0_3km_v                                  real,
+    diag_shear_0_6km_u                                  real,
+    diag_shear_0_6km_v                                  real,
+    diag_srh_0_3km_pos                                  real,
+    diag_srh_0_3km_neg                                  real,
+    diag_srh_0_3km_tot                                  real
 );
