@@ -750,7 +750,7 @@ def main():
     args = parser.parse_args()
 
     load_dotenv(args.env_file)
-    missing = [e for e in ['DB_USER','DB_PASSWORD','DB_HOST','DB_PORT','DB_NAME']
+    missing = [e for e in ['DB_USER','GRUAN_USER_PSW','DB_HOST','DB_PORT','DB_NAME']
                if not os.getenv(e)]
     if missing:
         sys.exit(f'Missing environment variables: {missing}')
@@ -760,7 +760,7 @@ def main():
         'port':     os.getenv('DB_PORT'),
         'dbname':   os.getenv('DB_NAME'),
         'user':     os.getenv('DB_USER'),
-        'password': os.getenv('DB_PASSWORD'),
+        'password': os.getenv('GRUAN_USER_PSW'),
     }
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
