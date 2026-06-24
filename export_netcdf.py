@@ -1,44 +1,4 @@
 #!/usr/bin/env python3
-"""
-Export GRUAN radiosounding data from PostgreSQL to CDM-compliant NetCDF4.
-
-Output format: long/tidy table (one row per observation × CDM variable),
-matching the GRUAN reference network file structure:
-  - observed_variable  : uint8 CDM variable code
-  - observation_value  : float32 measured value
-  - z_coordinate       : float32 altitude [m]
-  - z_coordinate_type  : uint8  (0 = altitude above MSL)
-  - units / original_units : char
-  - uncertainty_value1 / _type1 / _units1  (random,       type=1)
-  - uncertainty_value2 / _type2 / _units2  (systematic,   type=2)
-  - uncertainty_value5 / _type5 / _units5  (combined,     type=5)
-  - cor_rh / cor_temp  : GRUAN-specific humidity/temperature corrections
-  - report_timestamp   : int64, CF-units
-  - report_id          : char
-  - observation_id     : int64
-  - primary_station_id : char
-  - latitude|station_configuration  / longitude|station_configuration
-  - height_of_station_above_sea_level
-  - latitude|observations_table / longitude|observations_table
-  - index              : int64, dummy coordinate
-
-CDM variable codes used
------------------------
- 73  shortwave_radiation
-106  wind_from_direction
-107  wind_speed
-116  frost_point_temperature
-117  geopotential_height
-122  vertical_speed_of_radiosonde
-123  water_vapour_mixing_ratio
-125  altitude
-126  air_temperature
-138  relative_humidity
-139  eastward_wind_speed
-140  northward_wind_speed
-142  pressure
-143  time_since_launch
-"""
 
 import os
 import sys
@@ -78,7 +38,7 @@ TIME_CALENDAR   = "proleptic_gregorian"
 #   Check/adjust UNIT_TRANSFORMS accordingly.
 
 CDM_VARIABLES = [
-    # code var_name_cf_1_4      var_name_cf_1_7       unit   units_str        uc_rand       uc_sys_cf_1_4  uc_sys_cf_1_7,      uc_tot_cf_1_4  uc_tot_cf_1_7
+    # code var_name_cf_1_4      var_name_cf_1_7       unit   units_str    uc_rand       uc_sys_cf_1_4  uc_sys_cf_1_7,      uc_tot_cf_1_4  uc_tot_cf_1_7
     (126, 'temp',               'temp',               5,     'K',         'u_std_temp', 'u_cor_temp',  'temp_uc_tcor',     'u_temp',      'temp_uc'),
     (138, 'rh',                 'rh',                 1016,  '1',         'u_std_rh',   'u_cor_rh',    'rh_uc_tcor',       'u_rh',        'rh_uc'),
     (106, 'wdir',               'wdir',               110,   'degree',    None,         None,          None,               'u_wdir',      'wdir_uc'),
@@ -171,36 +131,24 @@ def _ensure_string_dim(ncf: nc.Dataset, length: int) -> str:
     return name
 
 
-def _write_char_var(ncf: nc.Dataset, name: str, arr, index_dim: str,
-                    **attrs) -> nc.Variable:
-    """Write a string column as 2-D char (index, stringN)."""
-    def to_str(s):
-        if s is None: return ''
-        if isinstance(s, bytes): return s.decode('utf-8', errors='replace')
-        try:
-            if pd.isna(s): return ''
-        except (TypeError, ValueError):
-            pass
-        return str(s)
+def _write_char_var(ncf, name, arr, index_dim, **attrs):
+    str_list = ['' if (s is None or (isinstance(s, float) and np.isnan(s)))
+                else (s.decode('utf-8', errors='replace') if isinstance(s, bytes) else str(s))
+                for s in arr]
+    maxlen = max((len(s) for s in str_list), default=1)
+    maxlen = max(maxlen, 1)
+    sdim = _ensure_string_dim(ncf, maxlen)
 
-    str_list = [to_str(s) for s in arr]
-    maxlen   = max((len(s) for s in str_list), default=0)
-    maxlen   = max(maxlen, 1)          # must be ≥ 1 even when all strings are empty
-    sdim     = _ensure_string_dim(ncf, maxlen)
+    encoded = [s.encode('utf-8', errors='replace')[:maxlen].ljust(maxlen, b'\x00')
+               for s in str_list]
+    data = np.frombuffer(b''.join(encoded), dtype='S1').reshape(len(str_list), maxlen)
 
-    var = ncf.createVariable(
-        name, 'S1', (index_dim, sdim),
-        zlib=True, complevel=DEFLATE_LEVEL, shuffle=True
-    )
-    data = np.full((len(str_list), maxlen), b'', dtype='S1')
-    for i, s in enumerate(str_list):
-        for j, ch in enumerate(s.encode('utf-8', errors='replace')[:maxlen]):
-            data[i, j] = bytes([ch])
+    var = ncf.createVariable(name, 'S1', (index_dim, sdim),
+                             zlib=True, complevel=DEFLATE_LEVEL, shuffle=True)
     var[:] = data
     for k, v in attrs.items():
         setattr(var, k, v)
     return var
-
 
 def _write_int64_var(ncf: nc.Dataset, name: str, arr, index_dim: str,
                      **attrs) -> nc.Variable:
@@ -209,6 +157,7 @@ def _write_int64_var(ncf: nc.Dataset, name: str, arr, index_dim: str,
         data = arr.fillna(sentinel).astype(np.int64).values
     else:
         data = np.where(np.isnan(arr.astype(float)), sentinel, arr).astype(np.int64)
+
     var = ncf.createVariable(
         name, np.int64, (index_dim,),
         zlib=True, complevel=DEFLATE_LEVEL, shuffle=True
@@ -225,6 +174,7 @@ def _write_float32_var(ncf: nc.Dataset, name: str, arr, index_dim: str,
         data = arr.to_numpy(dtype=np.float64, na_value=np.nan)
     else:
         data = np.asarray(arr, dtype=np.float64)
+
     var = ncf.createVariable(
         name, np.float32, (index_dim,),
         zlib=True, complevel=DEFLATE_LEVEL, shuffle=True,
@@ -242,10 +192,12 @@ def _write_uint8_var(ncf: nc.Dataset, name: str, arr, index_dim: str,
         data = arr.fillna(255).astype(np.uint8).values
     else:
         data = np.asarray(arr, dtype=np.uint8)
+
     var = ncf.createVariable(
         name, np.uint8, (index_dim,),
         zlib=True, complevel=DEFLATE_LEVEL, shuffle=True
     )
+
     var[:] = data
     for k, v in attrs.items():
         setattr(var, k, v)
@@ -257,10 +209,12 @@ def _write_uint16_var(ncf: nc.Dataset, name: str, arr, index_dim: str,
         data = arr.fillna(65535).astype(np.uint16).values
     else:
         data = np.asarray(arr, dtype=np.uint16)
+
     var = ncf.createVariable(
         name, np.uint16, (index_dim,),
         zlib=True, complevel=DEFLATE_LEVEL, shuffle=True
     )
+
     var[:] = data
     for k, v in attrs.items():
         setattr(var, k, v)
@@ -322,83 +276,18 @@ def _col_or_nan(df: pd.DataFrame,
 
 def build_cdm_dataframe(df_merged: pd.DataFrame,
                         station_lookup: dict) -> pd.DataFrame:
-    """
-    Pivot the wide merged DataFrame into a CDM long-format DataFrame.
-
-    Each physical level of the sounding generates one row per CDM variable.
-    The output has exactly the CDM columns needed by the NetCDF writer.
-    """
-
-    # # INIZIO ORIG
-    # # Ensure report_timestamp is datetime for time_since_launch computation
-    # if not pd.api.types.is_datetime64_any_dtype(df_merged['report_timestamp']):
-    #     df_merged = df_merged.copy()
-    #     df_merged['report_timestamp'] = pd.to_datetime(
-    #         df_merged['report_timestamp'], utc=True, errors='coerce'
-    #     )
-    #
-    # # Compute time_since_launch (seconds from sounding start per report_id)
-    # launch_time = (
-    #     df_merged.groupby('report_id')['report_timestamp']
-    #     .transform('min')
-    # )
-    # df_merged = df_merged.copy()
-    # df_merged['_time_since_launch'] = (
-    #     (df_merged['report_timestamp'] - launch_time)
-    #     .dt.total_seconds()
-    # )
-    #
-    # for col, (scale, offset) in UNIT_TRANSFORMS.items():
-    #     if col in df_merged.columns:
-    #         df_merged[col] = df_merged[col] * scale + offset
-    #
-    # # report_timestamp as int64 seconds-since-epoch
-    # ts_epoch = df_merged['report_timestamp'].astype('int64') // 10**9
-    # # FINE ORIG
-
-    # INIZIO NEW - NON FUNZIONANTE
-    # Normalizza sempre a UTC, sia che arrivi tz-aware che tz-naive
-    # ts_raw = pd.to_datetime(df_merged['report_timestamp'], errors='coerce')
-    # if ts_raw.dt.tz is None:
-    #     ts_raw = ts_raw.dt.tz_localize('UTC')
-    # else:
-    #     ts_raw = ts_raw.dt.tz_convert('UTC')
-    # df_merged = df_merged.copy()
-    # df_merged['report_timestamp'] = ts_raw
-    #
-    # # Poi usa ts_raw anche per il calcolo di time_since_launch
-    # launch_time = df_merged.groupby('report_id')['report_timestamp'].transform(
-    #     'min')
-    # df_merged['_time_since_launch'] = (
-    #             df_merged['report_timestamp'] - launch_time).dt.total_seconds()
-    #
-    # # Infine converti in secondi interi (coerente con TIME_UNITS = "seconds since 1970-01-01 00:00:00")
-    # ts_epoch = df_merged['report_timestamp'].astype('int64') // 10 ** 9
-    # print("DEBUG ts_epoch sample:", ts_epoch.iloc[:3].values)
-    # print("DEBUG decoded back:",
-    #       pd.to_datetime(ts_epoch.iloc[:3].values, unit='s', utc=True))
-    # print("DEBUG original timestamp:",
-    #       df_merged['report_timestamp'].iloc[:3].values)
-    # ema = ""
-    # FINE NEW - NON FUNZIONANTE
-
-    # INIZIO NEW
-    # Normalizza sempre a UTC, sia che arrivi tz-aware che tz-naive
-    # Determina la risoluzione e converti sempre in secondi interi
     ts_raw = df_merged['report_timestamp']
     if pd.api.types.is_datetime64_any_dtype(ts_raw):
         if ts_raw.dt.tz is None:
             ts_raw = ts_raw.dt.tz_localize('UTC')
         else:
             ts_raw = ts_raw.dt.tz_convert('UTC')
-        # Converti a datetime64[s] esplicitamente prima di astype int64
+
         ts_epoch = ts_raw.values.astype('datetime64[s]').astype('int64')
     else:
         ts_epoch = pd.to_datetime(ts_raw, utc=True).values.astype(
             'datetime64[s]').astype('int64')
-    # FINE NEW
 
-    # Station metadata (constant per report_id, comes from header after merge)
     def _str_col(column_name_cf_1_4, column_name_cf_1_7):
         if column_name_cf_1_4 in df_merged.columns and column_name_cf_1_7 in df_merged.columns:
             series_cf_1_4 = df_merged[column_name_cf_1_4]
@@ -424,13 +313,14 @@ def build_cdm_dataframe(df_merged: pd.DataFrame,
         .values
     )
     station_name = _str_col('g_general_sitename', 'g_site_name')
-    report_id_str      = df_merged['report_id'].fillna(0).astype(np.int64).astype(str)
+    sensor_id = _str_col('g_product_code', 'g_product_key')
+    # report_id_str      = df_merged['report_id'].fillna(0).astype(np.int64).astype(str)
     lat_station        = _col_or_nan(df_merged, 'g_measuringsystem_latitude', 'g_measurementsystem_latitude')
     lon_station        = _col_or_nan(df_merged, 'g_measuringsystem_longitude', 'g_measurementsystem_longitude')
     alt_station        = _col_or_nan(df_merged, 'g_measuringsystem_altitude', 'g_measurementsystem_altitude')
     lat_obs            = _col_or_nan(df_merged, 'lat', 'lat')
     lon_obs            = _col_or_nan(df_merged, 'lon', 'lon')
-    z_coord            = _col_or_nan(df_merged, 'alt', 'alt')   # altitude [m]
+    z_coord            = _col_or_nan(df_merged, 'alt', 'alt')
 
     # # GRUAN-specific corrections (same value broadcast to all variable rows)
     # cor_temp_vals = _col_or_nan(df_merged, 'temp_corr_rad')
@@ -470,7 +360,8 @@ def build_cdm_dataframe(df_merged: pd.DataFrame,
             # Identifiers
             'report_timestamp':                   ts_epoch,
             'report_meaning_of_timestamp':        np.uint8(1),
-            'report_id':                          report_id_str.values,
+            # 'report_id':                          report_id_str.values,
+            'report_id':                          df_merged['g_product_id'].values,
             'report_duration':                    np.uint8(9),
             'observation_id':                     df_merged['observation_id'].values,
             'primary_station_id':                 primary_station_id.values,
@@ -484,6 +375,7 @@ def build_cdm_dataframe(df_merged: pd.DataFrame,
             'longitude|observations_table':       lon_obs.values,
             # station.id lookup
             'record_number':                      record_number_vals,
+            'sensor_id':                          sensor_id.values,
         }, index=df_merged.index)
 
         pieces.append(piece)
@@ -531,6 +423,9 @@ def write_cdm_netcdf(cdm: pd.DataFrame, output_file: Path):
 
         # ── index ───────────────────────────────────────────────────────
         # _write_int64_var(ncf, 'index', np.arange(N, dtype=np.int64), index_dim)
+
+        _write_char_var(ncf, 'sensor_id',
+                        cdm['sensor_id'].values, index_dim)
 
         # ── station geometry ──────────────────────────────────────────────────
         _write_float32_var(ncf, 'height_of_station_above_sea_level',
@@ -634,7 +529,7 @@ def export_month(conn_params, year, month, output_dir,
 
     # ── fetch data ────────────────────────────────────────────────────────────
     COLUMNS_DATA_TABLE = [
-        "'asc'", "alt", "alt_gph", "alt_gph_uc_tcor", "alt_gph_uc", "alt_uc",
+        "g_product_id", "'asc'", "alt", "alt_gph", "alt_gph_uc_tcor", "alt_gph_uc", "alt_uc",
         "fp", "fp_uc", "geopot", "idstation_pk", "lat", "lon",
         "observation_id", "press", "press_uc", "report_timestamp", "rh", "rh_res", "rh_uc",
         "rh_uc_tcor", "swrad", "temp", "temp_uc", "temp_uc_tcor", "u", "u_alt",
@@ -651,9 +546,7 @@ def export_month(conn_params, year, month, output_dir,
 
     data_query = (
         f"SELECT {columns_str} "
-        # f"FROM {data_table} "
         f"FROM {data_table}_{year:04d}{month:02d} "
-        # f"WHERE report_timestamp >= %(start)s AND report_timestamp < %(end)s "
         f"ORDER BY report_timestamp, observation_id"
     )
 
@@ -697,8 +590,7 @@ def export_month(conn_params, year, month, output_dir,
         "g_measurementsystem_longitude", "g_measuringsystem_altitude",
         "g_measuringsystem_latitude",
         "g_measuringsystem_longitude", "g_site_key", "idstation_pk",
-        "report_id",
-        "report_timestamp"
+        "g_product_id", "report_timestamp", "g_product_key", "g_product_code"
     ]
 
     header_columns_str = ", ".join(COLUMNS_HEADER_TABLE)
@@ -716,15 +608,11 @@ def export_month(conn_params, year, month, output_dir,
         engine2.dispose()
     print(f"  Header rows : {len(df_header):,}")
 
-    # ── merge data + header ───────────────────────────────────────────────────
-    if df_header.empty:
-        df_merged = df_data.copy()
-    else:
-        df_merged = pd.merge(
-            df_data, df_header,
-            on=['idstation_pk', 'report_timestamp'],
-            how='left', suffixes=('', '_header')
-        ).copy()
+    df_merged = pd.merge(
+        df_data, df_header,
+        on=['g_product_id'],
+        how='inner', suffixes=('', '_header')
+    ).copy()
     print(f"  Merged rows : {len(df_merged):,}")
 
     # ── pivot to CDM long format ──────────────────────────────────────────────
@@ -738,6 +626,8 @@ def export_month(conn_params, year, month, output_dir,
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
+    start_time = time.perf_counter()
+
     parser = argparse.ArgumentParser(
         description='Export GRUAN PostgreSQL data to CDM-compliant monthly NetCDF4.'
     )
@@ -778,7 +668,16 @@ def main():
     for y, m in months:
         export_month(conn_params, y, m, output_dir, args.data_table, args.header_table,
                      station_lookup=station_lookup)
+    # y = 2010
+    # m = 1
+    # export_month(conn_params, y, m, output_dir, args.data_table, args.header_table,
+    #              station_lookup=station_lookup)
     print('\nDone.')
+
+    end_time = time.perf_counter()
+    elapsed_time = end_time - start_time
+
+    print(f"Total execution time: {elapsed_time:.2f} seconds")
 
 
 if __name__ == '__main__':

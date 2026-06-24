@@ -157,6 +157,9 @@ sources:
       units:
         description: abbreviated name of SI units of observation value, e.g. K, m/s or J/kg
         dtype: int16
+      sensor_id:
+        description: Link to sensor_configuration table
+        dtype: object
     mandatory_columns:
       - latitude|observations_table
       - longitude|observations_table
