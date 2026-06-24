@@ -2,7 +2,7 @@ DROP TABLE IF EXISTS header CASCADE;
 
 CREATE TABLE header
 (
-    report_id                                           serial PRIMARY KEY,
+    g_product_id                                        int PRIMARY KEY,
     idstation_pk                                        int,
     report_timestamp                                    timestamp with time zone,
 
@@ -130,7 +130,6 @@ CREATE TABLE header
     g_groundsystem_comment                              character varying(255),
 
     -- Product metadata
-    g_product_id                                        character varying(255),
     g_product_key                                       character varying(255),
     g_product_name                                      character varying(255),
     g_product_version                                   character varying(255),

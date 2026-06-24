@@ -171,6 +171,9 @@ class DataFrameConverter:
 
             metadata['report_timestamp'] = report_timestamp
 
+            metadata = {k.lower(): v for k, v in metadata.items()}
+            data['g.product.id'] = metadata['g.product.id']
+
             # Create DataFrames from processed data
             metadata_df = pd.DataFrame([metadata])
             data_df = pd.DataFrame(data)

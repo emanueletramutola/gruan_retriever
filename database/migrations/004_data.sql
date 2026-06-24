@@ -5,10 +5,7 @@ CREATE TABLE data
     -- Common identifier
     observation_id                     serial,
     idstation_pk                       int,
-
-    -- Timestamps
---     g_measurement_standardtime         timestamp with time zone,
---     g_ascent_standardtime              timestamp with time zone,
+    g_product_id                       int,
     report_timestamp                   timestamp with time zone,
 
     -- Position and coordinates
