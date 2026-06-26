@@ -1,13 +1,22 @@
 # File paths for different radiosonde data types
 paths:
-  rs92: "/Data/GRUAN_TEST/RS92"
-  rs41: "/Data/GRUAN_TEST/RS41"
-  ims100: "/Data/GRUAN_TEST/IMS-100"
-  rs11g: "/Data/GRUAN_TEST/RS-11G"
+  # Development PC
+#  rs92: "/Data/GRUAN_TEST/RS92"
+#  rs41: "/Data/GRUAN_TEST/RS41"
+#  ims100: "/Data/GRUAN_TEST/IMS-100"
+#  rs11g: "/Data/GRUAN_TEST/RS-11G"
+
+  # Production
 #  rs92: "/Data/GRUAN/RS92-GDP_002"  # Root directory for RS92 radiosonde data files
 #  rs41: "/Data/GRUAN/RS41-GDP_001"  # Root directory for RS41 radiosonde data files
 #  ims100: "/Data/GRUAN/IMS-100-GDP_002"  # Root directory for ims100 radiosonde data files
 #  rs11g: "/Data/GRUAN/RS-11G-GDP_001"  # Root directory for RS11G radiosonde data files
+
+  # Development MAC
+  rs92: "/Users/emanuele/Data/GRUAN/RS92"
+  rs41: "/Users/emanuele/Data/GRUAN/RS41"
+  ims100: "/Users/emanuele/Data/GRUAN/IMS-100"
+  rs11g: "/Users/emanuele/Data/GRUAN/RS-11G"
 
 # Database connection configuration
 database:

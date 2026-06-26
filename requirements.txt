@@ -3,7 +3,7 @@ MetPy
 netCDF4
 numpy
 pandas
-psycopg2
+psycopg2-binary
 pyarrow
 python-dotenv
 PyYAML
