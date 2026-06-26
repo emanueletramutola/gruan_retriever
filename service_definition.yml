@@ -3,7 +3,7 @@ lat_tile_size: 10.0
 lon_tile_size: 10.0
 reader: cdsobs.ingestion.readers.netcdf.read_flat_netcdfs
 reader_extra_args:
-  input_path: "/Data/owncloud/src/gruan_retriever/output/"
+  input_path: "/home/emanuele/src/gruan_retriever/output/"
 global_attributes:
   contactemail: https://support.ecmwf.int
   licence_list: 20180314_Copernicus_License_V1.1
