@@ -105,7 +105,7 @@ def load_station_record_numbers(conn_params) -> dict:
     return mapping
 
 
-def get_available_months(conn_params, data_table='data'):
+def get_available_months(conn_params, data_table='header'):
     query = (
         f"SELECT DISTINCT "
         f"  EXTRACT(YEAR  FROM report_timestamp)::int AS year, "
@@ -132,16 +132,33 @@ def _ensure_string_dim(ncf: nc.Dataset, length: int) -> str:
 
 
 def _write_char_var(ncf, name, arr, index_dim, **attrs):
-    str_list = ['' if (s is None or (isinstance(s, float) and np.isnan(s)))
-                else (s.decode('utf-8', errors='replace') if isinstance(s, bytes) else str(s))
-                for s in arr]
-    maxlen = max((len(s) for s in str_list), default=1)
+    # Vectorized version: avoids per-row Python loops, which is what made this
+    # function (called ~8x per file, 20M+ rows each) the single-core bottleneck.
+    s = pd.Series(arr)
+
+    # Decode bytes -> str where needed (vectorized where possible)
+    if s.dtype == object and s.map(lambda x: isinstance(x, bytes)).any():
+        s = s.map(lambda x: x.decode('utf-8', errors='replace')
+                  if isinstance(x, bytes) else x)
+
+    s = s.where(~s.isna(), '').astype(str)
+
+    maxlen = int(s.str.len().max()) if len(s) else 1
     maxlen = max(maxlen, 1)
     sdim = _ensure_string_dim(ncf, maxlen)
 
-    encoded = [s.encode('utf-8', errors='replace')[:maxlen].ljust(maxlen, b'\x00')
-               for s in str_list]
-    data = np.frombuffer(b''.join(encoded), dtype='S1').reshape(len(str_list), maxlen)
+    try:
+        # Fast path: numpy encodes/pads/truncates to fixed width in one shot.
+        # Works for ASCII-safe content (ids, codes, station names, etc.)
+        fixed = s.to_numpy(dtype=f'S{maxlen}')
+    except UnicodeEncodeError:
+        # Fallback for genuinely non-ASCII text: still vectorized encode,
+        # then a single bulk pad via numpy char operations (no per-row loop).
+        encoded = s.str.encode('utf-8', errors='replace')
+        fixed = np.array([b[:maxlen].ljust(maxlen, b'\x00') for b in encoded],
+                          dtype=f'S{maxlen}')
+
+    data = fixed.view('S1').reshape(len(s), maxlen)
 
     var = ncf.createVariable(name, 'S1', (index_dim, sdim),
                              zlib=True, complevel=DEFLATE_LEVEL, shuffle=True)
@@ -442,8 +459,8 @@ def write_cdm_netcdf(cdm: pd.DataFrame, output_file: Path):
         # ── sounding / report ids ─────────────────────────────────────────────
         _write_char_var(ncf, 'report_id',
                         cdm['report_id'].values, index_dim)
-        _write_char_var(ncf, 'report_duration',
-                        cdm['report_duration'].values, index_dim)
+        _write_uint8_var(ncf, 'report_duration',
+                        cdm['report_duration'], index_dim)
         _write_int64_var(ncf, 'observation_id',
                          cdm['observation_id'], index_dim)
 
@@ -500,8 +517,8 @@ def write_cdm_netcdf(cdm: pd.DataFrame, output_file: Path):
                                cdm[f'uncertainty_value{idx}'], index_dim)
             _write_uint8_var(  ncf, f'uncertainty_type{idx}',
                                cdm[f'uncertainty_type{idx}'], index_dim)
-            _write_char_var(   ncf, f'uncertainty_units{idx}',
-                               cdm[f'uncertainty_units{idx}'].values, index_dim)
+            _write_uint16_var( ncf, f'uncertainty_units{idx}',
+                               cdm[f'uncertainty_units{idx}'], index_dim)
 
         # ── GRUAN-specific corrections ────────────────────────────────────────
         # _write_float32_var(ncf, 'cor_rh',   cdm['cor_rh'],   index_dim)
@@ -668,8 +685,8 @@ def main():
     for y, m in months:
         export_month(conn_params, y, m, output_dir, args.data_table, args.header_table,
                      station_lookup=station_lookup)
-    # y = 2010
-    # m = 1
+    # y = 2018
+    # m = 5
     # export_month(conn_params, y, m, output_dir, args.data_table, args.header_table,
     #              station_lookup=station_lookup)
     print('\nDone.')

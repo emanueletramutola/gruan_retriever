@@ -41,7 +41,7 @@ sources:
         dtype: uint8
       uncertainty_units1:
         description: Units for uncertainty
-        dtype: object
+        dtype: int16
       uncertainty_value2:
         description: Uncertainty value
         dtype: float32
@@ -51,7 +51,7 @@ sources:
         dtype: uint8
       uncertainty_units2:
         description: Units for uncertainty
-        dtype: object
+        dtype: int16
       uncertainty_value5:
         description: Uncertainty value
         dtype: float32
@@ -61,7 +61,7 @@ sources:
         dtype: uint8
       uncertainty_units5:
         description: Units for uncertainty
-        dtype: object
+        dtype: int16
       primary_station_id:
         description: Primary station identifier
         dtype: object
