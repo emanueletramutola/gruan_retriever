@@ -607,7 +607,8 @@ def export_month(conn_params, year, month, output_dir,
         "g_measurementsystem_longitude", "g_measuringsystem_altitude",
         "g_measuringsystem_latitude",
         "g_measuringsystem_longitude", "g_site_key", "idstation_pk",
-        "g_product_id", "report_timestamp", "g_product_key", "g_product_code"
+        "g_product_id", "report_timestamp", "g_product_key", "g_product_code",
+        "g_general_sitename", "g_site_name"
     ]
 
     header_columns_str = ", ".join(COLUMNS_HEADER_TABLE)
