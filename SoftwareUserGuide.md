@@ -2,11 +2,11 @@
 
 **Project / Activity Name:** GRUAN Radiosonde Data Processing System
 
-**Document Version:** 1.0.1
+**Document Version:** 1.0.2
 **Date:** 2025-12-03
 **Last Updated:** 2026-02-25
 
-**Author(s):** Emanuele Tramutola - CNR, C.I.A.O. Research Group, IMAA Institute, Tito Scalo (PZ), Italy
+**Author(s):** Emanuele Tramutola - CNR, C.I.A.O. Research Group, IMIOT Institute, Tito Scalo (PZ), Italy
 
 ---
 
@@ -42,7 +42,7 @@ git clone git@github.com:emanueletramutola/gruan_retriever.git
 - `database/` - Database operations and migration scripts
 - `processors/` - Core data processing logic
 - `readers/` - NetCDF file readers
-- `tests/` - Unit and integration tests
+
 - `utils/` - Utility functions (logging, station management)
 - `main.py` - Main entry point
 - `requirements.txt` - Python dependencies
@@ -82,11 +82,13 @@ git clone git@github.com:emanueletramutola/gruan_retriever.git
 | `pandas` | Data manipulation and transformation |
 | `netCDF4` | Reading NetCDF data files |
 | `sqlalchemy` | Database ORM and connection management |
-| `psycopg2` | PostgreSQL adapter |
+| `psycopg2-binary` | PostgreSQL adapter |
 | `pyyaml` | Configuration file parsing |
-| `psutil` | System resource monitoring |
 | `metpy` | Atmospheric thermodynamics calculations |
 | `scipy` | Signal processing (smoothing) |
+| `pyarrow` | Columnar data format for intermediate processing |
+| `python-dotenv` | Loading environment variables from `.env` file |
+| `tqdm` | Progress bars for long-running operations |
 
 **External Data Requirements:**
 
@@ -126,10 +128,19 @@ git clone git@github.com:emanueletramutola/gruan_retriever.git
    ```
 
 4. **Configure Environment Variables:**
-   Set the database password environment variable:
+   The database password can be provided in two ways:
+
+   **Option A – Shell environment variable (temporary, current session only):**
    ```bash
    export GRUAN_USER_PSW="your_database_password"
    ```
+
+   **Option B – `.env` file (persistent, recommended):**
+   Create a `.env` file in the project root directory:
+   ```bash
+   echo 'GRUAN_USER_PSW=your_database_password' > .env
+   ```
+   The application automatically loads this file at startup if it exists (via `python-dotenv`), without overriding variables already set in the shell environment.
 
 5. **Verify installation:**
    ```bash
@@ -318,7 +329,7 @@ After retrieving a profile from the database (or reading a NetCDF file), you can
 ```python
 import numpy as np
 from metpy.units import units
-from utils.sounding_diagnostics import full_sounding_diagnostics   # module name suggested for integration
+from processors.sounding_diagnostics import full_sounding_diagnostics
 
 # Example data (normally read from your data source)
 pressure = np.array([1000, 925, 850, 700, 500]) * units.hPa
@@ -352,85 +363,8 @@ While the module is independent, it can be seamlessly integrated into the main p
 
 ---
 
-## 9. Automatic Tests
 
-### Purpose
-
-Verify that the data processing logic, file reading, and database operations work as expected.
-
-### Test Suite Structure
-
-The test suite includes 3 main test modules with 19 total tests:
-
-1. **`tests/test_netcdf_reader.py`** (8 tests)
-   - NetCDF file reading and processing
-   - Data validation and transformation
-   - Error handling for invalid inputs
-
-2. **`tests/test_processor.py`** (6 tests)
-   - JAR file processing logic
-   - Single file processing workflow
-   - Database save operations
-
-3. **`tests/test_station_manager.py`** (5 tests)
-   - Station database management
-   - Web scraping and data updates
-   - Singleton pattern implementation
-
-### Running Tests
-
-```bash
-# Run all tests (from project root)
-./.venv/bin/python -m pytest
-
-# If virtual environment is activated
-pytest
-
-# Run with verbose output
-pytest -v
-
-# Run specific test module
-pytest tests/test_netcdf_reader.py
-
-# Run with coverage report
-pytest --cov=. --cov-report=html
-```
-
-### Test Output Snapshot
-
-```
-============ test session starts =============
-platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0
-cachedir: .pytest_cache
-rootdir: /Data/owncloud/src/gruan_retriever
-configfile: pytest.ini
-
-tests/test_netcdf_reader.py::TestNetCDFReader::test_process_attribute_value PASSED [  5%]
-tests/test_netcdf_reader.py::TestNetCDFReader::test_process_variable_data_masked PASSED [ 10%]
-tests/test_netcdf_reader.py::TestNetCDFReader::test_process_variable_data_small_values PASSED [ 15%]
-tests/test_netcdf_reader.py::TestNetCDFReader::test_process_variable_data_strings PASSED [ 21%]
-tests/test_netcdf_reader.py::TestNetCDFReader::test_read_netcdf_file_not_found PASSED [ 26%]
-tests/test_netcdf_reader.py::TestNetCDFReader::test_read_netcdf_invalid_filename PASSED [ 31%]
-tests/test_netcdf_reader.py::TestNetCDFReader::test_read_netcdf_none_zip_ref PASSED [ 36%]
-tests/test_netcdf_reader.py::TestNetCDFReader::test_read_netcdf_success PASSED [ 42%]
-tests/test_processor.py::TestGRUANProcessor::test_process_single_jar_file_no_files PASSED [ 47%]
-tests/test_processor.py::TestGRUANProcessor::test_process_single_jar_file_root_files PASSED [ 52%]
-tests/test_processor.py::TestGRUANProcessor::test_process_single_jar_file_with_revisions PASSED [ 57%]
-tests/test_processor.py::TestGRUANProcessor::test_process_single_nc_file_skip PASSED [ 63%]
-tests/test_processor.py::TestGRUANProcessor::test_process_single_nc_file_success PASSED [ 68%]
-tests/test_processor.py::TestGRUANProcessor::test_save_data_copy_method PASSED [ 73%]
-tests/test_station_manager.py::TestStationManager::test_load_stations PASSED [ 78%]
-tests/test_station_manager.py::TestStationManager::test_scrape_gruan_sites_empty_table PASSED [ 84%]
-tests/test_station_manager.py::TestStationManager::test_scrape_gruan_sites_success PASSED [ 89%]
-tests/test_station_manager.py::TestStationManager::test_singleton PASSED [ 94%]
-tests/test_station_manager.py::TestStationManager::test_update_station_database PASSED [100%]
-
-============= 19 passed in 2.76s =============
-```
-
----
-
-## 10. Known Limitations
+## 9. Known Limitations
 
 ### Current Limitations
 
@@ -448,7 +382,7 @@ See the issue tracker for a complete list of known bugs.
 
 ---
 
-## 11. Documentation Summary
+## 10. Documentation Summary
 
 ### Available Documentation
 
@@ -458,42 +392,3 @@ See the issue tracker for a complete list of known bugs.
 ### Code Documentation
 
 - Docstrings are provided for all major classes and functions (e.g., `GRUANProcessor`, `StationManager`).
-
----
-
-## 12. Support and Contact
-
-### Reporting Issues
-
-To report bugs, please contact the development team or open an issue in the repository.
-
-### Contributing
-
-Contributions are welcome. Please ensure tests pass before submitting changes.
-
-**Maintainer(s):**
-
-- Emanuele Tramutola
-  - Organization: CNR (National Research Council of Italy)
-  - Research Group: C.I.A.O. (CNR-IMAA Atmospheric Observatory)
-  - Institute: IMAA (Institute of Methodologies for Environmental Analysis)
-  - Location: Tito Scalo (PZ), Italy
-
----
-
-## 13. Deliverable Compliance
-
-- [x] Software placed in public repository
-- [x] Complete source code included
-- [x] Documentation included in repository
-- [x] Installation instructions provided
-- [x] Installation does not require administrator privileges
-- [x] Automatic tests included and verified
-- [x] Snapshot of test output provided
-- [x] License specified
-- [x] Software includes version number/release tag
-- [x] Code follows ECMWF coding standards (if applicable)
-- [x] README.md with quick start instructions
-- [x] Example datasets or data access instructions provided
-- [x] Citation information provided (if applicable)
-- [x] Technical specifications documented

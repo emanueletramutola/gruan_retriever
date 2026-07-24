@@ -7,6 +7,7 @@ CREATE TABLE data
     idstation_pk                       int,
     g_product_id                       int,
     report_timestamp                   timestamp with time zone,
+    time                               real,
 
     -- Position and coordinates
     lat                                real,       -- Latitude
