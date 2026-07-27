@@ -53,7 +53,7 @@ CDM_VARIABLES = [
     (73,  'swrad',              None,                 811,   'W m-2',     None,         None,          None,               'u_swrad',     None),
     (125, 'alt',                'alt',                1,     'm',         None,         None,          None,               'u_alt',       'alt_uc'),
     (142, 'press',              'press',              32,    'Pa',        None,         None,          None,               'u_press',     'press_uc'),
-    (143, '_time_since_launch', '_time_since_launch', 3,     's',         None,         None,          None,               None,          None),
+    (143, 'time',               'time',               3,     's',         None,         None,          None,               None,          None),
 ]
 
 # Optional unit conversions applied BEFORE writing.
@@ -238,57 +238,28 @@ def _write_uint16_var(ncf: nc.Dataset, name: str, arr, index_dim: str,
     return var
 
 # ── CDM pivot logic ───────────────────────────────────────────────────────────
-
-def _col_or_nan_orig(df: pd.DataFrame, col: str) -> pd.Series:
-    """Return column if it exists, else a Series of NaN."""
-    if col and col in df.columns:
-        return pd.to_numeric(df[col], errors='coerce')
-    return pd.Series(np.nan, index=df.index, dtype=np.float32)
-
-
-def _col_or_nan_orig(df: pd.DataFrame, column_name_cf_1_4: str,
-                column_name_cf_1_7: str) -> pd.Series:
-    if (column_name_cf_1_4 and column_name_cf_1_4 in df.columns) and \
-            (column_name_cf_1_7 and column_name_cf_1_7 in df.columns):
-        series_cf_1_4 = pd.to_numeric(df[column_name_cf_1_4], errors='coerce')
-        series_cf_1_7 = pd.to_numeric(df[column_name_cf_1_7], errors='coerce')
-
-        return series_cf_1_4.fillna(series_cf_1_7)
-
-    # Fallback if columns are missing
-    return pd.Series(np.nan, index=df.index, dtype=np.float32)
-
-
 def _col_or_nan(df: pd.DataFrame,
                 column_name_cf_1_4: Optional[str] = None,
-                column_name_cf_1_7: Optional[str] = None) -> Optional[
-    pd.Series]:
-    # 1. If both are None, return None
-    # if column_name_cf_1_4 is None and column_name_cf_1_7 is None:
-    #     return None
+                column_name_cf_1_7: Optional[str] = None) -> pd.Series:
+    # 1. Retrieve the 1_4 series if the column exists, otherwise None
+    s1 = None
+    if column_name_cf_1_4 and column_name_cf_1_4 in df.columns:
+        s1 = pd.to_numeric(df[column_name_cf_1_4], errors='coerce')
 
-    # 2. If only cf_1_4 has a value and cf_1_7 is None
-    if column_name_cf_1_4 is not None and column_name_cf_1_7 is None:
-        if column_name_cf_1_4 in df.columns:
-            return pd.to_numeric(df[column_name_cf_1_4], errors='coerce')
-        # Fallback if the column is missing from the DataFrame
-        return pd.Series(np.nan, index=df.index, dtype=np.float32)
+    # 2. Retrieve the 1_7 series if the column exists, otherwise None
+    s2 = None
+    if column_name_cf_1_7 and column_name_cf_1_7 in df.columns:
+        s2 = pd.to_numeric(df[column_name_cf_1_7], errors='coerce')
 
-    # 3. If only cf_1_7 has a value and cf_1_4 is None
-    if column_name_cf_1_7 is not None and column_name_cf_1_4 is None:
-        if column_name_cf_1_7 in df.columns:
-            return pd.to_numeric(df[column_name_cf_1_7], errors='coerce')
-        # Fallback if the column is missing from the DataFrame
-        return pd.Series(np.nan, index=df.index, dtype=np.float32)
+    # 3. Combine the two series handling the different cases
+    if s1 is not None and s2 is not None:
+        return s1.fillna(s2)
+    elif s1 is not None:
+        return s1
+    elif s2 is not None:
+        return s2
 
-    # 4. If both have a value (original behavior)
-    if (column_name_cf_1_4 and column_name_cf_1_4 in df.columns) and \
-            (column_name_cf_1_7 and column_name_cf_1_7 in df.columns):
-        series_cf_1_4 = pd.to_numeric(df[column_name_cf_1_4], errors='coerce')
-        series_cf_1_7 = pd.to_numeric(df[column_name_cf_1_7], errors='coerce')
-
-        return series_cf_1_4.fillna(series_cf_1_7)
-
+    # 4. Fallback if neither column exists or was provided
     return pd.Series(np.nan, index=df.index, dtype=np.float32)
 
 def build_cdm_dataframe(df_merged: pd.DataFrame,
@@ -347,6 +318,8 @@ def build_cdm_dataframe(df_merged: pd.DataFrame,
 
     for entry in CDM_VARIABLES:
         cdm_code, var_name_cf_1_4, var_name_cf_1_7, units, units_str, uc_rand_col, uc_sys_cf_1_4, uc_sys_cf_1_7, uc_tot_cf_1_4, uc_tot_cf_1_7 = entry
+        if cdm_code == 143:
+            ema = ""
 
         obs_val = _col_or_nan(df_merged, var_name_cf_1_4, var_name_cf_1_7).copy()
 
@@ -546,14 +519,14 @@ def export_month(conn_params, year, month, output_dir,
 
     # ── fetch data ────────────────────────────────────────────────────────────
     COLUMNS_DATA_TABLE = [
-        "g_product_id", "'asc'", "alt", "alt_gph", "alt_gph_uc_tcor", "alt_gph_uc", "alt_uc",
+        "g_product_id", "\"asc\"", "alt", "alt_gph", "alt_gph_uc_tcor", "alt_gph_uc", "alt_uc",
         "fp", "fp_uc", "geopot", "idstation_pk", "lat", "lon",
         "observation_id", "press", "press_uc", "report_timestamp", "rh", "rh_res", "rh_uc",
         "rh_uc_tcor", "swrad", "temp", "temp_uc", "temp_uc_tcor", "u", "u_alt",
         "u_cor_rh", "u_cor_temp", "u_press", "u_rh", "u_std_rh", "u_std_temp",
         "u_swrad", "u_temp", "u_wdir", "u_wspeed", "v", "vspeed", "vspeed_uc",
         "wdir", "wdir_uc", "wmeri", "wmeri_uc", "wspeed", "wspeed_uc", "wvmr",
-        "wvmr_vol", "wvmr_vol_uc", "wvmr_vol_uc_tcor", "wzon", "wzon_uc"
+        "wvmr_vol", "wvmr_vol_uc", "wvmr_vol_uc_tcor", "wzon", "wzon_uc", "time"
     ]
 
     engine = get_sqlalchemy_engine(conn_params)
