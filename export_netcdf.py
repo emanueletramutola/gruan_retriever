@@ -521,7 +521,7 @@ def export_month(conn_params, year, month, output_dir,
     COLUMNS_DATA_TABLE = [
         "g_product_id", "\"asc\"", "alt", "alt_gph", "alt_gph_uc_tcor", "alt_gph_uc", "alt_uc",
         "fp", "fp_uc", "geopot", "idstation_pk", "lat", "lon",
-        "observation_id", "press", "press_uc", "report_timestamp", "rh", "rh_res", "rh_uc",
+        "observation_id", "press", "press_uc", "report_timestamp", "rh", "rh_res", "rh_uc", "res_rh",
         "rh_uc_tcor", "swrad", "temp", "temp_uc", "temp_uc_tcor", "u", "u_alt",
         "u_cor_rh", "u_cor_temp", "u_press", "u_rh", "u_std_rh", "u_std_temp",
         "u_swrad", "u_temp", "u_wdir", "u_wspeed", "v", "vspeed", "vspeed_uc",
