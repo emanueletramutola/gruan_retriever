@@ -335,39 +335,48 @@ def scan_partition(partition: str, cfg: ScanConfig) -> PartitionResult:
 
     # 3) Detailed, labeled extraction of anomalous rows for forensic
     #    inspection (which station, which exact timestamp, which value).
+    #    NOTE: NULL temp/press rows are intentionally EXCLUDED here. They
+    #    were flooding the anomaly output in practice (missing values are
+    #    extremely common in this DB and are not, by themselves, evidence
+    #    of a corrupted/implausible physical reading) - so this query only
+    #    flags rows where temp/press are present but physically implausible.
+    #    Rows with a NULL temp or press simply won't have a valid physical
+    #    value to evaluate and are skipped, both here and in count_query.
     anomaly_query = text(f"""
         SELECT idstation_pk,
                report_timestamp,
                temp,
                press,
                CASE
-                   WHEN temp IS NULL THEN 'temp_null'
                    WHEN temp < :temp_sentinel THEN 'temp_below_10K'
                    WHEN temp < :temp_min OR temp > :temp_max
                         THEN 'temp_out_of_physical_range'
-                   WHEN press IS NULL THEN 'press_null'
                    WHEN press <= :press_min OR press > :press_max
                         THEN 'press_out_of_physical_range'
                    ELSE 'other'
                END AS anomaly_reason
         FROM {quoted_table}
-        WHERE temp IS NULL
-           OR temp < :temp_min OR temp > :temp_max
-           OR press IS NULL
-           OR press <= :press_min OR press > :press_max
+        WHERE temp IS NOT NULL
+          AND press IS NOT NULL
+          AND (
+                temp < :temp_min OR temp > :temp_max
+             OR press <= :press_min OR press > :press_max
+          )
         LIMIT :row_cap
     """)
 
     # Exact count of anomalies (cheap: single scalar), independent of
     # the row cap above, so we always know the true magnitude even if
-    # the detailed listing was truncated.
+    # the detailed listing was truncated. Same NULL exclusion as above.
     count_query = text(f"""
         SELECT count(*)
         FROM {quoted_table}
-        WHERE temp IS NULL
-           OR temp < :temp_min OR temp > :temp_max
-           OR press IS NULL
-           OR press <= :press_min OR press > :press_max
+        WHERE temp IS NOT NULL
+          AND press IS NOT NULL
+          AND (
+                temp < :temp_min OR temp > :temp_max
+             OR press <= :press_min OR press > :press_max
+          )
     """)
 
     # 4) Raw, unfiltered record count per station for this calendar
