@@ -131,17 +131,19 @@ except ImportError:  # pragma: no cover - tqdm is optional
 # ---------------------------------------------------------------------------
 
 # Physically plausible bounds for atmospheric temperature (K) and pressure
-# (Pa). These are used ONLY to classify / flag data, never to silently drop
-# anything without a trace: every excluded record is written to the
-# anomalies CSV with an explanatory reason.
+# (hPa - confirmed against the actual DB column, NOT Pa). These are used
+# ONLY to classify / flag data, never to silently drop anything without a
+# trace: every excluded record is written to the anomalies CSV with an
+# explanatory reason.
 DEFAULT_TEMP_MIN_PHYSICAL = 150.0    # ~ -123 degC: colder than any recorded
                                       # atmospheric temperature (surface or
                                       # stratosphere)
 DEFAULT_TEMP_MAX_PHYSICAL = 340.0    # ~ 67 degC: hotter than any recorded
                                       # in-situ atmospheric observation
 DEFAULT_PRESS_MIN_PHYSICAL = 0.0
-DEFAULT_PRESS_MAX_PHYSICAL = 110000.0  # slightly above standard sea-level
-                                        # pressure, as a generous upper bound
+DEFAULT_PRESS_MAX_PHYSICAL = 1100.0    # hPa; slightly above standard
+                                        # sea-level pressure (1013.25 hPa),
+                                        # as a generous upper bound
 
 # Histogram configuration: shared, fixed bin edges (1 K bins by default).
 DEFAULT_HIST_MIN = 150.0
@@ -206,7 +208,7 @@ class PartitionResult:
     raw_press_max: Optional[float]  # outside the expected physical bounds,
                                      # it usually means a unit mismatch
                                      # (e.g. temp stored in degC instead of
-                                     # K, or press in hPa instead of Pa)
+                                     # K, or press in Pa instead of hPa)
                                      # rather than genuinely bad data.
     timestamps: pd.DataFrame     # idstation_pk, report_timestamp, press (all
                                   # rows with a non-null report_timestamp).
@@ -847,10 +849,18 @@ def parse_args() -> argparse.Namespace:
                          "on one month before committing to a full scan. "
                          "Takes precedence over --partitions-limit.")
     p.add_argument("--outdir", default="./gruan_qc_output")
-    p.add_argument("--temp-min-physical", type=float, default=DEFAULT_TEMP_MIN_PHYSICAL)
-    p.add_argument("--temp-max-physical", type=float, default=DEFAULT_TEMP_MAX_PHYSICAL)
-    p.add_argument("--press-min-physical", type=float, default=DEFAULT_PRESS_MIN_PHYSICAL)
-    p.add_argument("--press-max-physical", type=float, default=DEFAULT_PRESS_MAX_PHYSICAL)
+    p.add_argument("--temp-min-physical", type=float, default=DEFAULT_TEMP_MIN_PHYSICAL,
+                    help="Lower bound of the physically plausible temperature "
+                         "range, in Kelvin.")
+    p.add_argument("--temp-max-physical", type=float, default=DEFAULT_TEMP_MAX_PHYSICAL,
+                    help="Upper bound of the physically plausible temperature "
+                         "range, in Kelvin.")
+    p.add_argument("--press-min-physical", type=float, default=DEFAULT_PRESS_MIN_PHYSICAL,
+                    help="Lower bound of the physically plausible pressure "
+                         "range, in hPa.")
+    p.add_argument("--press-max-physical", type=float, default=DEFAULT_PRESS_MAX_PHYSICAL,
+                    help="Upper bound of the physically plausible pressure "
+                         "range, in hPa.")
     p.add_argument("--hist-min", type=float, default=DEFAULT_HIST_MIN)
     p.add_argument("--hist-max", type=float, default=DEFAULT_HIST_MAX)
     p.add_argument("--hist-nbins", type=int, default=DEFAULT_HIST_NBINS)
@@ -989,10 +999,10 @@ def main() -> None:
     print("\n=== Raw value range across scanned partition(s) (NO physical filter) ===")
     print(f"  temp : min={raw['temp_min']!r}  max={raw['temp_max']!r}   "
           f"(expected roughly within [{cfg.temp_min_physical}, {cfg.temp_max_physical}] "
-          f"if the column is really in Kelvin)")
+          f"K)")
     print(f"  press: min={raw['press_min']!r}  max={raw['press_max']!r}   "
           f"(expected roughly within [{cfg.press_min_physical}, {cfg.press_max_physical}] "
-          f"if the column is really in Pa)")
+          f"hPa)")
     if raw["temp_min"] is not None and raw["temp_max"] is not None:
         if raw["temp_max"] < 100.0:
             print("  WARNING: raw temp max is well under 100 - this column looks like "
@@ -1001,11 +1011,11 @@ def main() -> None:
                   "as an anomaly. Consider adding 273.15 in the query, or rerunning "
                   "with --temp-min-physical / --temp-max-physical set for degC.")
     if raw["press_min"] is not None and raw["press_max"] is not None:
-        if raw["press_max"] < 2000.0:
-            print("  WARNING: raw press max is well under 2000 - this column looks like "
-                  "it's in hPa (millibar), not Pa. Consider multiplying by 100 in the "
-                  "query, or rerunning with --press-min-physical / --press-max-physical "
-                  "set for hPa (e.g. 0 and 1100).")
+        if raw["press_max"] > 2000.0:
+            print("  WARNING: raw press max is well over 2000 - this column looks like "
+                  "it's in Pa, not hPa. Consider dividing by 100 in the query, or "
+                  "rerunning with --press-min-physical / --press-max-physical set "
+                  "for Pa (e.g. 0 and 110000).")
 
     station_meta = fetch_station_metadata(dsn)
     station_names = station_meta["name"].to_dict() if not station_meta.empty else {}
