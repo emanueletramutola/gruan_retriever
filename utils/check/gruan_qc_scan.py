@@ -200,6 +200,14 @@ class PartitionResult:
     anomalies: pd.DataFrame      # detailed anomalous rows
     n_anomalies_total: int       # true count, may exceed len(anomalies) if capped
     coverage_counts: pd.Series   # idstation_pk -> raw record count in this partition
+    raw_temp_min: Optional[float]   # UNFILTERED min/max of temp and press in
+    raw_temp_max: Optional[float]   # this partition (NULLs excluded only).
+    raw_press_min: Optional[float]  # Diagnostic only: if these fall wildly
+    raw_press_max: Optional[float]  # outside the expected physical bounds,
+                                     # it usually means a unit mismatch
+                                     # (e.g. temp stored in degC instead of
+                                     # K, or press in hPa instead of Pa)
+                                     # rather than genuinely bad data.
     timestamps: pd.DataFrame     # idstation_pk, report_timestamp, press (all
                                   # rows with a non-null report_timestamp).
                                   # NOTE: the row-level uniqueness key of
@@ -382,6 +390,19 @@ def scan_partition(partition: str, cfg: ScanConfig) -> PartitionResult:
         WHERE report_timestamp IS NOT NULL
     """)
 
+    # 6) Diagnostic only: TRUE min/max of temp and press with NO physical
+    #    filter applied at all (only NULLs excluded). This is what lets us
+    #    tell "genuinely corrupted data" apart from "wrong unit assumption
+    #    in DEFAULT_TEMP_*/DEFAULT_PRESS_* / --temp-*-physical /
+    #    --press-*-physical" - e.g. if raw temp values sit around -60..20,
+    #    the column is almost certainly in degC, not K, and EVERY row would
+    #    be (wrongly) flagged as an anomaly by the physical-range filters.
+    raw_range_query = text(f"""
+        SELECT min(temp) AS raw_temp_min, max(temp) AS raw_temp_max,
+               min(press) AS raw_press_min, max(press) AS raw_press_max
+        FROM {quoted_table}
+    """)
+
     params = {
         "temp_min": cfg.temp_min_physical,
         "temp_max": cfg.temp_max_physical,
@@ -401,6 +422,7 @@ def scan_partition(partition: str, cfg: ScanConfig) -> PartitionResult:
         coverage_df = pd.read_sql_query(coverage_query, conn, params=params)
         timestamps_df = pd.read_sql_query(timestamps_query, conn, params=params)
         n_anomalies_total = conn.execute(count_query, params).scalar_one()
+        raw_range_row = conn.execute(raw_range_query, params).mappings().one()
 
     if len(anomalies_df) >= MAX_ANOMALY_ROWS_PER_PARTITION:
         log.warning(
@@ -424,6 +446,10 @@ def scan_partition(partition: str, cfg: ScanConfig) -> PartitionResult:
         anomalies=anomalies_df,
         n_anomalies_total=n_anomalies_total,
         coverage_counts=coverage_series,
+        raw_temp_min=raw_range_row["raw_temp_min"],
+        raw_temp_max=raw_range_row["raw_temp_max"],
+        raw_press_min=raw_range_row["raw_press_min"],
+        raw_press_max=raw_range_row["raw_press_max"],
         timestamps=timestamps_df,
         elapsed_s=elapsed,
     )
@@ -450,6 +476,12 @@ class ResultAccumulator:
         self._partitions_done = 0
         # Coverage: (partition, station) -> raw record count
         self._coverage_rows = []
+        # Diagnostic: TRUE min/max across the whole run, no physical filter
+        # (see raw_range_query in scan_partition for why this matters).
+        self._raw_temp_min = np.inf
+        self._raw_temp_max = -np.inf
+        self._raw_press_min = np.inf
+        self._raw_press_max = -np.inf
         # Timestamps, one small DataFrame per partition, concatenated later.
         self._ts_frames = []
 
@@ -475,6 +507,15 @@ class ResultAccumulator:
 
         for station, n in result.coverage_counts.items():
             self._coverage_rows.append((result.partition, station, int(n)))
+
+        if result.raw_temp_min is not None:
+            self._raw_temp_min = min(self._raw_temp_min, result.raw_temp_min)
+        if result.raw_temp_max is not None:
+            self._raw_temp_max = max(self._raw_temp_max, result.raw_temp_max)
+        if result.raw_press_min is not None:
+            self._raw_press_min = min(self._raw_press_min, result.raw_press_min)
+        if result.raw_press_max is not None:
+            self._raw_press_max = max(self._raw_press_max, result.raw_press_max)
 
         if len(result.timestamps) > 0:
             self._ts_frames.append(result.timestamps)
@@ -546,6 +587,18 @@ class ResultAccumulator:
     @property
     def partitions_done(self) -> int:
         return self._partitions_done
+
+    @property
+    def raw_range(self) -> dict:
+        """TRUE min/max of temp and press across everything scanned, with
+        NO physical filter applied - diagnostic for spotting a unit
+        mismatch (see raw_range_query in scan_partition)."""
+        return {
+            "temp_min": None if self._raw_temp_min == np.inf else self._raw_temp_min,
+            "temp_max": None if self._raw_temp_max == -np.inf else self._raw_temp_max,
+            "press_min": None if self._raw_press_min == np.inf else self._raw_press_min,
+            "press_max": None if self._raw_press_max == -np.inf else self._raw_press_max,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -787,6 +840,12 @@ def parse_args() -> argparse.Namespace:
                     help="Number of parallel worker processes / DB connections.")
     p.add_argument("--partitions-limit", type=int, default=None,
                     help="Only scan the first N discovered partitions (smoke test).")
+    p.add_argument("--month", type=str, default=None,
+                    help="Only scan a single monthly partition, given as "
+                         "YYYYMM (e.g. --month 202301 scans only "
+                         "'data_202301'). Useful to isolate/debug anomalies "
+                         "on one month before committing to a full scan. "
+                         "Takes precedence over --partitions-limit.")
     p.add_argument("--outdir", default="./gruan_qc_output")
     p.add_argument("--temp-min-physical", type=float, default=DEFAULT_TEMP_MIN_PHYSICAL)
     p.add_argument("--temp-max-physical", type=float, default=DEFAULT_TEMP_MAX_PHYSICAL)
@@ -873,8 +932,24 @@ def main() -> None:
 
     log.info("Discovering data_YYYYMM partitions ...")
     partitions = list_data_partitions(dsn)
-    if args.partitions_limit:
+
+    if args.month:
+        if not re.match(r"^\d{6}$", args.month):
+            raise SystemExit(
+                f"--month must be YYYYMM (6 digits), got: {args.month!r}"
+            )
+        target = f"data_{args.month}"
+        if target not in partitions:
+            raise SystemExit(
+                f"Partition '{target}' not found. Available partitions: "
+                f"{partitions[0]}..{partitions[-1]} ({len(partitions)} total)."
+            )
+        partitions = [target]
+        log.info("--month %s given: restricting scan to partition '%s' only.",
+                  args.month, target)
+    elif args.partitions_limit:
         partitions = partitions[: args.partitions_limit]
+
     log.info("Will scan %d partitions with %d parallel workers.",
               len(partitions), args.workers)
 
@@ -905,6 +980,32 @@ def main() -> None:
         accumulator.partitions_done, len(partitions), elapsed,
         accumulator.n_anomalies_total,
     )
+
+    # --- Unit-mismatch diagnostic -------------------------------------------
+    # Printed BEFORE the QC results below because if this looks wrong,
+    # every anomaly count downstream is likely an artifact of the wrong
+    # --temp-*-physical / --press-*-physical bounds, not real bad data.
+    raw = accumulator.raw_range
+    print("\n=== Raw value range across scanned partition(s) (NO physical filter) ===")
+    print(f"  temp : min={raw['temp_min']!r}  max={raw['temp_max']!r}   "
+          f"(expected roughly within [{cfg.temp_min_physical}, {cfg.temp_max_physical}] "
+          f"if the column is really in Kelvin)")
+    print(f"  press: min={raw['press_min']!r}  max={raw['press_max']!r}   "
+          f"(expected roughly within [{cfg.press_min_physical}, {cfg.press_max_physical}] "
+          f"if the column is really in Pa)")
+    if raw["temp_min"] is not None and raw["temp_max"] is not None:
+        if raw["temp_max"] < 100.0:
+            print("  WARNING: raw temp max is well under 100 - this column looks like "
+                  "it's in degrees Celsius, not Kelvin. That alone would make almost "
+                  "every row fail the [150, 340] K physical-range filter and show up "
+                  "as an anomaly. Consider adding 273.15 in the query, or rerunning "
+                  "with --temp-min-physical / --temp-max-physical set for degC.")
+    if raw["press_min"] is not None and raw["press_max"] is not None:
+        if raw["press_max"] < 2000.0:
+            print("  WARNING: raw press max is well under 2000 - this column looks like "
+                  "it's in hPa (millibar), not Pa. Consider multiplying by 100 in the "
+                  "query, or rerunning with --press-min-physical / --press-max-physical "
+                  "set for hPa (e.g. 0 and 1100).")
 
     station_meta = fetch_station_metadata(dsn)
     station_names = station_meta["name"].to_dict() if not station_meta.empty else {}
