@@ -146,9 +146,25 @@ DEFAULT_PRESS_MAX_PHYSICAL = 1100.0    # hPa; slightly above standard
                                         # as a generous upper bound
 
 # Histogram configuration: shared, fixed bin edges (1 K bins by default).
+# NOTE: these are only used as a FALLBACK when --hist-min/--hist-max are
+# given explicitly, or when --no-hist-auto-range is passed. By default the
+# histogram range is now auto-detected from the true min/max temp in the DB
+# (see scan_temp_range() / --hist-auto-range) so that outliers are shown
+# in-band, spread across real bins, instead of being lumped into a single
+# underflow/overflow bucket at the edge of a range chosen in advance.
 DEFAULT_HIST_MIN = 150.0
 DEFAULT_HIST_MAX = 340.0
 DEFAULT_HIST_NBINS = 190
+# Target bin width (K) used to size the histogram once the auto-detected
+# range is known, so resolution stays ~constant regardless of how wide the
+# true data range turns out to be.
+HIST_TARGET_BIN_WIDTH = 1.0
+# Padding (K) added on each side of the auto-detected [min, max] so the
+# most extreme points aren't drawn right on the plot border.
+HIST_AUTO_RANGE_MARGIN = 5.0
+# Safety cap on the number of bins an auto-detected range can produce (in
+# case of a wild sentinel value like -999), so the figure stays renderable.
+HIST_AUTO_RANGE_MAX_BINS = 4000
 
 # Hard threshold explicitly called out by the researcher.
 TEMP_BELOW_SENTINEL = 10.0
@@ -260,6 +276,22 @@ def get_engine(dsn: dict) -> Engine:
         )
         _ENGINE_CACHE[key] = engine
     return engine
+
+
+def scan_temp_range(partition: str, dsn: dict) -> tuple[Optional[float], Optional[float]]:
+    """Lightweight pre-pass: TRUE min/max of temp in one partition, no other
+    aggregation. Used to auto-size the histogram range (see --hist-auto-range)
+    BEFORE the expensive full scan_partition() pass runs, so the shared bin
+    edges cover every value in the DB and nothing gets silently lumped into
+    an edge underflow/overflow bucket. Cheap: a single MIN/MAX aggregate,
+    same cost class as the diagnostic raw_range_query in scan_partition."""
+    engine = get_engine(dsn)
+    quoted_table = f'"{partition}"'
+    query = text(f"SELECT min(temp) AS temp_min, max(temp) AS temp_max "
+                 f"FROM {quoted_table} WHERE temp IS NOT NULL")
+    with engine.connect() as conn:
+        row = conn.execute(query).mappings().one()
+    return row["temp_min"], row["temp_max"]
 
 
 def list_data_partitions(dsn: dict) -> list[str]:
@@ -808,13 +840,32 @@ def plot_histograms(histograms: dict[int, np.ndarray], cfg: ScanConfig,
         ax = axes[i // ncols][i % ncols]
         arr = histograms[station]
         underflow, in_range, overflow = arr[0], arr[1:-1], arr[-1]
-        ax.bar(centers, in_range, width=(edges[1] - edges[0]), color="steelblue",
-               edgecolor="none")
+
+        # Shade the physically-plausible band so it's obvious at a glance
+        # which bars, if any, fall outside it - the whole point of no
+        # longer clipping the x-axis to that same band.
+        ax.axvspan(cfg.temp_min_physical, cfg.temp_max_physical,
+                   color="mediumseagreen", alpha=0.12, zorder=0, lw=0)
+
+        # Color bars outside the physically-plausible band differently so
+        # anomalies stand out even at a glance, without needing to read
+        # the axis values.
+        in_band = (centers >= cfg.temp_min_physical) & (centers <= cfg.temp_max_physical)
+        colors = np.where(in_band, "steelblue", "firebrick")
+        ax.bar(centers, in_range, width=(edges[1] - edges[0]), color=colors,
+               edgecolor="none", zorder=2)
         ax.set_yscale("log")
         title = station_names.get(station, str(station)) if station_names else str(station)
+        # With an auto-detected range these should normally be 0/0 - kept
+        # as a safety net in case new data landed between the range
+        # pre-pass and the histogram pass, or an explicit narrower range
+        # was requested via --hist-min/--hist-max.
         anomaly_note = ""
         if underflow or overflow:
             anomaly_note = f"\nunderflow={underflow}, overflow={overflow}"
+        n_out_of_band = int(in_range[~in_band].sum()) + int(underflow) + int(overflow)
+        if n_out_of_band:
+            anomaly_note += f"\n{n_out_of_band} outside [{cfg.temp_min_physical:.0f}, {cfg.temp_max_physical:.0f}] K"
         ax.set_title(f"Station {title}{anomaly_note}", fontsize=9)
         ax.set_xlabel("Temperature (K)", fontsize=8)
         ax.set_ylabel("Count (log)", fontsize=8)
@@ -825,8 +876,10 @@ def plot_histograms(histograms: dict[int, np.ndarray], cfg: ScanConfig,
 
     fig.suptitle(
         "GRUAN per-station temperature histograms (all pressure levels combined)\n"
-        f"Bin range [{cfg.hist_min}, {cfg.hist_max}] K, {cfg.hist_nbins} bins; "
-        "log-scale y-axis to expose rare anomalies",
+        f"Full data range shown: bins [{cfg.hist_min:.1f}, {cfg.hist_max:.1f}] K "
+        f"({cfg.hist_nbins} bins); shaded band = physically plausible range "
+        f"[{cfg.temp_min_physical:.0f}, {cfg.temp_max_physical:.0f}] K; "
+        "red bars = outside it; log-scale y-axis",
         fontsize=12,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.96))
@@ -870,9 +923,29 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--press-max-physical", type=float, default=DEFAULT_PRESS_MAX_PHYSICAL,
                     help="Upper bound of the physically plausible pressure "
                          "range, in hPa.")
-    p.add_argument("--hist-min", type=float, default=DEFAULT_HIST_MIN)
-    p.add_argument("--hist-max", type=float, default=DEFAULT_HIST_MAX)
-    p.add_argument("--hist-nbins", type=int, default=DEFAULT_HIST_NBINS)
+    p.add_argument("--hist-min", type=float, default=None,
+                    help="Lower bound of the histogram bin range, in Kelvin. "
+                         "If omitted (default), it is auto-detected from the "
+                         "TRUE min temp in the DB minus a margin, so every "
+                         "value - including out-of-physical-range anomalies "
+                         "- lands in a visible bin instead of a lumped "
+                         "underflow bucket. Passing this explicitly disables "
+                         "auto-detection for the lower bound.")
+    p.add_argument("--hist-max", type=float, default=None,
+                    help="Upper bound of the histogram bin range, in Kelvin. "
+                         "Same auto-detection behaviour as --hist-min.")
+    p.add_argument("--hist-nbins", type=int, default=None,
+                    help="Number of histogram bins. If omitted, it is "
+                         "derived from the (auto-detected or explicit) "
+                         "range to keep ~1 K per bin, up to a cap of "
+                         f"{HIST_AUTO_RANGE_MAX_BINS} bins.")
+    p.add_argument("--no-hist-auto-range", dest="hist_auto_range",
+                    action="store_false", default=True,
+                    help="Disable auto-detection of the histogram range and "
+                         "fall back to the fixed defaults "
+                         f"[{DEFAULT_HIST_MIN}, {DEFAULT_HIST_MAX}] K "
+                         f"({DEFAULT_HIST_NBINS} bins) unless --hist-min/"
+                         "--hist-max/--hist-nbins are given explicitly.")
     p.add_argument("--continuity-relative-gap-factor", type=float,
                     default=CONTINUITY_RELATIVE_GAP_FACTOR,
                     help="Flag a gap if it exceeds this multiple of the "
@@ -938,17 +1011,6 @@ def main() -> None:
     log.info("Connecting to %s:%s/%s as %s (credentials loaded from %s)",
               dsn["host"], dsn["port"], dsn["dbname"], dsn["user"], args.env_file)
 
-    cfg = ScanConfig(
-        dsn=dsn,
-        temp_min_physical=args.temp_min_physical,
-        temp_max_physical=args.temp_max_physical,
-        press_min_physical=args.press_min_physical,
-        press_max_physical=args.press_max_physical,
-        hist_min=args.hist_min,
-        hist_max=args.hist_max,
-        hist_nbins=args.hist_nbins,
-    )
-
     log.info("Discovering data_YYYYMM partitions ...")
     partitions = list_data_partitions(dsn)
 
@@ -971,6 +1033,82 @@ def main() -> None:
 
     log.info("Will scan %d partitions with %d parallel workers.",
               len(partitions), args.workers)
+
+    # --- Histogram range: auto-detect from the true data unless the user
+    # pinned it explicitly or passed --no-hist-auto-range. This is a cheap
+    # MIN/MAX-only pre-pass over the same partitions, so the real histogram
+    # pass below can use bin edges that cover every value in the DB -
+    # nothing lands in a lumped underflow/overflow bucket anymore, so
+    # anomalies remain visible, spread out, in the plot itself. -----------
+    hist_min, hist_max, hist_nbins = args.hist_min, args.hist_max, args.hist_nbins
+    need_auto = args.hist_auto_range and (hist_min is None or hist_max is None)
+    if need_auto:
+        log.info("Auto-detecting histogram range: scanning true min/max "
+                  "temp across %d partitions ...", len(partitions))
+        t0 = time.time()
+        global_min, global_max = np.inf, -np.inf
+        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+            futures = {
+                executor.submit(scan_temp_range, partition, dsn): partition
+                for partition in partitions
+            }
+            iterator = as_completed(futures)
+            if tqdm is not None:
+                iterator = tqdm(iterator, total=len(futures),
+                                 desc="Detecting temp range")
+            for future in iterator:
+                partition = futures[future]
+                try:
+                    part_min, part_max = future.result()
+                except Exception:
+                    log.exception("Range pre-pass failed for %s - skipping "
+                                  "it for range detection (still scanned "
+                                  "normally below).", partition)
+                    continue
+                if part_min is not None:
+                    global_min = min(global_min, part_min)
+                if part_max is not None:
+                    global_max = max(global_max, part_max)
+        if global_min == np.inf or global_max == -np.inf:
+            log.warning("Range pre-pass found no non-NULL temp values; "
+                        "falling back to fixed defaults [%s, %s] K.",
+                        DEFAULT_HIST_MIN, DEFAULT_HIST_MAX)
+            hist_min = hist_min if hist_min is not None else DEFAULT_HIST_MIN
+            hist_max = hist_max if hist_max is not None else DEFAULT_HIST_MAX
+        else:
+            if hist_min is None:
+                hist_min = math.floor(global_min - HIST_AUTO_RANGE_MARGIN)
+            if hist_max is None:
+                hist_max = math.ceil(global_max + HIST_AUTO_RANGE_MARGIN)
+            log.info(
+                "True temp range across DB: [%.2f, %.2f] K (%.1f s). Using "
+                "histogram range [%.1f, %.1f] K.",
+                global_min, global_max, time.time() - t0, hist_min, hist_max,
+            )
+    else:
+        hist_min = hist_min if hist_min is not None else DEFAULT_HIST_MIN
+        hist_max = hist_max if hist_max is not None else DEFAULT_HIST_MAX
+
+    if hist_nbins is None:
+        span = max(hist_max - hist_min, 1e-6)
+        hist_nbins = min(
+            HIST_AUTO_RANGE_MAX_BINS,
+            max(DEFAULT_HIST_NBINS, int(round(span / HIST_TARGET_BIN_WIDTH))),
+        )
+        log.info("Auto-sized histogram bins: %d bins over [%.1f, %.1f] K "
+                  "(~%.2f K/bin).", hist_nbins, hist_min, hist_max,
+                  span / hist_nbins)
+
+    cfg = ScanConfig(
+        dsn=dsn,
+        temp_min_physical=args.temp_min_physical,
+        temp_max_physical=args.temp_max_physical,
+        press_min_physical=args.press_min_physical,
+        press_max_physical=args.press_max_physical,
+        hist_min=hist_min,
+        hist_max=hist_max,
+        hist_nbins=hist_nbins,
+    )
 
     accumulator = ResultAccumulator(cfg)
     t_start = time.time()
