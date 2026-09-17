@@ -40,7 +40,7 @@ TIME_CALENDAR   = "proleptic_gregorian"
 CDM_VARIABLES = [
     # code var_name_cf_1_4      var_name_cf_1_7       unit   units_str    uc_rand       uc_sys_cf_1_4  uc_sys_cf_1_7,      uc_tot_cf_1_4  uc_tot_cf_1_7
     (126, 'temp',               'temp',               5,     'K',         'u_std_temp', 'u_cor_temp',  'temp_uc_tcor',     'u_temp',      'temp_uc'),
-    (138, 'rh',                 'rh',                 1016,  '1',         'u_std_rh',   'u_cor_rh',    'rh_uc_tcor',       'u_rh',        'rh_uc'),
+    (138, 'rh',                 'rh',                 300,   '%',         'u_std_rh',   'u_cor_rh',    'rh_uc_tcor',       'u_rh',        'rh_uc'),
     (106, 'wdir',               'wdir',               110,   'degree',    None,         None,          None,               'u_wdir',      'wdir_uc'),
     (107, 'wspeed',             'wspeed',             731,   'm s-1',     None,         None,          None,               'u_wspeed',    'wspeed_uc'),
     (104, 'u',                  'wzon',               731,   'm s-1',     None,         None,          None,               None,          'wzon_uc'),
@@ -318,8 +318,6 @@ def build_cdm_dataframe(df_merged: pd.DataFrame,
 
     for entry in CDM_VARIABLES:
         cdm_code, var_name_cf_1_4, var_name_cf_1_7, units, units_str, uc_rand_col, uc_sys_cf_1_4, uc_sys_cf_1_7, uc_tot_cf_1_4, uc_tot_cf_1_7 = entry
-        if cdm_code == 143:
-            ema = ""
 
         obs_val = _col_or_nan(df_merged, var_name_cf_1_4, var_name_cf_1_7).copy()
 
@@ -606,6 +604,10 @@ def export_month(conn_params, year, month, output_dir,
     ).copy()
     print(f"  Merged rows : {len(df_merged):,}")
 
+    for col, (scale, offset) in UNIT_TRANSFORMS.items():
+        if col in df_merged.columns:
+            df_merged[col] = df_merged[col] * scale + offset
+
     # ── pivot to CDM long format ──────────────────────────────────────────────
     cdm = build_cdm_dataframe(df_merged, station_lookup or {})
     print(f"  CDM rows    : {len(cdm):,}  ({len(CDM_VARIABLES)} vars × {len(df_merged):,} levels)")
@@ -654,13 +656,13 @@ def main():
     if args.end_year:
         months = [(y, m) for y, m in months if y <= args.end_year]
 
-    print(f'Months to export: {len(months)}')
+    # print(f'Months to export: {len(months)}')
     station_lookup = load_station_record_numbers(conn_params)
     for y, m in months:
         export_month(conn_params, y, m, output_dir, args.data_table, args.header_table,
                      station_lookup=station_lookup)
-    # y = 2018
-    # m = 5
+    # y = 2025
+    # m = 2
     # export_month(conn_params, y, m, output_dir, args.data_table, args.header_table,
     #              station_lookup=station_lookup)
     print('\nDone.')
