@@ -1,395 +1,234 @@
 #!/bin/bash
-# ==============================
-# GRUAN Database Export Script
-# ==============================
-# Description: Exports partitioned data tables and header metadata table from the GRUAN database to compressed CSV files
-# Usage: ./script.sh [OPTIONS]
-# Options:
-#   -s, --start-year YEAR    Start year for data partition export (default: 2004)
-#   -e, --end-year YEAR      End year for data partition export (default: 2025)
-#   -d, --database DB        Database name (default: gruan)
-#   -U, --username USER      Database username (default: gruan_user)
-#   -h, --host HOST          Database host (default: localhost)
-#   -p, --port PORT          Database port (default: 5432)
-#   --header-only            Export only the header table (skip data partitions)
-#   --no-compress            Skip compression (keep files as CSV)
-#   --help                   Display this help message
-# ==============================
+#
+# dump_gruan.sh
+#
+# Exports all GRUAN-related tables (header, files_to_import, station, and the
+# monthly data_YYYYMM tables) from a PostgreSQL database to CSV files, then
+# compresses each CSV with pbzip2.
+#
+# Connection parameters can be overridden via environment variables:
+#   DB_NAME, DB_USER, DB_HOST, DB_PORT, PGPASSWORD
+# The database password can be supplied via PGPASSWORD or via a ~/.pgpass file.
+#
+# Usage:
+#   ./dump_gruan.sh [-b BASE_PATH] [-s START_YEAR] [-e END_YEAR] [-j COMPRESSION_THREADS]
+#
+# Exit codes:
+#   0  - success (all exports and compressions completed)
+#   1  - fatal error (missing dependency, cannot create output dir, DB unreachable)
+#   2  - completed with one or more non-fatal export failures
 
-# ==============================
-# Default Configuration
-# ==============================
-#BASE_PATH="/Users/emanuele/Data/GRUAN_DUMP"
-BASE_PATH="/Users/emanuele/Library/CloudStorage/OneDrive-CNR/backup/GRUAN"
-START_YEAR=2004
-END_YEAR=2025
-DB_NAME="gruan"
-DB_USERNAME="gruan_user"
-DB_HOST="localhost"
-DB_PORT="5432"
-HEADER_ONLY=false
-COMPRESS=true
+set -Eeuo pipefail
+IFS=$'\n\t'
 
-# ==============================
-# Help Function
-# ==============================
-show_help() {
-    cat << EOF
-GRUAN Database Export Script
+# --------------------------------------------------------------------------
+# Configuration (overridable via environment variables and/or CLI options)
+# --------------------------------------------------------------------------
+BASE_PATH="${BASE_PATH:-/backup/GRUAN}"
+DB_NAME="${DB_NAME:-gruan}"
+DB_USER="${DB_USER:-gruan_user}"
+DB_HOST="${DB_HOST:-localhost}"
+DB_PORT="${DB_PORT:-5432}"
+START_YEAR="${START_YEAR:-2004}"
+END_YEAR="${END_YEAR:-2030}"
+COMPRESSION_THREADS="${COMPRESSION_THREADS:-4}"
 
-Exports partitioned data tables (data_YYYY) and header metadata table from GRUAN database.
+CURRENT_DATE="$(date +%Y%m%d)"
+CURRENT_YEAR="$(date +%Y)"
+CURRENT_MONTH="$(date +%-m)"
+OUTPUT_DIR="${BASE_PATH}/${CURRENT_DATE}"
+LOG_FILE="${OUTPUT_DIR}/dump_gruan.log"
 
-Usage: $(basename "$0") [OPTIONS]
+FAILED_TABLES=()
+EXPORTED_COUNT=0
+
+# --------------------------------------------------------------------------
+# Logging helpers
+# --------------------------------------------------------------------------
+log() {
+    local level="$1"; shift
+    local ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    local line="[${ts}] [${level}] $*"
+    echo "${line}"
+    # Log to file too, once OUTPUT_DIR exists
+    if [ -d "${OUTPUT_DIR}" ]; then
+        echo "${line}" >> "${LOG_FILE}"
+    fi
+}
+
+log_info()  { log "INFO"  "$@"; }
+log_warn()  { log "WARN"  "$@"; }
+log_error() { log "ERROR" "$@" >&2; }
+
+die() {
+    log_error "$@"
+    exit 1
+}
+
+# --------------------------------------------------------------------------
+# Cleanup / trap handling
+# --------------------------------------------------------------------------
+on_error() {
+    local exit_code=$?
+    local line_no=$1
+    log_error "Script aborted unexpectedly at line ${line_no} (exit code ${exit_code})."
+    exit "${exit_code}"
+}
+trap 'on_error ${LINENO}' ERR
+
+# --------------------------------------------------------------------------
+# Usage
+# --------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [-b BASE_PATH] [-s START_YEAR] [-e END_YEAR] [-j THREADS]
 
 Options:
-    -s, --start-year YEAR       Start year for data partition export (default: ${START_YEAR})
-    -e, --end-year YEAR         End year for data partition export (default: ${END_YEAR})
-    -d, --database DB           Database name (default: ${DB_NAME})
-    -U, --username USER         Database username (default: ${DB_USERNAME})
-    -h, --host HOST             Database host (default: ${DB_HOST})
-    -p, --port PORT             Database port (default: ${DB_PORT})
-    --header-only               Export only the header table (skip data partitions)
-    --no-compress               Skip compression (keep files as CSV)
-    --help                      Display this help message
+  -b BASE_PATH   Base backup directory (default: ${BASE_PATH})
+  -s START_YEAR  First year to export data for (default: ${START_YEAR})
+  -e END_YEAR    Last year to export data for (default: ${END_YEAR})
+  -j THREADS     Number of threads for pbzip2 compression (default: ${COMPRESSION_THREADS})
+  -h             Show this help message and exit
 
-Examples:
-    $(basename "$0") -s 2018 -e 2020
-    $(basename "$0") --start-year 2015 --end-year 2019
-    $(basename "$0") -h localhost -p 5432 -U gruan_user -d gruan
-    $(basename "$0") --header-only
-    $(basename "$0") --header-only --no-compress
-
-Notes:
-    - Always exports the 'header' metadata table
-    - Exports data partition tables in the format: data_YYYY
-    - Uses PGPASSWORD environment variable for authentication
-    - Default username: gruan_user (password from GRUAN_USER_PSW environment variable)
-
+Database connection is configured via environment variables:
+  DB_NAME (default: gruan)
+  DB_USER (default: gruan_user)
+  DB_HOST (default: localhost)
+  DB_PORT (default: 5432)
+  PGPASSWORD (optional; falls back to ~/.pgpass if unset)
 EOF
 }
 
-# ==============================
-# Parse Command Line Arguments
-# ==============================
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -s|--start-year)
-            if [[ -z "${2:-}" ]] || [[ "$2" =~ ^- ]]; then
-                echo "Error: --start-year requires a year argument" >&2
-                exit 1
-            fi
-            START_YEAR="$2"
-            shift 2
-            ;;
-        -e|--end-year)
-            if [[ -z "${2:-}" ]] || [[ "$2" =~ ^- ]]; then
-                echo "Error: --end-year requires a year argument" >&2
-                exit 1
-            fi
-            END_YEAR="$2"
-            shift 2
-            ;;
-        -d|--database)
-            if [[ -z "${2:-}" ]] || [[ "$2" =~ ^- ]]; then
-                echo "Error: --database requires a database name argument" >&2
-                exit 1
-            fi
-            DB_NAME="$2"
-            shift 2
-            ;;
-        -U|--username)
-            if [[ -z "${2:-}" ]] || [[ "$2" =~ ^- ]]; then
-                echo "Error: --username requires a username argument" >&2
-                exit 1
-            fi
-            DB_USERNAME="$2"
-            shift 2
-            ;;
-        -h|--host)
-            if [[ -z "${2:-}" ]] || [[ "$2" =~ ^- ]]; then
-                echo "Error: --host requires a host argument" >&2
-                exit 1
-            fi
-            DB_HOST="$2"
-            shift 2
-            ;;
-        -p|--port)
-            if [[ -z "${2:-}" ]] || [[ "$2" =~ ^- ]]; then
-                echo "Error: --port requires a port argument" >&2
-                exit 1
-            fi
-            DB_PORT="$2"
-            shift 2
-            ;;
-        --header-only)
-            HEADER_ONLY=true
-            shift
-            ;;
-        --no-compress)
-            COMPRESS=false
-            shift
-            ;;
-        --help)
-            show_help
-            exit 0
-            ;;
-        *)
-            echo "Error: Unknown option: $1" >&2
-            echo "Use --help for usage information" >&2
-            exit 1
-            ;;
+while getopts ":b:s:e:j:h" opt; do
+    case "${opt}" in
+        b) BASE_PATH="${OPTARG}"; OUTPUT_DIR="${BASE_PATH}/${CURRENT_DATE}"; LOG_FILE="${OUTPUT_DIR}/dump_gruan.log" ;;
+        s) START_YEAR="${OPTARG}" ;;
+        e) END_YEAR="${OPTARG}" ;;
+        j) COMPRESSION_THREADS="${OPTARG}" ;;
+        h) usage; exit 0 ;;
+        \?) echo "Invalid option: -${OPTARG}" >&2; usage; exit 1 ;;
+        :) echo "Option -${OPTARG} requires an argument." >&2; usage; exit 1 ;;
     esac
 done
 
-# ==============================
-# Validation
-# ==============================
-# Validate year format and range
-if ! [[ "$START_YEAR" =~ ^[0-9]{4}$ ]] || ! [[ "$END_YEAR" =~ ^[0-9]{4}$ ]]; then
-    echo "Error: Years must be in YYYY format" >&2
-    exit 1
-fi
-
-if [[ "$START_YEAR" -gt "$END_YEAR" ]]; then
-    echo "Error: Start year cannot be greater than end year" >&2
-    exit 1
-fi
-
-# Validate database connection parameters
-if [[ -z "$DB_NAME" ]]; then
-    echo "Error: Database name cannot be empty" >&2
-    exit 1
-fi
-
-if [[ -z "$DB_USERNAME" ]]; then
-    echo "Error: Database username cannot be empty" >&2
-    exit 1
-fi
-
-# Check if password environment variable is set
-if [[ -z "$GRUAN_USER_PSW" ]]; then
-    echo "Error: GRUAN_USER_PSW environment variable is not set" >&2
-    echo "Please set the password using: export GRUAN_USER_PSW='your_password'" >&2
-    exit 1
-fi
-
-# Set PostgreSQL password environment variable
-export PGPASSWORD="$GRUAN_USER_PSW"
-
-# Validate database connection
-if ! psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USERNAME" -d "$DB_NAME" -c "SELECT 1" >/dev/null 2>&1; then
-    echo "Error: Cannot connect to database '${DB_NAME}' as user '${DB_USERNAME}' on ${DB_HOST}:${DB_PORT}" >&2
-    echo "Please check your database connection parameters and ensure the database is running." >&2
-    unset PGPASSWORD
-    exit 1
-fi
-
-# ==============================
-# Setup
-# ==============================
-# Get the current date in YYYYMMDD format
-CURRENT_DATE=$(date +%Y%m%d)
-
-# Create the output directory
-OUTPUT_DIR="${BASE_PATH}/${CURRENT_DATE}"
-mkdir -p "${OUTPUT_DIR}"
-
-# Validate output directory permissions
-if [[ ! -w "$OUTPUT_DIR" ]]; then
-    echo "Error: Output directory '${OUTPUT_DIR}' is not writable" >&2
-    unset PGPASSWORD
-    exit 1
-fi
-
-echo "========================================="
-echo "GRUAN Database Export"
-echo "========================================="
-echo "Date: ${CURRENT_DATE}"
-echo "Database: ${DB_NAME}@${DB_HOST}:${DB_PORT} (user: ${DB_USERNAME})"
-echo "Header-only mode: ${HEADER_ONLY}"
-echo "Compression: ${COMPRESS}"
-if [[ "$HEADER_ONLY" == "false" ]]; then
-    echo "Data tables year range: ${START_YEAR} to ${END_YEAR}"
-    echo "Table format: data_YYYY"
-fi
-echo "Metadata table: header"
-echo "Output directory: ${OUTPUT_DIR}"
-echo "========================================="
-
-# ==============================
-# Export Function
-# ==============================
-# Function to export data from a table to a CSV file and optionally compress it
-export_table() {
-    local table_name=$1
-    local output_file="${OUTPUT_DIR}/${table_name}.csv"
-
-    echo "Exporting ${table_name}..."
-
-    # Check if table exists
-    local table_exists
-    table_exists=$(psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USERNAME" -d "$DB_NAME" -tAc "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='${table_name}')" 2>/dev/null || echo "false")
-
-    if [[ "$table_exists" != "t" ]]; then
-        echo "Warning: Table ${table_name} does not exist. Skipping..." >&2
-        return 1
-    fi
-
-    # Export the table data to CSV
-    if ! psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USERNAME" -d "$DB_NAME" -c "COPY ${table_name} TO STDOUT WITH (FORMAT CSV, DELIMITER ',', HEADER)" > "${output_file}" 2>/dev/null; then
-        echo "Error: Failed to export ${table_name}" >&2
-        [[ -f "${output_file}" ]] && rm -f "${output_file}"  # Clean up partial file
-        return 1
-    fi
-
-    # Check if file was created and has content
-    if [[ ! -f "${output_file}" ]]; then
-        echo "Error: Output file was not created for ${table_name}" >&2
-        return 1
-    fi
-
-    if [[ ! -s "${output_file}" ]]; then
-        echo "Warning: Table ${table_name} is empty" >&2
-        # We don't return error for empty tables, just warn and continue
-    fi
-
-    # Check if we can write to the output file
-    if [[ ! -w "${output_file}" ]]; then
-        echo "Error: Cannot write to output file ${output_file}" >&2
-        rm -f "${output_file}"
-        return 1
-    fi
-
-    # Compress the CSV file if compression is enabled
-    if [[ "$COMPRESS" == "true" ]]; then
-        # Test compression tools availability
-        if command -v pbzip2 >/dev/null 2>&1; then
-            echo "Compressing with pbzip2..."
-            if pbzip2 -9 "${output_file}" 2>/dev/null; then
-                # Verify compressed file was created
-                local compressed_file="${output_file}.bz2"
-                if [[ -f "$compressed_file" ]]; then
-                    echo "✓ Successfully exported and compressed ${table_name}"
-                    return 0
-                else
-                    echo "Warning: pbzip2 completed but compressed file not found for ${table_name}" >&2
-                    # Continue with uncompressed file
-                fi
-            else
-                echo "Warning: pbzip2 failed for ${table_name}, keeping uncompressed file" >&2
-                # Continue with uncompressed file
-            fi
-        elif command -v bzip2 >/dev/null 2>&1; then
-            echo "Compressing with bzip2..."
-            if bzip2 -9 "${output_file}" 2>/dev/null; then
-                # Verify compressed file was created
-                local compressed_file="${output_file}.bz2"
-                if [[ -f "$compressed_file" ]]; then
-                    echo "✓ Successfully exported and compressed ${table_name}"
-                    return 0
-                else
-                    echo "Warning: bzip2 completed but compressed file not found for ${table_name}" >&2
-                    # Continue with uncompressed file
-                fi
-            else
-                echo "Warning: bzip2 failed for ${table_name}, keeping uncompressed file" >&2
-                # Continue with uncompressed file
-            fi
-        else
-            echo "Warning: No compression tools available (pbzip2 or bzip2), keeping uncompressed file" >&2
+# --------------------------------------------------------------------------
+# Pre-flight checks
+# --------------------------------------------------------------------------
+check_dependencies() {
+    local missing=()
+    for cmd in psql pbzip2 date seq; do
+        if ! command -v "${cmd}" >/dev/null 2>&1; then
+            missing+=("${cmd}")
         fi
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+        die "Missing required command(s): ${missing[*]}. Please install them and retry."
+    fi
+}
+
+check_db_connection() {
+    log_info "Checking connectivity to database '${DB_NAME}' on ${DB_HOST}:${DB_PORT} as user '${DB_USER}'..."
+    if ! psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${DB_USER}" -d "${DB_NAME}" -Atc "SELECT 1;" >/dev/null 2>&1; then
+        die "Unable to connect to database '${DB_NAME}' on ${DB_HOST}:${DB_PORT} as user '${DB_USER}'. Check DB_HOST/DB_PORT/DB_USER/DB_NAME, PGPASSWORD, or ~/.pgpass."
+    fi
+    log_info "Database connection OK."
+}
+
+table_exists() {
+    local table_name="$1"
+    local result
+    result="$(psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${DB_USER}" -d "${DB_NAME}" -Atc \
+        "SELECT to_regclass('public.${table_name}') IS NOT NULL;" 2>/dev/null || echo "f")"
+    [ "${result}" = "t" ]
+}
+
+# --------------------------------------------------------------------------
+# Export function
+# --------------------------------------------------------------------------
+export_and_compress() {
+    local table_name="$1"
+    local output_file="${OUTPUT_DIR}/${table_name}.csv"
+    local compressed_file="${output_file}.bz2"
+
+    if ! table_exists "${table_name}"; then
+        log_warn "Table '${table_name}' does not exist. Skipping."
+        return 0
     fi
 
-    # If we reach here, either compression is disabled or compression failed
-    echo "✓ Successfully exported ${table_name} (uncompressed)"
+    log_info "Exporting '${table_name}' to ${output_file}..."
+    if ! psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${DB_USER}" -d "${DB_NAME}" \
+            -c "COPY ${table_name} TO STDOUT WITH CSV DELIMITER ',' HEADER" \
+            > "${output_file}" 2>>"${LOG_FILE}"; then
+        log_error "Failed to export table '${table_name}'."
+        rm -f "${output_file}"
+        FAILED_TABLES+=("${table_name} (export)")
+        return 1
+    fi
+
+    if [ ! -s "${output_file}" ]; then
+        log_warn "Export of '${table_name}' produced an empty file."
+    fi
+
+    log_info "Compressing ${output_file}..."
+    if ! pbzip2 -f -9 -p"${COMPRESSION_THREADS}" "${output_file}" 2>>"${LOG_FILE}"; then
+        log_error "Failed to compress '${output_file}'."
+        FAILED_TABLES+=("${table_name} (compression)")
+        return 1
+    fi
+
+    log_info "Compressed ${output_file} -> ${compressed_file}"
+    EXPORTED_COUNT=$((EXPORTED_COUNT + 1))
     return 0
 }
 
-# ==============================
-# Main Export Process
-# ==============================
-export_count=0
-error_count=0
-skipped_count=0
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+main() {
+    check_dependencies
 
-echo "Starting export process..."
-echo "Progress:"
+    mkdir -p "${OUTPUT_DIR}" || die "Could not create output directory '${OUTPUT_DIR}'."
 
-# Export header metadata table (always attempt)
-echo "Exporting header metadata table..."
-if export_table "header"; then
-    ((export_count++))
-    echo "✓ Header metadata table exported successfully"
-else
-    # Check if the failure was due to table not existing
-    table_exists=$(psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USERNAME" -d "$DB_NAME" -tAc "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='header')" 2>/dev/null || echo "false")
-    if [[ "$table_exists" != "t" ]]; then
-        ((skipped_count++))
-        echo "SKIP: Header table not found"
-    else
-        ((error_count++))
-        echo "ERROR: Header table export failed"
+    log_info "Starting GRUAN export. Output directory: ${OUTPUT_DIR}"
+
+    export PGPASSWORD="${PGPASSWORD:-}"
+    if [ -z "${PGPASSWORD}" ]; then
+        log_info "PGPASSWORD is not set; relying on ~/.pgpass for authentication."
+        unset PGPASSWORD
     fi
-fi
 
-# Export partitioned data tables only if not in header-only mode
-if [[ "$HEADER_ONLY" == "false" ]]; then
-    echo "-----------------------------------------"
-    echo "Exporting partitioned data tables..."
+    check_db_connection
 
-    # Use while loop for better control
-    year=$START_YEAR
-    while [[ $year -le $END_YEAR ]]; do
-        table_name="data_${year}"
+    # Fixed lookup / metadata tables
+    export_and_compress "header" || true
+    export_and_compress "files_to_import" || true
+    export_and_compress "station" || true
 
-        printf "Year %4d: " "$year"
-
-        if export_table "$table_name"; then
-            ((export_count++))
-        else
-            # Check if the failure was due to table not existing
-            table_exists=$(psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USERNAME" -d "$DB_NAME" -tAc "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='${table_name}')" 2>/dev/null || echo "false")
-            if [[ "$table_exists" != "t" ]]; then
-                ((skipped_count++))
-                echo "SKIP (table not found)"
-            else
-                ((error_count++))
-                echo "ERROR (export failed)"
-            fi
+    # Monthly data tables
+    for year in $(seq "${START_YEAR}" "${END_YEAR}"); do
+        # Skip years in the future
+        if [ "${year}" -gt "${CURRENT_YEAR}" ]; then
+            continue
         fi
-
-        ((year++))
+        for month in $(seq -w 1 12); do
+            # Skip future months in the current year
+            if [ "${year}" -eq "${CURRENT_YEAR}" ] && [ "${month#0}" -gt "${CURRENT_MONTH}" ]; then
+                continue
+            fi
+            export_and_compress "data_${year}${month}" || true
+        done
     done
-else
-    echo "-----------------------------------------"
-    echo "Skipping data partition tables (header-only mode)"
-fi
 
-# ==============================
-# Cleanup and Summary
-# ==============================
-# Clear the password from environment for security
-unset PGPASSWORD
+    log_info "Export run finished. Successfully exported ${EXPORTED_COUNT} table(s)."
 
-echo "========================================="
-echo "Export Summary"
-echo "========================================="
-echo "Mode: $([[ "$HEADER_ONLY" == "true" ]] && echo "Header-only" || echo "Full export")"
-echo "Compression: ${COMPRESS}"
-echo "Successfully exported: ${export_count} table(s)"
-echo "Skipped (not found): ${skipped_count} table(s)"
-echo "Errors encountered: ${error_count} table(s)"
-echo "Output directory: ${OUTPUT_DIR}"
-echo "========================================="
+    if [ "${#FAILED_TABLES[@]}" -gt 0 ]; then
+        log_error "The following table(s) failed: ${FAILED_TABLES[*]}"
+        exit 2
+    fi
 
-if [[ $error_count -gt 0 ]]; then
-    echo "Warning: Some exports failed. Check errors above." >&2
-    exit 1
-fi
+    log_info "All tables have been exported and compressed successfully."
+    exit 0
+}
 
-if [[ $export_count -eq 0 ]]; then
-    echo "Warning: No tables were exported." >&2
-    exit 1
-fi
-
-echo "Export process completed successfully."
+main "$@"
