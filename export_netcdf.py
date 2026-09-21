@@ -628,9 +628,16 @@ def main():
     parser.add_argument('--output-dir',   required=True)
     parser.add_argument('--start-year',   type=int)
     parser.add_argument('--end-year',     type=int)
+    parser.add_argument('--year',         type=int,
+                         help='Export a single year. Combine with --month to export a single month.')
+    parser.add_argument('--month',        type=int, choices=range(1, 13), metavar='[1-12]',
+                         help='Month to export (1-12). Requires --year.')
     parser.add_argument('--data-table',   default='data')
     parser.add_argument('--header-table', default='header')
     args = parser.parse_args()
+
+    if args.month and not args.year:
+        sys.exit('--month requires --year to be set as well.')
 
     load_dotenv(args.env_file)
     missing = [e for e in ['DB_USER','GRUAN_USER_PSW','DB_HOST','DB_PORT','DB_NAME']
@@ -651,20 +658,25 @@ def main():
     months = get_available_months(conn_params, args.header_table)
     if not months:
         sys.exit('No data found.')
-    if args.start_year:
-        months = [(y, m) for y, m in months if y >= args.start_year]
-    if args.end_year:
-        months = [(y, m) for y, m in months if y <= args.end_year]
+    if args.year and args.month:
+        # Single-month export: overrides any --start-year/--end-year range.
+        months = [(y, m) for y, m in months if y == args.year and m == args.month]
+        if not months:
+            sys.exit(f'No data found for {args.year:04d}-{args.month:02d}.')
+    else:
+        if args.year:
+            months = [(y, m) for y, m in months if y == args.year]
+        if args.start_year:
+            months = [(y, m) for y, m in months if y >= args.start_year]
+        if args.end_year:
+            months = [(y, m) for y, m in months if y <= args.end_year]
 
     # print(f'Months to export: {len(months)}')
     station_lookup = load_station_record_numbers(conn_params)
     for y, m in months:
         export_month(conn_params, y, m, output_dir, args.data_table, args.header_table,
                      station_lookup=station_lookup)
-    # y = 2025
-    # m = 2
-    # export_month(conn_params, y, m, output_dir, args.data_table, args.header_table,
-    #              station_lookup=station_lookup)
+
     print('\nDone.')
 
     end_time = time.perf_counter()
