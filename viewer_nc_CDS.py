@@ -10,6 +10,7 @@ import pickle
 import hashlib
 import threading
 import queue
+import csv
 from collections import defaultdict
 
 # --- Configuration ---
@@ -247,17 +248,30 @@ class GruanViewerApp:
 
         self.fig_val, self.ax_val = plt.subplots(figsize=(6, 6))
         self.canvas_val = FigureCanvasTkAgg(self.fig_val, master=left_frame)
-        toolbar_val = NavigationToolbar2Tk(self.canvas_val, left_frame, pack_toolbar=False)
+        toolbar_val_frame = ttk.Frame(left_frame)
+        toolbar_val_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        toolbar_val = NavigationToolbar2Tk(self.canvas_val, toolbar_val_frame, pack_toolbar=False)
         toolbar_val.update()
-        toolbar_val.pack(side=tk.BOTTOM, fill=tk.X)
+        toolbar_val.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(toolbar_val_frame, text="Save data (CSV)",
+                   command=self._save_values_csv).pack(side=tk.LEFT, padx=6)
         self.canvas_val.get_tk_widget().pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
 
         self.fig_unc, self.ax_unc = plt.subplots(figsize=(6, 6))
         self.canvas_unc = FigureCanvasTkAgg(self.fig_unc, master=right_frame)
-        toolbar_unc = NavigationToolbar2Tk(self.canvas_unc, right_frame, pack_toolbar=False)
+        toolbar_unc_frame = ttk.Frame(right_frame)
+        toolbar_unc_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        toolbar_unc = NavigationToolbar2Tk(self.canvas_unc, toolbar_unc_frame, pack_toolbar=False)
         toolbar_unc.update()
-        toolbar_unc.pack(side=tk.BOTTOM, fill=tk.X)
+        toolbar_unc.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(toolbar_unc_frame, text="Save data (CSV)",
+                   command=self._save_uncertainties_csv).pack(side=tk.LEFT, padx=6)
         self.canvas_unc.get_tk_widget().pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
+
+        # Data currently shown in each plot (populated by _update_plots),
+        # used by the "Save data (CSV)" buttons above.
+        self._current_values_data = None
+        self._current_unc_data = None
 
         self.status_bar = ttk.Label(self.root, text="", anchor="w", relief=tk.SUNKEN)
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
@@ -450,9 +464,17 @@ class GruanViewerApp:
             self.ax_val.plot(values[sort_idx], z_sorted, marker='o', markersize=3,
                               linewidth=1.2, color='tab:blue')
             self.ax_val.set_xlabel(var_label.split(' (code')[0])
+            self._current_values_data = {
+                'z': z_sorted,
+                'value_label': var_label,
+                'values': values[sort_idx],
+                'station_name': launch['station_name'],
+                'launch_date': launch['launch_date'],
+            }
         except KeyError:
             self.ax_val.text(0.5, 0.5, f"Variable '{VALUE_VAR_NAME}' not found in file",
                               ha='center', va='center', transform=self.ax_val.transAxes)
+            self._current_values_data = None
         self.ax_val.set_title(f"Observed values\n{launch['station_name']} | {launch['launch_date']}", fontsize=10)
         self.ax_val.set_ylabel('Z Coordinate (Altitude / Proxy)')
         self.ax_val.grid(True, linestyle='--', alpha=0.6)
@@ -476,8 +498,75 @@ class GruanViewerApp:
         self.fig_unc.tight_layout()
         self.canvas_unc.draw()
 
+        self._current_unc_data = {
+            'z': z_sorted,
+            'u1': u1[sort_idx],
+            'u2': u2[sort_idx],
+            'u5': u5[sort_idx],
+            'value_label': var_label,
+            'station_name': launch['station_name'],
+            'launch_date': launch['launch_date'],
+        }
+
         self.status_bar.config(
             text=f"{launch['station_name']} | {launch['launch_date']} | {var_label} | {int(mask.sum())} points")
+
+    # ---------- Save plot data as CSV ----------
+    @staticmethod
+    def _suggest_csv_name(data, suffix):
+        station = data.get('station_name', 'station')
+        date = data.get('launch_date', 'date')
+        safe = lambda s: "".join(c if c.isalnum() or c in "-_." else "_" for c in str(s))
+        return f"{safe(station)}_{safe(date)}_{suffix}.csv"
+
+    def _save_values_csv(self):
+        data = self._current_values_data
+        if not data:
+            messagebox.showinfo("No data", "There is no plotted data to save yet.")
+            return
+        default_name = self._suggest_csv_name(data, "values")
+        path = filedialog.asksaveasfilename(
+            title="Save plot data as CSV",
+            defaultextension=".csv",
+            initialfile=default_name,
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            value_col = data['value_label']
+            with open(path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['z_coordinate', value_col])
+                for z, v in zip(data['z'], data['values']):
+                    writer.writerow([z, v])
+            messagebox.showinfo("Saved", f"Data saved to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Error saving CSV", f"Could not save the file:\n{e}")
+
+    def _save_uncertainties_csv(self):
+        data = self._current_unc_data
+        if not data:
+            messagebox.showinfo("No data", "There is no plotted data to save yet.")
+            return
+        default_name = self._suggest_csv_name(data, "uncertainties")
+        path = filedialog.asksaveasfilename(
+            title="Save plot data as CSV",
+            defaultextension=".csv",
+            initialfile=default_name,
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            with open(path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['z_coordinate', 'uncertainty_value1', 'uncertainty_value2', 'uncertainty_value5'])
+                for z, u1, u2, u5 in zip(data['z'], data['u1'], data['u2'], data['u5']):
+                    writer.writerow([z, u1, u2, u5])
+            messagebox.showinfo("Saved", f"Data saved to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Error saving CSV", f"Could not save the file:\n{e}")
 
     def _on_closing(self):
         if self.ds is not None:

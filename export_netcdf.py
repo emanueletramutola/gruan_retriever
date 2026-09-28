@@ -17,6 +17,8 @@ from typing import Optional
 import time
 from tqdm import tqdm
 
+import qc_pipeline
+
 # ── tunables ──────────────────────────────────────────────────────────────────
 DATA_CHUNK_SIZE = 50_000
 DEFLATE_LEVEL   = 3
@@ -69,6 +71,49 @@ UNIT_TRANSFORMS: dict[str, tuple[float, float]] = {
     'u_press':          (100.0, 0.0),
     'press_uc':         (100.0, 0.0)
 }
+
+# ── plausibility QC configuration ─────────────────────────────────────────────
+# Before writing the NetCDF, every level of every sounding (profile identified
+# by g_product_id) is checked with the plausibility rules of qc_pipeline.py.
+# Implausible values are replaced by NULL (NaN). Only the variables analysed by
+# qc_pipeline are checked: temperature, RH, wind speed, wind direction,
+# pressure and WVMR.
+#
+# The QC works on the DB values BEFORE UNIT_TRANSFORMS are applied, converted
+# into the units used by qc_pipeline (K, RH as a fraction, m s-1, degrees,
+# hPa, ppmv).
+#
+# QC variable name -> list of (DB column, scale factor to QC units), in order of
+# preference: the first column that is not NULL wins (same CF-1.4 first, CF-1.7
+# second logic used by _col_or_nan when the CDM dataframe is built).
+#   * rh and its uncertainties are stored in % in the DB  -> x 0.01 = fraction
+#   * press is stored in hPa in the DB (converted to Pa only at export time)
+#   * wvmr (CF-1.4) is a dimensionless ratio  -> x 1e6 = ppmv
+#     wvmr_vol (CF-1.7) is already in ppmv (converted to mol mol-1 at export)
+# If the units of your DB differ, change the scale factors here.
+QC_INPUT_COLUMNS = {
+    'height':                   [('alt', 1.0)],
+    'temperature':              [('temp', 1.0)],
+    'relative_humidity':        [('rh', 0.01)],
+    'relative_humidity_uc_tot': [('u_rh', 0.01), ('rh_uc', 0.01)],
+    'wind_speed':               [('wspeed', 1.0)],
+    'wind_direction':           [('wdir', 1.0)],
+    'pressure':                 [('press', 1.0)],
+    'pressure_uc_tot':          [('u_press', 1.0), ('press_uc', 1.0)],
+    'wvmr':                     [('wvmr', 1e6), ('wvmr_vol', 1.0)],
+}
+
+# Levels above this altitude (m) are not checked (same default as qc_pipeline).
+# Use None to check every level.
+QC_MAX_ALTITUDE_M = qc_pipeline.PLAUSIBILITY_MAX_ALTITUDE_M
+
+# When True, the uncertainty columns (random / systematic / total) of a value
+# that has been set to NULL are set to NULL as well.
+QC_NULLIFY_UNCERTAINTIES = False
+
+# A warning is printed when more than this fraction of the values of a
+# variable is rejected in a month (usually a sign of a wrong unit).
+QC_REJECTION_WARN_FRACTION = 0.5
 
 # ── helpers: DB ───────────────────────────────────────────────────────────────
 
@@ -236,6 +281,84 @@ def _write_uint16_var(ncf: nc.Dataset, name: str, arr, index_dim: str,
     for k, v in attrs.items():
         setattr(var, k, v)
     return var
+
+# ── plausibility QC ───────────────────────────────────────────────────────────
+
+def _qc_series(df: pd.DataFrame, sources: list) -> pd.Series:
+    """Coalesce the DB columns in `sources` [(column, scale), ...] into a single
+    series expressed in QC units. Missing columns are ignored."""
+    result = None
+    for column, scale in sources:
+        if column not in df.columns:
+            continue
+        series = pd.to_numeric(df[column], errors='coerce') * scale
+        result = series if result is None else result.fillna(series)
+    if result is None:
+        return pd.Series(np.nan, index=df.index, dtype=np.float64)
+    return result
+
+
+def _uncertainty_columns(value_columns: set) -> list:
+    """All uncertainty columns (from CDM_VARIABLES) of the given value columns."""
+    uc_columns = []
+    for entry in CDM_VARIABLES:
+        (_, name_cf_1_4, name_cf_1_7, _, _,
+         uc_rand, uc_sys_cf_1_4, uc_sys_cf_1_7, uc_tot_cf_1_4, uc_tot_cf_1_7) = entry
+        if name_cf_1_4 in value_columns or name_cf_1_7 in value_columns:
+            uc_columns += [c for c in (uc_rand, uc_sys_cf_1_4, uc_sys_cf_1_7,
+                                       uc_tot_cf_1_4, uc_tot_cf_1_7) if c]
+    return uc_columns
+
+
+def apply_plausibility_qc(df_merged: pd.DataFrame,
+                          nullify_uncertainties: bool = QC_NULLIFY_UNCERTAINTIES,
+                          max_altitude_m=QC_MAX_ALTITUDE_M) -> pd.DataFrame:
+    """
+    Replace implausible values with NULL, level by level, using qc_pipeline.
+
+    df_merged holds all the soundings of a month stacked together; each
+    sounding is identified by g_product_id and is evaluated on its own by
+    qc_pipeline.flag_implausible_levels. Must be called BEFORE UNIT_TRANSFORMS.
+    """
+    start = time.perf_counter()
+
+    # 1) DataFrame in the format/units expected by qc_pipeline
+    qc_df = pd.DataFrame(
+        {name: _qc_series(df_merged, sources).to_numpy(dtype=np.float64)
+         for name, sources in QC_INPUT_COLUMNS.items()},
+        index=df_merged.index,
+    )
+    qc_df['profile_id'] = df_merged['g_product_id'].to_numpy()
+
+    # 2) level-by-level flags, profile by profile
+    implausible = qc_pipeline.flag_implausible_levels(
+        qc_df, profile_id_column='profile_id', max_altitude_m=max_altitude_m)
+
+    # 3) replace implausible values with NULL
+    print(f"  Plausibility QC ({qc_df['profile_id'].nunique():,} profiles):")
+    for var in qc_pipeline.PLAUSIBILITY_LIMITS:
+        mask = implausible[var].to_numpy()
+        n_valid = int(qc_df[var].notna().sum())
+        n_rejected = int(mask.sum())
+        fraction = n_rejected / n_valid if n_valid else 0.0
+        print(f"    {var:<18}: {n_rejected:>10,} / {n_valid:>12,} values set to NULL"
+              f" ({100 * fraction:.3f}%)")
+        if fraction > QC_REJECTION_WARN_FRACTION:
+            print(f"    WARNING: more than {100 * QC_REJECTION_WARN_FRACTION:.0f}% of "
+                  f"'{var}' rejected - check the units in QC_INPUT_COLUMNS.")
+        if n_rejected == 0:
+            continue
+        value_columns = {c for c, _ in QC_INPUT_COLUMNS[var]}
+        columns = set(value_columns)
+        if nullify_uncertainties:
+            columns.update(_uncertainty_columns(value_columns))
+        for column in columns:
+            if column in df_merged.columns:
+                df_merged[column] = df_merged[column].mask(mask)
+
+    print(f"  Plausibility QC time: {time.perf_counter() - start:.2f}s")
+    return df_merged
+
 
 # ── CDM pivot logic ───────────────────────────────────────────────────────────
 def _col_or_nan(df: pd.DataFrame,
@@ -503,7 +626,7 @@ def write_cdm_netcdf(cdm: pd.DataFrame, output_file: Path):
 
 def export_month(conn_params, year, month, output_dir,
                  data_table='data', header_table='header',
-                 station_lookup: dict = None):
+                 station_lookup: dict = None, apply_qc: bool = True):
     start_date = datetime(year, month, 1, tzinfo=timezone.utc)
     end_date   = (
         datetime(year + 1, 1, 1, tzinfo=timezone.utc) if month == 12
@@ -604,6 +727,10 @@ def export_month(conn_params, year, month, output_dir,
     ).copy()
     print(f"  Merged rows : {len(df_merged):,}")
 
+    # ── plausibility QC (must run BEFORE the unit transforms) ─────────────────
+    if apply_qc:
+        df_merged = apply_plausibility_qc(df_merged)
+
     for col, (scale, offset) in UNIT_TRANSFORMS.items():
         if col in df_merged.columns:
             df_merged[col] = df_merged[col] * scale + offset
@@ -634,6 +761,8 @@ def main():
                          help='Month to export (1-12). Requires --year.')
     parser.add_argument('--data-table',   default='data')
     parser.add_argument('--header-table', default='header')
+    parser.add_argument('--skip-qc', action='store_true',
+                        help='Do not replace implausible values with NULL.')
     args = parser.parse_args()
 
     if args.month and not args.year:
@@ -675,7 +804,7 @@ def main():
     station_lookup = load_station_record_numbers(conn_params)
     for y, m in months:
         export_month(conn_params, y, m, output_dir, args.data_table, args.header_table,
-                     station_lookup=station_lookup)
+                     station_lookup=station_lookup, apply_qc=not args.skip_qc)
 
     print('\nDone.')
 
