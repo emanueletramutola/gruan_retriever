@@ -66,7 +66,7 @@ PRESSURE_UNCERTAINTY_MAX_HPA = 3.0
 
 # Plausibility checks are evaluated only on levels up to this altitude (m).
 # Use None to evaluate every level of the profile.
-PLAUSIBILITY_MAX_ALTITUDE_M = 40000.0
+PLAUSIBILITY_MAX_ALTITUDE_M = 47000.0
 
 # Physical validity range (lower, upper) of each checked variable.
 PLAUSIBILITY_LIMITS = {
