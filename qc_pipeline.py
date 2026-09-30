@@ -76,6 +76,9 @@ PLAUSIBILITY_LIMITS = {
     "wind_direction": (0.0, 360.0),
     "pressure": (PRESSURE_MIN_HPA, PRESSURE_MAX_HPA),
     "wvmr": (0.0, 50000.0),
+    "frost_point": (150.0, 330.0),
+    "shortwave_radiation": (0.0, 1600.0),
+    "vertical_speed": (-10.0, 30.0),
 }
 
 # variable -> (total uncertainty column, maximum accepted uncertainty).
@@ -661,6 +664,9 @@ def load_netcdf_profile(jar_file_path):
             "wvmr": ["wvmr_vol", "WVMR", "wvmr"],
             "wvmr_uc_sys": ["wvmr_vol_uc_tcor"],
             "wvmr_uc_tot": ["wvmr_vol_uc"],
+            "frost_point": ["fp"],
+            "shortwave_radiation": ["swrad"],
+            "vertical_speed": ["vspeed", "asc"],
         }
         extracted_data = {}
         extracted_units = {}

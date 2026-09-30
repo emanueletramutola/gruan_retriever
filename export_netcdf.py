@@ -9,12 +9,20 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import netCDF4 as nc
+try:                                    # optional: enables parallel compression
+    import h5py
+    _HAVE_H5PY = True
+except ImportError:
+    _HAVE_H5PY = False
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from sqlalchemy import create_engine
 from dotenv import load_dotenv
 from typing import Optional
 import time
+import platform
+import traceback
+from contextlib import contextmanager
 from tqdm import tqdm
 
 import qc_pipeline
@@ -22,8 +30,26 @@ import qc_pipeline
 # ── tunables ──────────────────────────────────────────────────────────────────
 DATA_CHUNK_SIZE = 50_000
 DEFLATE_LEVEL   = 3
+CHUNK_BYTES      = 1 << 20      # target HDF5 chunk size (~1 MB, uncompressed)
+WRITE_BLOCK_ROWS = 1 << 21      # rows converted+written per call (sequential mode)
+
+
+def _available_cpus() -> int:
+    """CPUs this process may actually use (respects taskset/cgroup affinity)."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:                      # macOS / Windows
+        return os.cpu_count() or 1
+
+
+DEFAULT_THREADS  = min(_available_cpus(), 32)   # parallel compression threads
 TIME_UNITS      = "seconds since 1970-01-01 00:00:00"
 TIME_CALENDAR   = "proleptic_gregorian"
+
+# Only sounding levels with a valid (not NULL, not NaN) "alt" value that is
+# <= MAX_ALTITUDE_M are exported. The filter is applied directly in the SQL
+# query so that discarded levels are never transferred nor loaded in memory.
+MAX_ALTITUDE_M  = 47_000
 
 # ── CDM variable mapping ──────────────────────────────────────────────────────
 # Each entry:
@@ -101,6 +127,9 @@ QC_INPUT_COLUMNS = {
     'pressure':                 [('press', 1.0)],
     'pressure_uc_tot':          [('u_press', 1.0), ('press_uc', 1.0)],
     'wvmr':                     [('wvmr', 1e6), ('wvmr_vol', 1.0)],
+    'frost_point':              [('fp', 1.0)],
+    'shortwave_radiation':     [('swrad', 1.0)],
+    'vertical_speed':           [('vspeed', 1.0), ('asc', 1.0)],
 }
 
 # Levels above this altitude (m) are not checked (same default as qc_pipeline).
@@ -114,6 +143,118 @@ QC_NULLIFY_UNCERTAINTIES = False
 # A warning is printed when more than this fraction of the values of a
 # variable is rejected in a month (usually a sign of a wrong unit).
 QC_REJECTION_WARN_FRACTION = 0.5
+
+# ── stage timer ───────────────────────────────────────────────────────────────
+# Lightweight wall-clock profiler. Usage:
+#     with TIMER('merge'): ...            # top-level stage
+#     with TIMER('qc/flag_levels'): ...   # 'parent/child' = sub-stage of 'parent'
+#     TIMER.add('db_read_data', seconds)  # when the code can't be wrapped
+# TIMER collects one month; export_month prints its report and folds it into
+# RUN_TIMER, which main() prints at the end (whole run).
+
+LOG_PATH = None     # set by init_log(); None = no log file
+
+
+def init_log(log_dir, header_lines, started=None):
+    """Create '<log_dir>/export_netcdf_timing_YYYYmmdd_HHMMSS.log' (timestamp of
+    the run start) and write a header. Returns the path."""
+    global LOG_PATH
+    started = started or datetime.now()
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    LOG_PATH = log_dir / f"export_netcdf_timing_{started:%Y%m%d_%H%M%S}.log"
+    log("=" * 70)
+    log(f"export_netcdf timing log - run started {started:%Y-%m-%d %H:%M:%S}")
+    for line in header_lines:
+        log(line)
+    log("=" * 70)
+    return LOG_PATH
+
+
+def log(text=''):
+    """Append text to the log file (no console output)."""
+    if LOG_PATH is None:
+        return
+    with open(LOG_PATH, 'a', encoding='utf-8') as fh:
+        fh.write(text + '\n')
+
+
+def emit(text=''):
+    """Print to console AND append to the log file."""
+    print(text)
+    log(text)
+
+
+class StageTimer:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.t = {}            # stage -> [seconds, calls]   (insertion = pipeline order)
+        self.var_times = {}    # NetCDF variable -> seconds  (writer detail)
+
+    def add(self, name, seconds):
+        e = self.t.setdefault(name, [0.0, 0])
+        e[0] += seconds
+        e[1] += 1
+
+    @contextmanager
+    def __call__(self, name):
+        self.t.setdefault(name, [0.0, 0])      # register on entry -> parent listed before children
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.add(name, time.perf_counter() - start)
+
+    def merge(self, other):
+        for k, (sec, calls) in other.t.items():
+            e = self.t.setdefault(k, [0.0, 0])
+            e[0] += sec
+            e[1] += calls
+        for k, sec in other.var_times.items():
+            self.var_times[k] = self.var_times.get(k, 0.0) + sec
+
+    def report(self, title, note=''):
+        """Print the timing table to the console and append it to the log file."""
+        top = {k: v[0] for k, v in self.t.items() if '/' not in k}
+        total = sum(top.values())
+        if not total:
+            return
+        slowest = max(top, key=top.get)
+        out = []
+        rule = '─' * 66
+        out.append(f"\n── Timing: {title} {rule[:max(66 - len(title) - 11, 3)]}")
+        if note:
+            out.append(f"  {note}")
+        out.append(f"  {'stage':<38}{'time':>9}{'%':>8}{'calls':>7}")
+
+        def row(label, sec, calls, mark=''):
+            out.append(f"  {label:<38}{sec:>8.2f}s{100 * sec / total:>7.1f}%"
+                       f"{calls if calls else '':>7} {mark}".rstrip())
+
+        for name, (sec, calls) in self.t.items():
+            if '/' in name:
+                continue
+            row(name, sec, calls, '◄ slowest' if name == slowest else '')
+            children = [(k.split('/', 1)[1], v) for k, v in self.t.items()
+                        if k.startswith(name + '/')]
+            for child, (csec, ccalls) in children:
+                row(f"   └ {child}", csec, ccalls)
+            if children:
+                rest = sec - sum(v[0] for _, v in children)
+                if rest > 0.005 * total:
+                    row("   └ (other / not itemised)", rest, 0)
+        out.append(f"  {'TOTAL (top-level stages)':<38}{total:>8.2f}s")
+        if self.var_times:
+            worst = sorted(self.var_times.items(), key=lambda kv: -kv[1])[:5]
+            out.append("  slowest NetCDF variables: " +
+                       ", ".join(f"{k} {v:.2f}s" for k, v in worst))
+        emit('\n'.join(out))
+
+
+TIMER     = StageTimer()   # current month
+RUN_TIMER = StageTimer()   # whole run
 
 # ── helpers: DB ───────────────────────────────────────────────────────────────
 
@@ -168,119 +309,230 @@ def get_available_months(conn_params, data_table='header'):
 
 
 # ── helpers: NetCDF writing ───────────────────────────────────────────────────
+#
+# Why write_cdm_netcdf was slow, and what changed
+# -----------------------------------------------
+#   1. ~80% of the time is zlib compression of ~30 variables x 20M+ rows, done
+#      by HDF5 on ONE core. The writer below can compress the HDF5 chunks in
+#      parallel threads (zlib releases the GIL) and store them with h5py's
+#      write_direct_chunk. The result is a perfectly standard NetCDF4/HDF5
+#      file (same filters: shuffle + deflate), readable by any NetCDF reader.
+#      Needs `h5py`; without it (or with threads=1) the sequential path is used.
+#   2. String columns were processed row by row in Python (isinstance map,
+#      astype(str), str.len ... on 20M rows, x4 columns). They are now
+#      factorised (unique values -> codes) and expanded with one numpy fancy
+#      index per block. A pandas Categorical input (see build_cdm_dataframe)
+#      needs no hashing at all.
+#   3. Data are converted and written BLOCK by BLOCK (aligned to the chunk
+#      grid) instead of building full-size converted copies of every column.
+#   4. Explicit ~1 MB chunks, and the HDF5 "shuffle" filter only where it
+#      helps (4/8-byte types), float32 cast done once (no float64 detour).
 
-def _ensure_string_dim(ncf: nc.Dataset, length: int) -> str:
-    name = f"string{max(length, 1)}"
-    if name not in ncf.dimensions:
-        ncf.createDimension(name, max(length, 1))
-    return name
+def _chunk_rows(itemsize_bytes: int) -> int:
+    return max(CHUNK_BYTES // max(itemsize_bytes, 1), 1024)
 
 
-def _write_char_var(ncf, name, arr, index_dim, **attrs):
-    # Vectorized version: avoids per-row Python loops, which is what made this
-    # function (called ~8x per file, 20M+ rows each) the single-core bottleneck.
-    s = pd.Series(arr)
-
-    # Decode bytes -> str where needed (vectorized where possible)
-    if s.dtype == object and s.map(lambda x: isinstance(x, bytes)).any():
-        s = s.map(lambda x: x.decode('utf-8', errors='replace')
-                  if isinstance(x, bytes) else x)
-
-    s = s.where(~s.isna(), '').astype(str)
-
-    maxlen = int(s.str.len().max()) if len(s) else 1
-    maxlen = max(maxlen, 1)
-    sdim = _ensure_string_dim(ncf, maxlen)
-
-    try:
-        # Fast path: numpy encodes/pads/truncates to fixed width in one shot.
-        # Works for ASCII-safe content (ids, codes, station names, etc.)
-        fixed = s.to_numpy(dtype=f'S{maxlen}')
-    except UnicodeEncodeError:
-        # Fallback for genuinely non-ASCII text: still vectorized encode,
-        # then a single bulk pad via numpy char operations (no per-row loop).
-        encoded = s.str.encode('utf-8', errors='replace')
-        fixed = np.array([b[:maxlen].ljust(maxlen, b'\x00') for b in encoded],
-                          dtype=f'S{maxlen}')
-
-    data = fixed.view('S1').reshape(len(s), maxlen)
-
-    var = ncf.createVariable(name, 'S1', (index_dim, sdim),
-                             zlib=True, complevel=DEFLATE_LEVEL, shuffle=True)
-    var[:] = data
-    for k, v in attrs.items():
-        setattr(var, k, v)
-    return var
-
-def _write_int64_var(ncf: nc.Dataset, name: str, arr, index_dim: str,
-                     **attrs) -> nc.Variable:
-    sentinel = np.iinfo(np.int64).min
+def _src_numeric(arr):
+    """Series/array -> numpy array, zero-copy when it is already plain numpy."""
     if isinstance(arr, pd.Series):
-        data = arr.fillna(sentinel).astype(np.int64).values
-    else:
-        data = np.where(np.isnan(arr.astype(float)), sentinel, arr).astype(np.int64)
-
-    var = ncf.createVariable(
-        name, np.int64, (index_dim,),
-        zlib=True, complevel=DEFLATE_LEVEL, shuffle=True
-    )
-    var[:] = data
-    for k, v in attrs.items():
-        setattr(var, k, v)
-    return var
+        if isinstance(arr.dtype, np.dtype) and arr.dtype.kind in 'fiub':
+            return arr.to_numpy()
+        return arr.to_numpy(dtype=np.float64, na_value=np.nan)
+    return np.asarray(arr)
 
 
-def _write_float32_var(ncf: nc.Dataset, name: str, arr, index_dim: str,
-                       **attrs) -> nc.Variable:
+def _src_integer(arr, sentinel, dtype):
+    """Series/array -> numpy integer-like array; NULLs replaced by `sentinel`."""
     if isinstance(arr, pd.Series):
-        data = arr.to_numpy(dtype=np.float64, na_value=np.nan)
+        if isinstance(arr.dtype, np.dtype) and arr.dtype.kind in 'iub':
+            return arr.to_numpy()
+        return arr.fillna(sentinel).to_numpy().astype(dtype)
+    return np.asarray(arr)
+
+
+def _factorize_strings(values):
+    """Return (codes, table): codes has one int entry per row, table is the
+    list of unique python str. Missing values map to ''."""
+    s = values if isinstance(values, pd.Series) else pd.Series(values)
+
+    if isinstance(s.dtype, pd.CategoricalDtype):
+        codes = s.cat.codes.to_numpy()
+        uniques = list(s.cat.categories)
     else:
-        data = np.asarray(arr, dtype=np.float64)
+        codes, uniques = pd.factorize(s, use_na_sentinel=True)
+        uniques = list(uniques)
 
-    var = ncf.createVariable(
-        name, np.float32, (index_dim,),
-        zlib=True, complevel=DEFLATE_LEVEL, shuffle=True,
-        fill_value=np.float32('nan')
-    )
-    var[:] = data.astype(np.float32)
-    for k, v in attrs.items():
-        setattr(var, k, v)
-    return var
+    def _to_str(x):
+        if x is None:
+            return ''
+        if isinstance(x, bytes):
+            return x.decode('utf-8', errors='replace')
+        return str(x)
+
+    table = [_to_str(x) for x in uniques]
+    table.append('')                                     # slot for NULL / NaN
+    codes = np.where(codes < 0, len(table) - 1, codes)   # -1 -> ''
+    return codes, table
 
 
-def _write_uint8_var(ncf: nc.Dataset, name: str, arr, index_dim: str,
-                     **attrs) -> nc.Variable:
-    if isinstance(arr, pd.Series):
-        data = arr.fillna(255).astype(np.uint8).values
-    else:
-        data = np.asarray(arr, dtype=np.uint8)
+class _VarSpec:
+    __slots__ = ('name', 'chunk', 'shuffle', 'get_block')
 
-    var = ncf.createVariable(
-        name, np.uint8, (index_dim,),
-        zlib=True, complevel=DEFLATE_LEVEL, shuffle=True
-    )
+    def __init__(self, name, chunk, shuffle, get_block):
+        self.name, self.chunk, self.shuffle, self.get_block = name, chunk, shuffle, get_block
 
-    var[:] = data
-    for k, v in attrs.items():
-        setattr(var, k, v)
-    return var
 
-def _write_uint16_var(ncf: nc.Dataset, name: str, arr, index_dim: str,
-                      **attrs) -> nc.Variable:
-    if isinstance(arr, pd.Series):
-        data = arr.fillna(65535).astype(np.uint16).values
-    else:
-        data = np.asarray(arr, dtype=np.uint16)
+class _NcWriter:
+    """Writes 1-D (or 1-D + char) variables along one fixed 'index' dimension.
 
-    var = ncf.createVariable(
-        name, np.uint16, (index_dim,),
-        zlib=True, complevel=DEFLATE_LEVEL, shuffle=True
-    )
+    threads <= 1 (or h5py missing) : classic sequential write via netCDF4.
+    threads  > 1 (and h5py present): netCDF4 only creates the file structure;
+        the chunks are then compressed by a thread pool and stored with h5py.
+    """
 
-    var[:] = data
-    for k, v in attrs.items():
-        setattr(var, k, v)
-    return var
+    def __init__(self, path, n_rows, threads=1, index_dim='index'):
+        self.path, self.n, self.dim = str(path), int(n_rows), index_dim
+        self.threads = max(int(threads or 1), 1)
+        if self.threads > 1 and not _HAVE_H5PY:
+            print("  [writer] h5py not installed -> sequential write "
+                  "(pip install h5py to enable parallel compression)")
+        self.parallel = self.threads > 1 and _HAVE_H5PY
+        self._pending = []
+        self.ncf = nc.Dataset(self.path, 'w', format='NETCDF4')
+        self.ncf.createDimension(self.dim, self.n)
+
+    # context manager -------------------------------------------------------
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        with TIMER('write_netcdf/hdf5_close (flush)'):
+            self.ncf.close()
+        if exc_type is None and self._pending:
+            with TIMER('write_netcdf/parallel_compress_and_write'):
+                self._fill_parallel()
+
+    # variable creation -----------------------------------------------------
+    def _add(self, name, dtype, dims, chunk, shuffle, get_block,
+             fill_value=None, **attrs):
+        kw = {} if fill_value is None else {'fill_value': fill_value}
+        var = self.ncf.createVariable(
+            name, dtype, dims, zlib=True, complevel=DEFLATE_LEVEL,
+            shuffle=shuffle, chunksizes=chunk, **kw)
+        for k, v in attrs.items():
+            setattr(var, k, v)
+        if self.parallel:
+            self._pending.append(_VarSpec(name, chunk, shuffle, get_block))
+        else:                                   # sequential: write right away
+            cr = chunk[0]
+            step = max(WRITE_BLOCK_ROWS // cr, 1) * cr      # multiple of chunk
+            t_var = time.perf_counter()
+            with TIMER('write_netcdf/seq_convert_compress_write'):
+                for i in range(0, self.n, step):
+                    j = min(i + step, self.n)
+                    var[i:j] = get_block(i, j)
+            # Writes are chunk-aligned, so HDF5 compresses each chunk as it is
+            # written: this time includes conversion + compression.
+            TIMER.var_times[name] = TIMER.var_times.get(name, 0.0) + time.perf_counter() - t_var
+        return var
+
+    def _numeric(self, name, dtype, src, conv, shuffle, fill_value=None, **attrs):
+        chunk = (min(_chunk_rows(np.dtype(dtype).itemsize), max(self.n, 1)),)
+        return self._add(name, dtype, (self.dim,), chunk, shuffle,
+                         lambda i, j: conv(src[i:j]), fill_value, **attrs)
+
+    def float32(self, name, arr, **attrs):
+        return self._numeric(
+            name, np.float32, _src_numeric(arr),
+            lambda b: np.asarray(b, dtype=np.float32), shuffle=True,
+            fill_value=np.float32('nan'), **attrs)
+
+    def int64(self, name, arr, **attrs):
+        sentinel = np.iinfo(np.int64).min
+        def conv(b):
+            if b.dtype.kind == 'f':
+                return np.where(np.isnan(b), sentinel, b).astype(np.int64)
+            return b.astype(np.int64, copy=False)
+        return self._numeric(name, np.int64,
+                             _src_integer(arr, sentinel, np.int64),
+                             conv, shuffle=True, **attrs)
+
+    def uint(self, name, arr, dtype, sentinel, **attrs):
+        def conv(b):
+            if b.dtype.kind == 'f':
+                b = np.where(np.isnan(b), sentinel, b)
+            return b.astype(dtype, copy=False)
+        return self._numeric(name, dtype, _src_integer(arr, sentinel, dtype),
+                             conv, shuffle=False, **attrs)
+
+    def uint8(self, name, arr, **attrs):
+        return self.uint(name, arr, np.uint8, 255, **attrs)
+
+    def uint16(self, name, arr, **attrs):
+        return self.uint(name, arr, np.uint16, 65535, **attrs)
+
+    def char(self, name, arr, **attrs):
+        with TIMER('write_netcdf/string_factorize'):
+            codes, table = _factorize_strings(arr)
+        enc = [t.encode('utf-8', errors='replace') for t in table]
+        lens = np.fromiter((len(b) for b in enc), dtype=np.int64, count=len(enc))
+        used = np.bincount(codes, minlength=len(enc)) > 0    # ignore unused categories
+        maxlen = max(int(lens[used].max()) if used.any() else 1, 1)
+
+        sdim = f"string{maxlen}"
+        if sdim not in self.ncf.dimensions:
+            self.ncf.createDimension(sdim, maxlen)
+
+        # (n_unique, maxlen) matrix of single chars, NUL padded
+        table_s1 = np.array(enc, dtype=f'S{maxlen}').view('S1').reshape(len(enc), maxlen)
+        chunk = (min(_chunk_rows(maxlen), max(self.n, 1)), maxlen)
+        return self._add(name, 'S1', (self.dim, sdim), chunk, False,
+                         lambda i, j: table_s1[codes[i:j]], **attrs)
+
+    # parallel phase --------------------------------------------------------
+    def _fill_parallel(self):
+        import zlib
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor
+
+        level, n = DEFLATE_LEVEL, self.n
+
+        def compress_chunk(spec, i):
+            cr = spec.chunk[0]
+            j = min(i + cr, n)
+            blk = np.ascontiguousarray(spec.get_block(i, j))
+            if j - i < cr:                       # HDF5 edge chunks are stored full-size
+                full = np.zeros((cr,) + blk.shape[1:], dtype=blk.dtype)
+                full[:j - i] = blk
+                blk = full
+            raw = blk.reshape(-1).view(np.uint8)
+            if spec.shuffle:                     # == HDF5 shuffle filter
+                raw = np.ascontiguousarray(raw.reshape(-1, blk.dtype.itemsize).T)
+            return zlib.compress(raw, level)     # == HDF5 deflate filter; releases the GIL
+
+        with h5py.File(self.path, 'r+') as h5, \
+                ThreadPoolExecutor(max_workers=self.threads) as pool:
+            for spec in self._pending:
+                t_var = time.perf_counter()
+                ds = h5[spec.name]
+                if (tuple(ds.chunks) != tuple(spec.chunk) or ds.compression != 'gzip'
+                        or bool(ds.shuffle) != spec.shuffle):
+                    raise RuntimeError(f"unexpected HDF5 layout for '{spec.name}'")
+                cr, tail = spec.chunk[0], (0,) * (ds.ndim - 1)
+                window = deque()                 # bounded in-flight chunks -> bounded RAM
+
+                def flush_one():
+                    i0, fut = window.popleft()
+                    ds.id.write_direct_chunk((i0,) + tail, fut.result())
+
+                for i in range(0, n, cr):
+                    window.append((i, pool.submit(compress_chunk, spec, i)))
+                    if len(window) >= 2 * self.threads:
+                        flush_one()
+                while window:
+                    flush_one()
+                TIMER.var_times[spec.name] = time.perf_counter() - t_var
+        self._pending = []
 
 # ── plausibility QC ───────────────────────────────────────────────────────────
 
@@ -323,16 +575,18 @@ def apply_plausibility_qc(df_merged: pd.DataFrame,
     start = time.perf_counter()
 
     # 1) DataFrame in the format/units expected by qc_pipeline
-    qc_df = pd.DataFrame(
-        {name: _qc_series(df_merged, sources).to_numpy(dtype=np.float64)
-         for name, sources in QC_INPUT_COLUMNS.items()},
-        index=df_merged.index,
-    )
-    qc_df['profile_id'] = df_merged['g_product_id'].to_numpy()
+    with TIMER('plausibility_qc/build_qc_input'):
+        qc_df = pd.DataFrame(
+            {name: _qc_series(df_merged, sources).to_numpy(dtype=np.float64)
+             for name, sources in QC_INPUT_COLUMNS.items()},
+            index=df_merged.index,
+        )
+        qc_df['profile_id'] = df_merged['g_product_id'].to_numpy()
 
     # 2) level-by-level flags, profile by profile
-    implausible = qc_pipeline.flag_implausible_levels(
-        qc_df, profile_id_column='profile_id', max_altitude_m=max_altitude_m)
+    with TIMER('plausibility_qc/flag_implausible_levels'):
+        implausible = qc_pipeline.flag_implausible_levels(
+            qc_df, profile_id_column='profile_id', max_altitude_m=max_altitude_m)
 
     # 3) replace implausible values with NULL
     print(f"  Plausibility QC ({qc_df['profile_id'].nunique():,} profiles):")
@@ -437,6 +691,14 @@ def build_cdm_dataframe(df_merged: pd.DataFrame,
     # cor_temp_vals = _col_or_nan(df_merged, 'temp_corr_rad')
     # cor_rh_vals   = _col_or_nan(df_merged, 'rh_corr') - _col_or_nan(df_merged, 'rh')
 
+    # Strings are repeated for every CDM variable (x15). Keeping them as pandas
+    # Categoricals (built ONCE, same categories in every piece) makes the
+    # pd.concat below cheap and lets the writer skip hashing entirely.
+    primary_station_id_c = primary_station_id.astype('category')
+    station_name_c       = station_name.astype('category')
+    sensor_id_c          = sensor_id.astype('category')
+    report_id_c          = df_merged['g_product_id'].astype('category')
+
     pieces = []
 
     for entry in CDM_VARIABLES:
@@ -472,11 +734,11 @@ def build_cdm_dataframe(df_merged: pd.DataFrame,
             'report_timestamp':                   ts_epoch,
             'report_meaning_of_timestamp':        np.uint8(1),
             # 'report_id':                          report_id_str.values,
-            'report_id':                          df_merged['g_product_id'].values,
+            'report_id':                          report_id_c,
             'report_duration':                    np.uint8(9),
             'observation_id':                     df_merged['observation_id'].values,
-            'primary_station_id':                 primary_station_id.values,
-            'station_name|station_configuration': station_name.values,
+            'primary_station_id':                 primary_station_id_c,
+            'station_name|station_configuration': station_name_c,
             # Station geometry
             'latitude|station_configuration':     lat_station.values,
             'longitude|station_configuration':    lon_station.values,
@@ -486,7 +748,7 @@ def build_cdm_dataframe(df_merged: pd.DataFrame,
             'longitude|observations_table':       lon_obs.values,
             # station.id lookup
             'record_number':                      record_number_vals,
-            'sensor_id':                          sensor_id.values,
+            'sensor_id':                          sensor_id_c,
         }, index=df_merged.index)
 
         pieces.append(piece)
@@ -518,115 +780,93 @@ ALL_CDM_LABELS = {
 }
 
 
-def write_cdm_netcdf(cdm: pd.DataFrame, output_file: Path):
-    """Write a CDM long-format DataFrame to a GRUAN-convention NetCDF4 file."""
+def write_cdm_netcdf(cdm: pd.DataFrame, output_file: Path, threads: int = None):
+    """Write a CDM long-format DataFrame to a GRUAN-convention NetCDF4 file.
+
+    threads: compression threads (default DEFAULT_THREADS). 1 = sequential.
+    """
     N = len(cdm)
+    threads = DEFAULT_THREADS if threads is None else threads
     print(f"  CDM rows to write: {N:,}")
 
     codes_used  = sorted(set(ALL_CDM_CODES))
     labels_used = [ALL_CDM_LABELS.get(c, str(c)) for c in codes_used]
+    t0 = time.perf_counter()
 
-    with nc.Dataset(str(output_file), 'w', format='NETCDF4') as ncf:
+    with _NcWriter(output_file, N, threads=threads) as w:
 
-        # ── dimensions ────────────────────────────────────────────────────────
-        ncf.createDimension('index', N)
-        index_dim = 'index'
-
-        # ── index ───────────────────────────────────────────────────────
-        # _write_int64_var(ncf, 'index', np.arange(N, dtype=np.int64), index_dim)
-
-        _write_char_var(ncf, 'sensor_id',
-                        cdm['sensor_id'].values, index_dim)
-
-        # ── station geometry ──────────────────────────────────────────────────
-        _write_float32_var(ncf, 'height_of_station_above_sea_level',
-                           cdm['height_of_station_above_sea_level'], index_dim)
-        _write_char_var(ncf, 'primary_station_id',
-                        cdm['primary_station_id'].values, index_dim)
-        _write_char_var(ncf, 'station_name|station_configuration',
-                        cdm['station_name|station_configuration'].values, index_dim)
-        _write_float32_var(ncf, 'latitude|station_configuration',
-                           cdm['latitude|station_configuration'], index_dim)
-        _write_float32_var(ncf, 'longitude|station_configuration',
-                           cdm['longitude|station_configuration'], index_dim)
+        # ── sensor / station geometry ─────────────────────────────────────────
+        w.char('sensor_id', cdm['sensor_id'])
+        w.float32('height_of_station_above_sea_level',
+                  cdm['height_of_station_above_sea_level'])
+        w.char('primary_station_id', cdm['primary_station_id'])
+        w.char('station_name|station_configuration',
+               cdm['station_name|station_configuration'])
+        w.float32('latitude|station_configuration',
+                  cdm['latitude|station_configuration'])
+        w.float32('longitude|station_configuration',
+                  cdm['longitude|station_configuration'])
 
         # ── sounding / report ids ─────────────────────────────────────────────
-        _write_char_var(ncf, 'report_id',
-                        cdm['report_id'].values, index_dim)
-        _write_uint8_var(ncf, 'report_duration',
-                        cdm['report_duration'], index_dim)
-        _write_int64_var(ncf, 'observation_id',
-                         cdm['observation_id'], index_dim)
+        w.char('report_id', cdm['report_id'])
+        w.uint8('report_duration', cdm['report_duration'])
+        w.int64('observation_id', cdm['observation_id'])
 
         # ── record_number: station.id from station table ──────────────────────
-        rec_num_var = ncf.createVariable(
-            'record_number', np.int8, (index_dim,),
-            zlib=True, complevel=DEFLATE_LEVEL, shuffle=True,
-            fill_value=np.iinfo(np.int8).min
-        )
-        rec_num_var[:] = cdm['record_number'].values.astype(np.int8)
-        rec_num_var.long_name = 'station record number'
-        rec_num_var.comment   = 'integer primary key (id) of the matching row in the station table'
+        # build_cdm_dataframe uses int32-min as "unknown station" sentinel. A
+        # plain astype(int8) would turn it into 0 (a valid-looking id), so it
+        # is mapped explicitly to the int8 fill value.
+        rec = cdm['record_number'].to_numpy()
+        rec = np.where(rec == np.iinfo(np.int32).min,
+                       np.iinfo(np.int8).min, rec).astype(np.int8)
+        w._numeric('record_number', np.int8, rec, lambda b: b, shuffle=False,
+                   fill_value=np.iinfo(np.int8).min,
+                   long_name='station record number',
+                   comment='integer primary key (id) of the matching row '
+                           'in the station table')
 
         # ── time ──────────────────────────────────────────────────────────────
-        _write_int64_var(ncf, 'report_timestamp',
-                         cdm['report_timestamp'], index_dim,
-                         units=TIME_UNITS, calendar=TIME_CALENDAR)
-        _write_uint8_var(ncf, 'report_meaning_of_timestamp',
-                         cdm['report_meaning_of_timestamp'], index_dim)
+        w.int64('report_timestamp', cdm['report_timestamp'],
+                units=TIME_UNITS, calendar=TIME_CALENDAR)
+        w.uint8('report_meaning_of_timestamp', cdm['report_meaning_of_timestamp'])
 
         # ── balloon position ──────────────────────────────────────────────────
-        _write_float32_var(ncf, 'latitude|observations_table',
-                           cdm['latitude|observations_table'], index_dim)
-        _write_float32_var(ncf, 'longitude|observations_table',
-                           cdm['longitude|observations_table'], index_dim)
+        w.float32('latitude|observations_table', cdm['latitude|observations_table'])
+        w.float32('longitude|observations_table', cdm['longitude|observations_table'])
 
         # ── z coordinate ──────────────────────────────────────────────────────
-        _write_float32_var(ncf, 'z_coordinate',
-                           cdm['z_coordinate'], index_dim)
-        _write_uint8_var(ncf, 'z_coordinate_type',
-                         cdm['z_coordinate_type'], index_dim)
+        w.float32('z_coordinate', cdm['z_coordinate'])
+        w.uint8('z_coordinate_type', cdm['z_coordinate_type'])
 
         # ── CDM core: observed variable & value ───────────────────────────────
-        ov_var = ncf.createVariable(
-            'observed_variable', np.int16, (index_dim,),
-            zlib=True, complevel=DEFLATE_LEVEL, shuffle=True
-        )
-        ov_var[:] = cdm['observed_variable'].values.astype(np.int16)
-        ov_var.codes  = np.array(codes_used, dtype=np.int32)
-        ov_var.labels = ', '.join(labels_used)
-
-        _write_float32_var(ncf, 'observation_value',
-                           cdm['observation_value'], index_dim)
+        w._numeric('observed_variable', np.int16,
+                   cdm['observed_variable'].to_numpy(),
+                   lambda b: b.astype(np.int16, copy=False), shuffle=False,
+                   codes=np.array(codes_used, dtype=np.int32),
+                   labels=', '.join(labels_used))
+        w.float32('observation_value', cdm['observation_value'])
 
         # ── units ─────────────────────────────────────────────────────────────
-        _write_uint16_var(ncf, 'units',
-                        cdm['units'].values, index_dim)
-        # _write_char_var(ncf, 'original_units',
-        #                 cdm['original_units'].values, index_dim)
+        w.uint16('units', cdm['units'])
 
         # ── uncertainties ─────────────────────────────────────────────────────
         for idx in (1, 2, 5):
-            _write_float32_var(ncf, f'uncertainty_value{idx}',
-                               cdm[f'uncertainty_value{idx}'], index_dim)
-            _write_uint8_var(  ncf, f'uncertainty_type{idx}',
-                               cdm[f'uncertainty_type{idx}'], index_dim)
-            _write_uint16_var( ncf, f'uncertainty_units{idx}',
-                               cdm[f'uncertainty_units{idx}'], index_dim)
-
-        # ── GRUAN-specific corrections ────────────────────────────────────────
-        # _write_float32_var(ncf, 'cor_rh',   cdm['cor_rh'],   index_dim)
-        # _write_float32_var(ncf, 'cor_temp', cdm['cor_temp'], index_dim)
+            w.float32(f'uncertainty_value{idx}', cdm[f'uncertainty_value{idx}'])
+            w.uint8(f'uncertainty_type{idx}',    cdm[f'uncertainty_type{idx}'])
+            w.uint16(f'uncertainty_units{idx}',  cdm[f'uncertainty_units{idx}'])
 
     size_mb = output_file.stat().st_size / 1e6
-    print(f"  Written: {output_file}  ({size_mb:.1f} MB)")
+    mode = f"{w.threads} threads" if w.parallel else "sequential"
+    print(f"  Written: {output_file}  ({size_mb:.1f} MB, {mode}, "
+          f"{time.perf_counter() - t0:.1f}s)")
 
 
 # ── Main export logic ─────────────────────────────────────────────────────────
 
 def export_month(conn_params, year, month, output_dir,
                  data_table='data', header_table='header',
-                 station_lookup: dict = None, apply_qc: bool = True):
+                 station_lookup: dict = None, apply_qc: bool = True,
+                 threads: int = None):
     start_date = datetime(year, month, 1, tzinfo=timezone.utc)
     end_date   = (
         datetime(year + 1, 1, 1, tzinfo=timezone.utc) if month == 12
@@ -635,8 +875,10 @@ def export_month(conn_params, year, month, output_dir,
     output_file = output_dir / f"insitu-observations-gruan-reference-network_GRUAN_{year:04d}_{month:02d}.nc"
     if output_file.exists():
         print(f"  {output_file} already exists, skipping.")
+        log(f"\n{year:04d}-{month:02d}: output already exists, skipped ({output_file.name})")
         return
     print(f"\n── Exporting {year:04d}-{month:02d}  →  {output_file}")
+    TIMER.reset()
 
     # ── fetch data ────────────────────────────────────────────────────────────
     COLUMNS_DATA_TABLE = [
@@ -655,13 +897,22 @@ def export_month(conn_params, year, month, output_dir,
 
     columns_str = ", ".join(COLUMNS_DATA_TABLE)
 
+    # The altitude filter is pushed down to PostgreSQL (server-side), so only
+    # the levels we actually need are transferred and held in memory.
+    # NOTE: "alt <= X" alone would already drop NULLs (comparison yields NULL)
+    # and NaNs (PostgreSQL sorts NaN above every other value), but the checks
+    # are kept explicit for clarity and robustness.
     data_query = (
         f"SELECT {columns_str} "
         f"FROM {data_table}_{year:04d}{month:02d} "
+        f"WHERE alt IS NOT NULL "
+        f"  AND alt <> 'NaN'::float8 "
+        f"  AND alt <= %(max_alt)s "
         f"ORDER BY report_timestamp, observation_id"
     )
 
     print("data_query: ", data_query)
+    print("max altitude (m): ", MAX_ALTITUDE_M)
     print("start: ", start_date)
     print("end: ", end_date)
 
@@ -670,7 +921,7 @@ def export_month(conn_params, year, month, output_dir,
     try:
         chunk_iterator = pd.read_sql(
             data_query, engine,
-            params={'start': start_date, 'end': end_date},
+            params={'max_alt': MAX_ALTITUDE_M},
             chunksize=DATA_CHUNK_SIZE
         )
 
@@ -686,11 +937,16 @@ def export_month(conn_params, year, month, output_dir,
         engine.dispose()
 
     if not chunks:
-        print("  No data rows — skipping.")
+        print("  No data rows with valid alt <= "
+              f"{MAX_ALTITUDE_M} m — skipping.")
+        log(f"\n{year:04d}-{month:02d}: no data rows with valid alt <= {MAX_ALTITUDE_M} m, skipped")
         return
 
+    t_concat = time.perf_counter()
     df_data = pd.concat(chunks, ignore_index=True)
+    TIMER.add('db_read_data/concat_chunks', time.perf_counter() - t_concat)
     total_fetch_time = time.perf_counter() - start_fetch_time
+    TIMER.add('db_read_data', total_fetch_time)
     print(
         f"  Data rows   : {len(df_data):,} (Total read time: {total_fetch_time:.2f}s)")
 
@@ -712,35 +968,47 @@ def export_month(conn_params, year, month, output_dir,
         f"FROM {header_table} "
         f"WHERE report_timestamp >= %(start)s AND report_timestamp < %(end)s"
     )
+    t_hdr = time.perf_counter()
     engine2 = get_sqlalchemy_engine(conn_params)
     try:
         df_header = pd.read_sql(header_query, engine2,
                                 params={'start': start_date, 'end': end_date})
     finally:
         engine2.dispose()
+    TIMER.add('db_read_header', time.perf_counter() - t_hdr)
     print(f"  Header rows : {len(df_header):,}")
 
-    df_merged = pd.merge(
-        df_data, df_header,
-        on=['g_product_id'],
-        how='inner', suffixes=('', '_header')
-    ).copy()
+    with TIMER('merge_data_header'):
+        df_merged = pd.merge(
+            df_data, df_header,
+            on=['g_product_id'],
+            how='inner', suffixes=('', '_header')
+        ).copy()
     print(f"  Merged rows : {len(df_merged):,}")
 
     # ── plausibility QC (must run BEFORE the unit transforms) ─────────────────
     if apply_qc:
-        df_merged = apply_plausibility_qc(df_merged)
+        with TIMER('plausibility_qc'):
+            df_merged = apply_plausibility_qc(df_merged)
 
-    for col, (scale, offset) in UNIT_TRANSFORMS.items():
-        if col in df_merged.columns:
-            df_merged[col] = df_merged[col] * scale + offset
+    with TIMER('unit_transforms'):
+        for col, (scale, offset) in UNIT_TRANSFORMS.items():
+            if col in df_merged.columns:
+                df_merged[col] = df_merged[col] * scale + offset
 
     # ── pivot to CDM long format ──────────────────────────────────────────────
-    cdm = build_cdm_dataframe(df_merged, station_lookup or {})
+    with TIMER('build_cdm_dataframe'):
+        cdm = build_cdm_dataframe(df_merged, station_lookup or {})
     print(f"  CDM rows    : {len(cdm):,}  ({len(CDM_VARIABLES)} vars × {len(df_merged):,} levels)")
 
     # ── write NetCDF ──────────────────────────────────────────────────────────
-    write_cdm_netcdf(cdm, output_file)
+    with TIMER('write_netcdf'):
+        write_cdm_netcdf(cdm, output_file, threads=threads)
+
+    TIMER.report(f"{year:04d}-{month:02d}",
+                 note=f"{len(df_merged):,} levels -> {len(cdm):,} CDM rows")
+    RUN_TIMER.merge(TIMER)
+    TIMER.reset()
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -761,6 +1029,15 @@ def main():
                          help='Month to export (1-12). Requires --year.')
     parser.add_argument('--data-table',   default='data')
     parser.add_argument('--header-table', default='header')
+    parser.add_argument('--threads',      type=int, default=DEFAULT_THREADS,
+                         help='Threads used to compress the NetCDF chunks '
+                              '(needs h5py; 1 = sequential). Default: %(default)s')
+    parser.add_argument('--log-dir',      default=None,
+                         help='Directory of the timing log '
+                              '(export_netcdf_timing_<YYYYmmdd_HHMMSS>.log). '
+                              'Default: the output directory.')
+    parser.add_argument('--no-log', action='store_true',
+                         help='Do not write the timing log file.')
     parser.add_argument('--skip-qc', action='store_true',
                         help='Do not replace implausible values with NULL.')
     args = parser.parse_args()
@@ -784,7 +1061,26 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if not args.no_log:
+        import pandas, numpy
+        log_path = init_log(args.log_dir or output_dir, [
+            f"command : {' '.join(sys.argv)}",
+            f"host    : {platform.node()} ({platform.system()} {platform.release()}), "
+            f"{os.cpu_count()} logical CPUs ({_available_cpus()} usable by this process)",
+            f"python  : {platform.python_version()} | pandas {pandas.__version__} | "
+            f"numpy {numpy.__version__} | netCDF4 {nc.__version__} | "
+            f"h5py {h5py.__version__ if _HAVE_H5PY else 'NOT INSTALLED'}",
+            f"settings: threads={args.threads} (parallel compression "
+            f"{'ON' if args.threads > 1 and _HAVE_H5PY else 'OFF'}), "
+            f"deflate={DEFLATE_LEVEL}, qc={'off' if args.skip_qc else 'on'}, "
+            f"max_alt={MAX_ALTITUDE_M} m",
+            f"output  : {output_dir}",
+        ])
+        print(f"Timing log: {log_path}")
+
+    _t = time.perf_counter()
     months = get_available_months(conn_params, args.header_table)
+    RUN_TIMER.add('startup: list_available_months', time.perf_counter() - _t)
     if not months:
         sys.exit('No data found.')
     if args.year and args.month:
@@ -801,17 +1097,30 @@ def main():
             months = [(y, m) for y, m in months if y <= args.end_year]
 
     # print(f'Months to export: {len(months)}')
+    _t = time.perf_counter()
     station_lookup = load_station_record_numbers(conn_params)
-    for y, m in months:
-        export_month(conn_params, y, m, output_dir, args.data_table, args.header_table,
-                     station_lookup=station_lookup, apply_qc=not args.skip_qc)
+    RUN_TIMER.add('startup: station_lookup', time.perf_counter() - _t)
+    try:
+        for y, m in months:
+            export_month(conn_params, y, m, output_dir, args.data_table, args.header_table,
+                         station_lookup=station_lookup, apply_qc=not args.skip_qc,
+                         threads=args.threads)
+    except BaseException as exc:
+        # keep what was measured so far, and record why the run stopped
+        log(f"\n!! RUN INTERRUPTED after {time.perf_counter() - start_time:.2f}s: "
+            f"{type(exc).__name__}: {exc}")
+        if not isinstance(exc, KeyboardInterrupt):
+            log(traceback.format_exc())
+        RUN_TIMER.report("PARTIAL RUN (interrupted)")
+        raise
 
     print('\nDone.')
+    RUN_TIMER.report(f"WHOLE RUN ({len(months)} month(s))")
 
     end_time = time.perf_counter()
     elapsed_time = end_time - start_time
 
-    print(f"Total execution time: {elapsed_time:.2f} seconds")
+    emit(f"Total execution time: {elapsed_time:.2f} seconds")
 
 
 if __name__ == '__main__':

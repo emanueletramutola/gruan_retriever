@@ -49,8 +49,10 @@ import pandas as pd
 # USER SETTINGS - edit these values to change the defaults.
 # Each one can still be overridden from the command line.
 # --------------------------------------------------------------------------- #
-INPUT_DIR = "/Data/GRUAN_CDS"         # directory containing the NetCDF files
-OUTPUT_CSV = "/home/emanuele/logs/gruan_check_nc_CDM.csv"  # output CSV: full path + file name
+# INPUT_DIR = "/Data/GRUAN_CDS"         # directory containing the NetCDF files
+INPUT_DIR = "/Data/GRUAN_TEST/output"         # directory containing the NetCDF files
+# OUTPUT_CSV = "/home/emanuele/logs/gruan_check_nc_CDM.csv"  # output CSV: full path + file name
+OUTPUT_CSV = "/Data/GRUAN_TEST/output/gruan_check_nc_CDM.csv"  # output CSV: full path + file name
 N_WORKERS = 23                             # parallel worker processes (1 = serial)
 
 # --------------------------------------------------------------------------- #

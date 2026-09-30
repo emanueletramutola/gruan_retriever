@@ -16,8 +16,10 @@ Dependencies: numpy, pandas, matplotlib
 # --------------------------------------------------------------------------
 # USER SETTINGS  (edit these two variables)
 # --------------------------------------------------------------------------
-INPUT_CSV_PATH = "/home/emanuele/logs/gruan_check_nc_CDM.csv"      # input CSV file
-OUTPUT_PDF_PATH = "/home/emanuele/logs/gruan_quality_report.pdf"   # output PDF file
+# INPUT_CSV_PATH = "/home/emanuele/logs/gruan_check_nc_CDM.csv"      # input CSV file
+INPUT_CSV_PATH = "/Data/GRUAN_TEST/output/gruan_check_nc_CDM.csv"      # input CSV file
+# OUTPUT_PDF_PATH = "/home/emanuele/logs/gruan_quality_report.pdf"   # output PDF file
+OUTPUT_PDF_PATH = "/Data/GRUAN_TEST/output/gruan_quality_report.pdf"   # output PDF file
 # --------------------------------------------------------------------------
 
 import textwrap
@@ -35,18 +37,18 @@ from matplotlib.backends.backend_pdf import PdfPages
 # These are ASSUMPTIONS made for a quick screening (generous, so that only
 # clearly unphysical values are flagged); adapt them to your needs.
 PLAUSIBLE_RANGES = {
-    "shortwave radiation": (0.0, 1500.0),                       # W m-2
+    "shortwave radiation": (0.0, 1600.0),                       # W m-2
     "eastward wind speed": (-150.0, 150.0),                     # m/s
     "northward wind speed": (-150.0, 150.0),                    # m/s
     "wind from direction": (0.0, 360.0),                        # deg
-    "wind speed": (0.0, 150.0),                                 # m/s
-    "frost point temperature": (100.0, 330.0),                  # K
+    "wind speed": (0.0, 180.0),                                 # m/s
+    "frost point temperature": (150.0, 330.0),                  # K
     "geopotential height": (-100.0, 50000.0),                   # m
-    "vertical speed of radiosonde": (-100.0, 100.0),            # m/s
+    "vertical speed of radiosonde": (-10.0, 30.0),              # m/s
     "water vapour mixing ratio": (0.0, 0.05),                   # mol/mol
     "air relative humidity effective vertical resolution": (0.0, 1000.0),  # s
     "altitude": (-100.0, 50000.0),                              # m
-    "air temperature": (150.0, 330.0),                          # K
+    "air temperature": (178.15, 323.15),                          # K
     "relative humidity": (0.0, 105.0),                          # % (small supersaturation tolerated)
     "pressure": (1.0, 110000.0),                                # Pa
     "time since launch": (0.0, 21600.0),                        # s (6 h)
@@ -188,7 +190,7 @@ def consistency_flags(d):
 # ==========================================================================
 # Pages
 # ==========================================================================
-def page_summary(pdf, df, var_names, summ):
+def page_summary_old(pdf, df, var_names, summ):
     """Text page with dataset overview and computed strengths / weaknesses."""
     fig = plt.figure(figsize=LANDSCAPE)
     fig.text(0.5, 0.95, "GRUAN dataset - quality screening report", ha="center",
@@ -279,6 +281,99 @@ def page_summary(pdf, df, var_names, summ):
     pdf.savefig(fig)
     plt.close(fig)
 
+def page_summary(pdf, df, var_names, summ):
+    """Text page with dataset overview and computed strengths / weaknesses."""
+    fig = plt.figure(figsize=LANDSCAPE)
+    fig.text(0.5, 0.95, "GRUAN dataset - quality screening report", ha="center",
+             fontsize=17, weight="bold")
+    fig.text(0.5, 0.915, f"Source table: {INPUT_CSV_PATH}", ha="center", fontsize=9, color="gray")
+
+    n_files = df["file"].nunique()
+    gaps = month_gaps(df)
+    gap_txt = (", ".join(g.strftime("%Y-%m") for g in gaps)) if len(gaps) else "none"
+    total_rec = df.groupby("file")["n_records"].max().sum()
+    n_rows = len(df)
+
+    core = summ[summ["name"].isin(["air temperature", "pressure", "relative humidity", "altitude"])]
+    core_valid = core["Valid obs (%)"].min()
+    n_tot_unc = int((summ["Total unc. (%)"] > 50).sum())
+    n_no_unc = int(((summ[["Random unc. (%)", "Syst. unc. (%)", "Total unc. (%)"]].max(axis=1)) == 0).sum())
+    both = int(((summ["Random unc. (%)"] > 0) & (summ["Syst. unc. (%)"] > 0)).sum())
+    oor_rows = 100 * df["out_of_range"].mean()
+    worst = summ.sort_values("Files out of range (%)", ascending=False).head(3)
+    worst_txt = "; ".join(f"{r['name']} ({r['Files out of range (%)']:.0f}% of files)" for _, r in worst.iterrows())
+
+    sw = df[df["observed_variable_name"] == "shortwave radiation"].groupby("year")["observation_value_n_valid"].sum()
+    sw_peak_year, sw_peak = sw.idxmax(), sw.max()
+    sw_last_full = sw[sw.index < df["year"].max()].iloc[-1]
+
+    t = df[df["observed_variable_name"] == "air temperature"]
+    capmask = (t["uncertainty_total_max"] > 19.0) & (t["uncertainty_total_max"] <= 20.01)
+    cap_files = int(capmask.sum())
+    cap_first = t.loc[capmask, "date"].min()
+
+    # Safely format cap_first to avoid ValueError when pd.NaT is returned
+    cap_first_txt = f"from {cap_first:%Y-%m} on" if pd.notna(cap_first) else "N/A"
+
+    viol = {}
+    for v in ["air temperature", "relative humidity"]:
+        d = df[(df["observed_variable_name"] == v)].dropna(
+            subset=["uncertainty_random_max", "uncertainty_systematic_max", "uncertainty_total_max"])
+        lo_v, hi_v = consistency_flags(d)
+        viol[v] = (int((lo_v | hi_v).sum()), len(d))
+
+    strengths = [
+        f"Long and nearly continuous record: {n_files} monthly files from {df['date'].min():%Y-%m} to "
+        f"{df['date'].max():%Y-%m}; {len(gaps)} months missing ({gap_txt}).",
+        f"Large volume: about {total_rec / 1e9:.2f} billion records in total; the core state variables "
+        f"(temperature, pressure, RH, altitude) are valid in at least {core_valid:.0f}% of the records.",
+        f"Uncertainty information is provided for part of the variables: {n_tot_unc} of {len(var_names)} "
+        f"variables have a total uncertainty on more than half of the records, and {both} variables "
+        f"(air temperature, relative humidity) carry random AND systematic components.",
+        "Systematic structure of the table (identical variables, units and layout in every file) makes "
+        "automated checks straightforward, and no file has min > max or more valid values than records.",
+    ]
+    weaknesses = [
+        f"Unphysical extremes: {oor_rows:.1f}% of the file/variable rows have a minimum or maximum outside "
+        f"the assumed plausible range. Worst variables: {worst_txt}.",
+        f"Shortwave radiation collapses in time: {sw_peak / 1e6:.0f} M valid values in {sw_peak_year} vs "
+        f"{sw_last_full / 1e6:.2f} M in the last complete year; {int((df.loc[df['observed_variable_name'] == 'shortwave radiation', 'observation_value_n_valid'] == 0).sum())} "
+        f"files have no valid value at all.",
+        f"Air-temperature total uncertainty appears clipped: file maxima pile up just below ~5 K up to 2014 and "
+        f"just below ~20 K {cap_first_txt} ({cap_files} files near 20 K), i.e. a cap/fill value rather than "
+        "a real estimate.",
+        f"Total uncertainty is not compatible with its components in many files: the file maximum of the total "
+        f"is smaller than the largest component in {viol['air temperature'][0]}/{viol['air temperature'][1]} "
+        f"(temperature) and {viol['relative humidity'][0]}/{viol['relative humidity'][1]} (RH) files, or exceeds "
+        "their sum. Absurd values also occur (RH systematic uncertainty up to ~1e19 %, pressure total "
+        "uncertainty up to ~1e9 Pa).",
+        f"{n_no_unc} variables have no uncertainty at all, and wind/pressure/altitude carry only a total "
+        "uncertainty (no random / systematic split), which limits error propagation.",
+        "The table only stores min / max / counts per file: outlier frequency, distributions and "
+        "vertical structure cannot be assessed, and one single bad value flags a whole month.",
+    ]
+
+    y = 0.86
+
+    def block(title, items, y, color):
+        fig.text(0.05, y, title, fontsize=13, weight="bold", color=color)
+        y -= 0.04
+        for it in items:
+            lines = textwrap.wrap(it, 150)
+            fig.text(0.06, y, "\u2022", fontsize=10, va="top")
+            fig.text(0.075, y, "\n".join(lines), fontsize=9.5, va="top", linespacing=1.35)
+            y -= 0.028 * len(lines) + 0.022
+        return y
+
+    y = block("Strengths", strengths, y, "#1a7f37")
+    y -= 0.015
+    block("Weaknesses", weaknesses, y, "#b42318")
+
+    fig.text(0.05, 0.03, "Plausible ranges are screening assumptions defined in PLAUSIBLE_RANGES at the top of the "
+             "script; consistency bounds assume total = sqrt(random^2 + systematic^2) at each point.",
+             fontsize=7.5, color="gray")
+    pdf.savefig(fig)
+    plt.close(fig)
 
 def page_volume(pdf, df):
     """Records per monthly file, missing months and cumulative volume."""
@@ -477,7 +572,7 @@ def page_uncertainty_extremes(pdf, df, var_names):
             labs.append("\n".join(textwrap.wrap(f"{v} [{df.loc[df['observed_variable_name'] == v, 'units_abbreviation'].iloc[0]}]", 30)))
         pos = np.arange(len(var_names))
         ax.boxplot([x[~np.isnan(x)] if np.isfinite(x).any() else [] for x in data], positions=pos,
-                   vert=False, widths=0.6, flierprops=dict(marker=".", ms=3, markeredgecolor="red"),
+                   orientation='horizontal', widths=0.6, flierprops=dict(marker=".", ms=3, markeredgecolor="red"),
                    medianprops=dict(color="black"))
         ax.set_xscale("log")
         ax.set_yticks(pos)
@@ -496,7 +591,7 @@ def page_uncertainty_extremes(pdf, df, var_names):
     plt.close(fig)
 
 
-def page_consistency(pdf, df):
+def page_consistency_old(pdf, df):
     """Scatter total_max vs the largest component: tests the quadrature-sum consistency."""
     targets = ["air temperature", "relative humidity", "water vapour mixing ratio", "geopotential height"]
     fig, axes = plt.subplots(2, 2, figsize=LANDSCAPE)
@@ -539,6 +634,70 @@ def page_consistency(pdf, df):
     pdf.savefig(fig)
     plt.close(fig)
 
+def page_consistency(pdf, df):
+    """Scatter total_max vs the largest component: tests the quadrature-sum consistency."""
+    targets = ["air temperature", "relative humidity", "water vapour mixing ratio", "geopotential height"]
+    fig, axes = plt.subplots(2, 2, figsize=LANDSCAPE)
+    sc = None
+
+    for ax, v in zip(axes.ravel(), targets):
+        d = df[df["observed_variable_name"] == v].dropna(subset=["uncertainty_total_max"])
+        d = d[d["uncertainty_total_max"] > 0]
+        comps = d[["uncertainty_random_max", "uncertainty_systematic_max"]]
+        x = comps.max(axis=1)
+        ok = x > 0
+        d, x = d[ok], x[ok]
+        y = d["uncertainty_total_max"]
+
+        if len(d) == 0:
+            ax.text(0.5, 0.5, "No valid data available", transform=ax.transAxes,
+                    ha="center", va="center", fontsize=10, color="gray")
+            ax.set_title(f"{v}: 0/0 files outside the bounds", fontsize=9)
+            continue
+
+        viol_lo, viol_hi = consistency_flags(d)
+        sc_item = ax.scatter(x, y, c=d["year"], cmap="viridis", s=12, alpha=0.8)
+        if sc is None:
+            sc = sc_item
+
+        ax.scatter(x[viol_lo | viol_hi], y[viol_lo | viol_hi], facecolors="none", edgecolors="red", s=45, lw=0.8)
+
+        # Ensure valid limits > 0 for log scale
+        min_val = max(1e-6, min(x.min(), y.min()))
+        max_val = max(min_val * 10, max(x.max(), y.max()))
+        lim = [min_val, max_val]
+
+        ax.plot(lim, lim, "k-", lw=0.8, label="total = max(components)  (lower bound)")
+        both = comps.notna().all(axis=1).loc[d.index].any()
+        if both:
+            ax.plot(lim, [2 * l for l in lim], "k--", lw=0.8, label="total = 2 x max(comp.)  (upper bound)")
+
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+
+        if v == "relative humidity":
+            ax.set_xlim(1e-2, 1e6)
+            ax.set_ylim(1e-2, 1e6)
+            n_off = int(((x > 1e6) | (y > 1e6)).sum())
+            ax.text(0.98, 0.04, f"{n_off} file(s) off scale", transform=ax.transAxes, ha="right",
+                    fontsize=7, color="red")
+
+        ax.set_xlabel("max of components' file maxima")
+        ax.set_ylabel("total uncertainty (file maximum)")
+        ax.set_title(f"{v}: {int((viol_lo | viol_hi).sum())}/{len(d)} files outside the bounds", fontsize=9)
+        ax.legend(fontsize=6.5, loc="upper left")
+
+    if sc is not None:
+        cax = fig.add_axes([0.91, 0.12, 0.015, 0.68])
+        fig.colorbar(sc, cax=cax, label="Year")
+
+    fig.suptitle("Consistency of the total uncertainty with its components\n"
+                 "(if total = quadrature sum, points lie between the solid and dashed lines; red rings = outside;\n"
+                 "points below the solid line suggest a clipped/capped total uncertainty)",
+                 fontsize=12, weight="bold")
+    fig.subplots_adjust(top=0.85, left=0.07, right=0.88, bottom=0.08, hspace=0.35, wspace=0.25)
+    pdf.savefig(fig)
+    plt.close(fig)
 
 def page_table(pdf, summ):
     """Appendix: per-variable summary table."""
