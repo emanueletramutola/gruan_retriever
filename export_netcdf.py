@@ -971,7 +971,8 @@ def _adbc_uri(conn_params) -> str:
 # the last bit. To make both readers return the SAME float64, the shortest
 # round-tripping decimal is recomputed here, vectorised (bisection over 1..9
 # significant digits). Validated against PostgreSQL's own text output on
-# ~5M values (0 mismatches); ~6M values/s per thread.
+# ~5M values (0 mismatches); ~9M values/s per thread (blocks of 32k elements
+# keep the temporaries in cache: 1.7x faster than 256k-element blocks).
 
 # 10**k is exactly representable in float64 for k <= 22
 _POW10 = 10.0 ** np.arange(0, 23, dtype=np.float64)
@@ -986,7 +987,7 @@ def _round_sig(x, e, d):
     return np.where(pos, n / p, n * p)
 
 
-def float32_as_pg_text_float64(x32: np.ndarray, block: int = 1 << 18) -> np.ndarray:
+def float32_as_pg_text_float64(x32: np.ndarray, block: int = 1 << 15) -> np.ndarray:
     """float32 -> float64, giving for every value the float64 that psycopg2 would
     obtain from PostgreSQL's text output of the same REAL (PostgreSQL >= 12 prints
     the SHORTEST decimal that round-trips to the float4, and float() parses it)."""
@@ -1090,15 +1091,25 @@ def read_data_adbc(conn_params, year, month, data_table):
     if f32_cols:
         with TIMER('db_read_data/float32_to_double'):
             from concurrent.futures import ThreadPoolExecutor
-            def _convert(c):
-                arr = df[c].to_numpy()
-                if np.isnan(arr).all():              # entirely NULL: nothing to recompute
-                    return arr.astype(np.float64)
-                return float32_as_pg_text_float64(arr)
+            n_rows, step = len(df), 1 << 18          # tasks = (column, row range): balanced over threads
 
+            def _convert(src, dst, a, b):
+                dst[a:b] = float32_as_pg_text_float64(src[a:b])
+
+            converted, futures = {}, []
             with ThreadPoolExecutor(max_workers=max(DEFAULT_THREADS, 1)) as pool:
-                converted = list(pool.map(_convert, f32_cols))
-            for c, values in zip(f32_cols, converted):
+                for c in f32_cols:
+                    src = df[c].to_numpy()
+                    dst = np.empty(src.shape, dtype=np.float64)
+                    converted[c] = dst
+                    if np.isnan(src).all():          # entirely NULL: nothing to recompute
+                        dst[:] = src
+                        continue
+                    futures += [pool.submit(_convert, src, dst, a, min(a + step, n_rows))
+                                for a in range(0, n_rows, step)]
+                for f in futures:
+                    f.result()                       # re-raise any worker error
+            for c, values in converted.items():
                 df[c] = values
     return df
 
@@ -1178,7 +1189,7 @@ def verify_read_methods(conn_params, year, month, data_table='data') -> bool:
 def export_month(conn_params, year, month, output_dir,
                  data_table='data', header_table='header',
                  station_lookup: dict = None, apply_qc: bool = True,
-                 threads: int = None, read_method: str = 'sqlalchemy'):
+                 threads: int = None, read_method: str = 'adbc'):
     start_date = datetime(year, month, 1, tzinfo=timezone.utc)
     end_date   = (
         datetime(year + 1, 1, 1, tzinfo=timezone.utc) if month == 12
@@ -1295,10 +1306,10 @@ def main():
     parser.add_argument('--threads',      type=int, default=DEFAULT_THREADS,
                          help='Threads used to compress the NetCDF chunks '
                               '(needs h5py; 1 = sequential). Default: %(default)s')
-    parser.add_argument('--read-method',  choices=sorted(READ_METHODS), default='sqlalchemy',
-                         help="How the data table is read: 'sqlalchemy' (pandas.read_sql, "
-                              "default) or 'adbc' (Arrow/binary COPY, much faster; needs "
-                              "`pip install adbc-driver-postgresql pyarrow`).")
+    parser.add_argument('--read-method',  choices=sorted(READ_METHODS), default='adbc',
+                         help="How the data table is read: 'adbc' (default: Arrow/binary COPY, "
+                              "needs `pip install adbc-driver-postgresql pyarrow`) or "
+                              "'sqlalchemy' (pandas.read_sql, the original, ~2x slower).")
     parser.add_argument('--verify-read',  metavar='YYYY-MM', default=None,
                          help='Read that month with BOTH methods, compare them and exit '
                               '(no export). Run it once before using --read-method adbc.')
@@ -1348,6 +1359,11 @@ def main():
             f"output  : {output_dir}",
         ])
         print(f"Timing log: {log_path}")
+
+    if args.read_method == 'adbc' and not _HAVE_ADBC and not args.verify_read:
+        sys.exit("--read-method adbc (the default) needs: "
+                 "pip install adbc-driver-postgresql pyarrow\n"
+                 "or run with --read-method sqlalchemy")
 
     if args.verify_read:
         try:
