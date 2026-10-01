@@ -9,6 +9,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import netCDF4 as nc
+try:                                    # optional: faster DB reads (--read-method adbc)
+    import pyarrow as pa
+    import adbc_driver_postgresql.dbapi as adbc_dbapi
+    _HAVE_ADBC = True
+except ImportError:
+    _HAVE_ADBC = False
 try:                                    # optional: enables parallel compression
     import h5py
     _HAVE_H5PY = True
@@ -16,11 +22,12 @@ except ImportError:
     _HAVE_H5PY = False
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from dotenv import load_dotenv
 from typing import Optional
 import time
 import platform
+from urllib.parse import quote
 import traceback
 from contextlib import contextmanager
 from tqdm import tqdm
@@ -258,19 +265,40 @@ RUN_TIMER = StageTimer()   # whole run
 
 # ── helpers: DB ───────────────────────────────────────────────────────────────
 
+def _set_session_utc(dbapi_conn, *_unused):
+    """Force the session time zone to UTC, whatever the server default is.
+
+    Why it matters: with a non-UTC session (e.g. Europe/Rome) timestamptz values
+    come back with different UTC offsets inside the same month (DST change) and
+    pandas.read_sql + psycopg2 then shifts part of them by 1 hour. Partitions,
+    month boundaries and EXTRACT(MONTH ...) are also UTC-based. A plain SET
+    (not the 'options' startup parameter) also works behind connection poolers.
+    """
+    cur = dbapi_conn.cursor()
+    try:
+        cur.execute("SET TIME ZONE 'UTC'")
+    finally:
+        cur.close()
+    dbapi_conn.commit()
+
+
 def get_psycopg2_connection(conn_params):
-    return psycopg2.connect(
+    conn = psycopg2.connect(
         host=conn_params['host'], port=conn_params['port'],
         dbname=conn_params['dbname'], user=conn_params['user'],
         password=conn_params['password'], cursor_factory=RealDictCursor
     )
+    _set_session_utc(conn)
+    return conn
 
 def get_sqlalchemy_engine(conn_params):
     url = (
         f"postgresql://{conn_params['user']}:{conn_params['password']}"
         f"@{conn_params['host']}:{conn_params['port']}/{conn_params['dbname']}"
     )
-    return create_engine(url)
+    engine = create_engine(url)
+    event.listen(engine, 'connect', _set_session_utc)   # every pooled connection
+    return engine
 
 def load_station_record_numbers(conn_params) -> dict:
     """
@@ -863,10 +891,185 @@ def write_cdm_netcdf(cdm: pd.DataFrame, output_file: Path, threads: int = None):
 
 # ── Main export logic ─────────────────────────────────────────────────────────
 
+COLUMNS_DATA_TABLE = [
+    "g_product_id", "\"asc\"", "alt", "alt_gph", "alt_gph_uc_tcor", "alt_gph_uc", "alt_uc",
+    "fp", "fp_uc", "geopot", "idstation_pk", "lat", "lon",
+    "observation_id", "press", "press_uc", "report_timestamp", "rh", "rh_res", "rh_uc", "res_rh",
+    "rh_uc_tcor", "swrad", "temp", "temp_uc", "temp_uc_tcor", "u", "u_alt",
+    "u_cor_rh", "u_cor_temp", "u_press", "u_rh", "u_std_rh", "u_std_temp",
+    "u_swrad", "u_temp", "u_wdir", "u_wspeed", "v", "vspeed", "vspeed_uc",
+    "wdir", "wdir_uc", "wmeri", "wmeri_uc", "wspeed", "wspeed_uc", "wvmr",
+    "wvmr_vol", "wvmr_vol_uc", "wvmr_vol_uc_tcor", "wzon", "wzon_uc", "time"
+]
+
+
+# ── reading the data table ────────────────────────────────────────────────────
+# Why two readers: pd.read_sql + psycopg2 turns every one of the ~80M values of
+# a month into a Python object (~2.5M values/s) and transfers text, so reading
+# was ~65% of the whole export although PostgreSQL itself needs only a few
+# seconds. The ADBC reader streams the result as Arrow record batches over the
+# binary COPY protocol (no per-value Python objects). Select it with
+# --read-method adbc (pip install adbc-driver-postgresql pyarrow) and check it
+# on one month first with --verify-read YYYY-MM.
+
+def _data_query(year: int, month: int, data_table: str, max_alt_sql: str) -> str:
+    # The altitude filter is pushed down to PostgreSQL (server-side), so only
+    # the levels we actually need are transferred and held in memory.
+    # NOTE: "alt <= X" alone would already drop NULLs (comparison yields NULL)
+    # and NaNs (PostgreSQL sorts NaN above every other value), but the checks
+    # are kept explicit for clarity and robustness.
+    return (
+        f"SELECT {', '.join(COLUMNS_DATA_TABLE)} "
+        f"FROM {data_table}_{year:04d}{month:02d} "
+        f"WHERE alt IS NOT NULL "
+        f"  AND alt <> 'NaN'::float8 "
+        f"  AND alt <= {max_alt_sql} "
+        f"ORDER BY report_timestamp, observation_id"
+    )
+
+
+def read_data_sqlalchemy(conn_params, year, month, data_table):
+    """Original reader: pandas.read_sql in chunks. Returns None if no rows."""
+    engine = get_sqlalchemy_engine(conn_params)
+    chunks = []
+    query = _data_query(year, month, data_table, '%(max_alt)s')
+    print("data_query: ", query)
+    try:
+        chunk_iterator = pd.read_sql(query, engine,
+                                     params={'max_alt': MAX_ALTITUDE_M},
+                                     chunksize=DATA_CHUNK_SIZE)
+        with tqdm(chunk_iterator, desc="  Reading chunks", unit=" chunk",
+                  leave=True) as pbar:
+            for chunk in pbar:
+                chunks.append(chunk)
+                pbar.set_postfix(
+                    {"total_rows": f"{sum(len(c) for c in chunks):,}"},
+                    refresh=False)
+    finally:
+        engine.dispose()
+    if not chunks:
+        return None
+    t_concat = time.perf_counter()
+    df = pd.concat(chunks, ignore_index=True)
+    TIMER.add('db_read_data/concat_chunks', time.perf_counter() - t_concat)
+    return df
+
+
+def _adbc_uri(conn_params) -> str:
+    return (f"postgresql://{quote(str(conn_params['user']), safe='')}:"
+            f"{quote(str(conn_params['password']), safe='')}"
+            f"@{conn_params['host']}:{conn_params['port']}/{conn_params['dbname']}")
+
+
+def read_data_adbc(conn_params, year, month, data_table):
+    """Arrow-native reader (binary COPY, no per-value Python objects).
+    Returns a DataFrame with the same columns/dtypes as read_data_sqlalchemy,
+    or None if no rows."""
+    if not _HAVE_ADBC:
+        raise RuntimeError("--read-method adbc needs: "
+                           "pip install adbc-driver-postgresql pyarrow")
+    query = _data_query(year, month, data_table, repr(float(MAX_ALTITUDE_M)))
+    print("data_query: ", query)
+    with adbc_dbapi.connect(_adbc_uri(conn_params)) as conn, conn.cursor() as cur:
+        with TIMER('db_read_data/arrow_fetch'):
+            cur.execute("SET TIME ZONE 'UTC'")
+            cur.execute(query)
+            table = cur.fetch_arrow_table()
+    if table.num_rows == 0:
+        return None
+    # NUMERIC -> float64, as psycopg2 + pandas (coerce_float) would give.
+    # ADBC returns NUMERIC as an *opaque* Arrow type (string storage); passing
+    # that to to_pandas() fails, so convert it here. Any other opaque type is
+    # unknown territory: stop with a clear message instead of guessing.
+    for i, field in enumerate(table.schema):
+        ftype = field.type
+        if hasattr(ftype, 'type_name') and hasattr(ftype, 'vendor_name'):   # pa.OpaqueType
+            if ftype.type_name != 'numeric':
+                raise RuntimeError(
+                    f"column '{field.name}': PostgreSQL type '{ftype.type_name}' is not "
+                    f"supported by --read-method adbc; use --read-method sqlalchemy")
+            col = table.column(i)
+            storage = pa.chunked_array([c.storage for c in col.chunks],
+                                       type=ftype.storage_type)
+            table = table.set_column(i, field.name, storage.cast(pa.float64()))
+        elif pa.types.is_decimal(ftype):
+            table = table.set_column(i, field.name, table.column(i).cast(pa.float64()))
+    with TIMER('db_read_data/arrow_to_pandas'):
+        df = table.to_pandas(self_destruct=True, split_blocks=True)
+    del table
+    # psycopg2 hands over Python int/float -> int64/float64: keep those dtypes
+    for c in df.columns:
+        dt = df[c].dtype
+        if dt.kind in 'iu' and dt.itemsize < 8:
+            df[c] = df[c].astype(np.int64)
+        elif dt.kind == 'f' and dt.itemsize < 8:
+            df[c] = df[c].astype(np.float64)
+    return df
+
+
+READ_METHODS = {'sqlalchemy': read_data_sqlalchemy, 'adbc': read_data_adbc}
+
+
+def _frame_differences(a: pd.DataFrame, b: pd.DataFrame):
+    """List of human readable differences between two frames (empty = same)."""
+    out = []
+    if len(a) != len(b):
+        return [f"row count differs: {len(a):,} vs {len(b):,}"]
+    if list(a.columns) != list(b.columns):
+        return [f"columns differ: {list(a.columns)} vs {list(b.columns)}"]
+    for c in a.columns:
+        x, y = a[c], b[c]
+        if x.dtype != y.dtype:
+            out.append(f"{c}: dtype {x.dtype} vs {y.dtype}")
+        if x.dtype.kind in 'iufb' and y.dtype.kind in 'iufb':
+            xv, yv = x.to_numpy(np.float64), y.to_numpy(np.float64)
+            n_bad = int((~((xv == yv) | (np.isnan(xv) & np.isnan(yv)))).sum())
+        elif isinstance(x.dtype, pd.DatetimeTZDtype) or x.dtype.kind == 'M':
+            xv = pd.to_datetime(x, utc=True).astype('int64').to_numpy()
+            yv = pd.to_datetime(y, utc=True).astype('int64').to_numpy()
+            n_bad = int((xv != yv).sum())
+        else:
+            xn, yn = x.isna().to_numpy(), y.isna().to_numpy()
+            both = ~xn & ~yn
+            n_bad = int((xn != yn).sum()) + int(
+                (x.astype(object).to_numpy()[both] != y.astype(object).to_numpy()[both]).sum())
+        if n_bad:
+            out.append(f"{c}: {n_bad:,} differing values")
+    return out
+
+
+def verify_read_methods(conn_params, year, month, data_table='data') -> bool:
+    """Read one month with BOTH readers, report time and any difference."""
+    emit(f"\n── Verifying read methods on {year:04d}-{month:02d} ──")
+    frames, times = {}, {}
+    for name in ('sqlalchemy', 'adbc'):
+        TIMER.reset()
+        t0 = time.perf_counter()
+        frames[name] = READ_METHODS[name](conn_params, year, month, data_table)
+        times[name] = time.perf_counter() - t0
+        n = 0 if frames[name] is None else len(frames[name])
+        emit(f"  {name:<11} {times[name]:8.2f}s   {n:,} rows")
+    TIMER.reset()
+    a, b = frames['sqlalchemy'], frames['adbc']
+    if a is None or b is None:
+        emit("  no rows returned by one of the readers - nothing to compare"
+             if (a is None) == (b is None) else "  ONE READER RETURNED NO ROWS")
+        return (a is None) == (b is None)
+    diffs = _frame_differences(a, b)
+    if diffs:
+        emit("  DIFFERENCES FOUND:")
+        for d in diffs:
+            emit(f"    - {d}")
+    else:
+        emit(f"  identical: same columns, dtypes and values  "
+             f"(adbc is {times['sqlalchemy'] / times['adbc']:.1f}x faster)")
+    return not diffs
+
+
 def export_month(conn_params, year, month, output_dir,
                  data_table='data', header_table='header',
                  station_lookup: dict = None, apply_qc: bool = True,
-                 threads: int = None):
+                 threads: int = None, read_method: str = 'sqlalchemy'):
     start_date = datetime(year, month, 1, tzinfo=timezone.utc)
     end_date   = (
         datetime(year + 1, 1, 1, tzinfo=timezone.utc) if month == 12
@@ -881,70 +1084,21 @@ def export_month(conn_params, year, month, output_dir,
     TIMER.reset()
 
     # ── fetch data ────────────────────────────────────────────────────────────
-    COLUMNS_DATA_TABLE = [
-        "g_product_id", "\"asc\"", "alt", "alt_gph", "alt_gph_uc_tcor", "alt_gph_uc", "alt_uc",
-        "fp", "fp_uc", "geopot", "idstation_pk", "lat", "lon",
-        "observation_id", "press", "press_uc", "report_timestamp", "rh", "rh_res", "rh_uc", "res_rh",
-        "rh_uc_tcor", "swrad", "temp", "temp_uc", "temp_uc_tcor", "u", "u_alt",
-        "u_cor_rh", "u_cor_temp", "u_press", "u_rh", "u_std_rh", "u_std_temp",
-        "u_swrad", "u_temp", "u_wdir", "u_wspeed", "v", "vspeed", "vspeed_uc",
-        "wdir", "wdir_uc", "wmeri", "wmeri_uc", "wspeed", "wspeed_uc", "wvmr",
-        "wvmr_vol", "wvmr_vol_uc", "wvmr_vol_uc_tcor", "wzon", "wzon_uc", "time"
-    ]
-
-    engine = get_sqlalchemy_engine(conn_params)
-    chunks = []
-
-    columns_str = ", ".join(COLUMNS_DATA_TABLE)
-
-    # The altitude filter is pushed down to PostgreSQL (server-side), so only
-    # the levels we actually need are transferred and held in memory.
-    # NOTE: "alt <= X" alone would already drop NULLs (comparison yields NULL)
-    # and NaNs (PostgreSQL sorts NaN above every other value), but the checks
-    # are kept explicit for clarity and robustness.
-    data_query = (
-        f"SELECT {columns_str} "
-        f"FROM {data_table}_{year:04d}{month:02d} "
-        f"WHERE alt IS NOT NULL "
-        f"  AND alt <> 'NaN'::float8 "
-        f"  AND alt <= %(max_alt)s "
-        f"ORDER BY report_timestamp, observation_id"
-    )
-
-    print("data_query: ", data_query)
+    # (data columns: module-level COLUMNS_DATA_TABLE; query: _data_query)
     print("max altitude (m): ", MAX_ALTITUDE_M)
     print("start: ", start_date)
     print("end: ", end_date)
+    print("read method: ", read_method)
 
     start_fetch_time = time.perf_counter()
+    df_data = READ_METHODS[read_method](conn_params, year, month, data_table)
 
-    try:
-        chunk_iterator = pd.read_sql(
-            data_query, engine,
-            params={'max_alt': MAX_ALTITUDE_M},
-            chunksize=DATA_CHUNK_SIZE
-        )
-
-        with tqdm(chunk_iterator, desc="  Reading chunks", unit=" chunk",
-                  leave=True) as pbar:
-            for chunk in pbar:
-                chunks.append(chunk)
-                pbar.set_postfix(
-                    {"total_rows": f"{sum(len(c) for c in chunks):,}"},
-                    refresh=False)
-
-    finally:
-        engine.dispose()
-
-    if not chunks:
+    if df_data is None:
         print("  No data rows with valid alt <= "
               f"{MAX_ALTITUDE_M} m — skipping.")
         log(f"\n{year:04d}-{month:02d}: no data rows with valid alt <= {MAX_ALTITUDE_M} m, skipped")
         return
 
-    t_concat = time.perf_counter()
-    df_data = pd.concat(chunks, ignore_index=True)
-    TIMER.add('db_read_data/concat_chunks', time.perf_counter() - t_concat)
     total_fetch_time = time.perf_counter() - start_fetch_time
     TIMER.add('db_read_data', total_fetch_time)
     print(
@@ -1032,6 +1186,13 @@ def main():
     parser.add_argument('--threads',      type=int, default=DEFAULT_THREADS,
                          help='Threads used to compress the NetCDF chunks '
                               '(needs h5py; 1 = sequential). Default: %(default)s')
+    parser.add_argument('--read-method',  choices=sorted(READ_METHODS), default='sqlalchemy',
+                         help="How the data table is read: 'sqlalchemy' (pandas.read_sql, "
+                              "default) or 'adbc' (Arrow/binary COPY, much faster; needs "
+                              "`pip install adbc-driver-postgresql pyarrow`).")
+    parser.add_argument('--verify-read',  metavar='YYYY-MM', default=None,
+                         help='Read that month with BOTH methods, compare them and exit '
+                              '(no export). Run it once before using --read-method adbc.')
     parser.add_argument('--log-dir',      default=None,
                          help='Directory of the timing log '
                               '(export_netcdf_timing_<YYYYmmdd_HHMMSS>.log). '
@@ -1072,11 +1233,21 @@ def main():
             f"h5py {h5py.__version__ if _HAVE_H5PY else 'NOT INSTALLED'}",
             f"settings: threads={args.threads} (parallel compression "
             f"{'ON' if args.threads > 1 and _HAVE_H5PY else 'OFF'}), "
+            f"read={args.read_method}, "
             f"deflate={DEFLATE_LEVEL}, qc={'off' if args.skip_qc else 'on'}, "
             f"max_alt={MAX_ALTITUDE_M} m",
             f"output  : {output_dir}",
         ])
         print(f"Timing log: {log_path}")
+
+    if args.verify_read:
+        try:
+            vy, vm = (int(x) for x in args.verify_read.split('-'))
+            assert 1 <= vm <= 12
+        except (ValueError, AssertionError):
+            sys.exit('--verify-read expects YYYY-MM, e.g. 2020-10')
+        ok = verify_read_methods(conn_params, vy, vm, args.data_table)
+        sys.exit(0 if ok else 1)
 
     _t = time.perf_counter()
     months = get_available_months(conn_params, args.header_table)
@@ -1104,7 +1275,7 @@ def main():
         for y, m in months:
             export_month(conn_params, y, m, output_dir, args.data_table, args.header_table,
                          station_lookup=station_lookup, apply_qc=not args.skip_qc,
-                         threads=args.threads)
+                         threads=args.threads, read_method=args.read_method)
     except BaseException as exc:
         # keep what was measured so far, and record why the run stopped
         log(f"\n!! RUN INTERRUPTED after {time.perf_counter() - start_time:.2f}s: "
