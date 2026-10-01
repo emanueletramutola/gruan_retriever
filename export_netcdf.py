@@ -961,6 +961,87 @@ def _adbc_uri(conn_params) -> str:
             f"@{conn_params['host']}:{conn_params['port']}/{conn_params['dbname']}")
 
 
+# ── float4 (REAL) columns: reproduce what psycopg2 delivers ──────────────────
+# PostgreSQL REAL columns are sent as TEXT by the classic reader: since PG 12 the
+# SHORTEST decimal that round-trips to the float4 (e.g. 205.37), which Python
+# parses into a float64. ADBC delivers the exact float32 instead, which widened
+# to float64 is 205.3699951171875. After the final cast to float32 (NetCDF) the
+# two coincide for pass-through columns, but arithmetic in float64 (unit
+# transforms) or comparisons against decimal thresholds (QC) could differ in
+# the last bit. To make both readers return the SAME float64, the shortest
+# round-tripping decimal is recomputed here, vectorised (bisection over 1..9
+# significant digits). Validated against PostgreSQL's own text output on
+# ~5M values (0 mismatches); ~6M values/s per thread.
+
+# 10**k is exactly representable in float64 for k <= 22
+_POW10 = 10.0 ** np.arange(0, 23, dtype=np.float64)
+
+
+def _round_sig(x, e, d):
+    """x rounded to d significant digits (decimal exponent e), as float64."""
+    k = d - 1 - e
+    p = _POW10[np.abs(k)]
+    pos = k >= 0
+    n = np.rint(np.where(pos, x * p, x / p))
+    return np.where(pos, n / p, n * p)
+
+
+def float32_as_pg_text_float64(x32: np.ndarray, block: int = 1 << 18) -> np.ndarray:
+    """float32 -> float64, giving for every value the float64 that psycopg2 would
+    obtain from PostgreSQL's text output of the same REAL (PostgreSQL >= 12 prints
+    the SHORTEST decimal that round-trips to the float4, and float() parses it)."""
+    x32 = np.ascontiguousarray(x32, dtype=np.float32)
+    out = x32.astype(np.float64)
+    ax = np.abs(out)
+    fast = (ax >= 1e-12) & (ax < 1e12)               # excludes 0, NaN, inf
+    idx = np.flatnonzero(fast)
+    bad = []
+    for s in range(0, idx.size, block):
+        ii = idx[s:s + block]
+        x = out[ii]
+        t = x32[ii]
+        e = np.floor(np.log10(np.abs(x))).astype(np.int64)
+        # midpoints to the neighbouring float32 values (exact in float64). PostgreSQL's
+        # shortest-digits output does NOT accept a decimal lying exactly on such a midpoint.
+        mid_up = (x + np.nextafter(t, np.float32(np.inf)).astype(np.float64)) / 2
+        mid_dn = (x + np.nextafter(t, np.float32(-np.inf)).astype(np.float64)) / 2
+
+        def roundtrips(r):
+            return (r.astype(np.float32) == t) & (r != mid_up) & (r != mid_dn)
+
+        lo = np.ones(ii.size, dtype=np.int64)
+        hi = np.full(ii.size, 9, dtype=np.int64)
+        for _ in range(4):                           # shortest digit count: monotonic -> bisection on 1..9
+            mid = (lo + hi) // 2
+            good = roundtrips(_round_sig(x, e, mid))
+            hi = np.where(good, mid, hi)
+            lo = np.where(good, lo, mid + 1)
+        r = _round_sig(x, e, hi)
+        ok = roundtrips(r)                           # safety net (e.g. log10 off by one at powers of ten)
+        out[ii[ok]] = r[ok]
+        bad.append(ii[~ok])
+    # rare leftovers + values outside the fast window (tiny/huge): exact but slow, per element
+    rest = np.concatenate(bad + [np.flatnonzero(np.isfinite(out) & (out != 0) & ~fast)]) if bad else \
+        np.flatnonzero(np.isfinite(out) & (out != 0) & ~fast)
+    for i in rest:
+        out[i] = _shortest_exact(x32[i])
+    return out
+
+
+def _shortest_exact(v):
+    """Slow, per-element version of the same rule (used for the rare values that fall
+    outside the vectorised window): fewest digits whose decimal round-trips to v
+    and does not lie exactly on the midpoint to a neighbouring float32."""
+    x = float(v)
+    mid_up = (x + float(np.nextafter(v, np.float32(np.inf)))) / 2
+    mid_dn = (x + float(np.nextafter(v, np.float32(-np.inf)))) / 2
+    for precision in range(0, 9):                    # digits after the point in scientific notation
+        r = float(np.format_float_scientific(v, precision=precision, unique=False))
+        if np.float32(r) == v and r != mid_up and r != mid_dn:
+            return r
+    return x
+
+
 def read_data_adbc(conn_params, year, month, data_table):
     """Arrow-native reader (binary COPY, no per-value Python objects).
     Returns a DataFrame with the same columns/dtypes as read_data_sqlalchemy,
@@ -997,21 +1078,39 @@ def read_data_adbc(conn_params, year, month, data_table):
     with TIMER('db_read_data/arrow_to_pandas'):
         df = table.to_pandas(self_destruct=True, split_blocks=True)
     del table
-    # psycopg2 hands over Python int/float -> int64/float64: keep those dtypes
+    # psycopg2 hands over Python int / float: keep int64 / float64, and for REAL
+    # (float32) columns the very same float64 values the classic reader produces.
+    f32_cols = []
     for c in df.columns:
         dt = df[c].dtype
         if dt.kind in 'iu' and dt.itemsize < 8:
             df[c] = df[c].astype(np.int64)
         elif dt.kind == 'f' and dt.itemsize < 8:
-            df[c] = df[c].astype(np.float64)
+            f32_cols.append(c)
+    if f32_cols:
+        with TIMER('db_read_data/float32_to_double'):
+            from concurrent.futures import ThreadPoolExecutor
+            def _convert(c):
+                arr = df[c].to_numpy()
+                if np.isnan(arr).all():              # entirely NULL: nothing to recompute
+                    return arr.astype(np.float64)
+                return float32_as_pg_text_float64(arr)
+
+            with ThreadPoolExecutor(max_workers=max(DEFAULT_THREADS, 1)) as pool:
+                converted = list(pool.map(_convert, f32_cols))
+            for c, values in zip(f32_cols, converted):
+                df[c] = values
     return df
 
 
 READ_METHODS = {'sqlalchemy': read_data_sqlalchemy, 'adbc': read_data_adbc}
 
 
-def _frame_differences(a: pd.DataFrame, b: pd.DataFrame):
-    """List of human readable differences between two frames (empty = same)."""
+def _frame_differences(a: pd.DataFrame, b: pd.DataFrame, notes: list = None):
+    """List of human readable differences between two frames (empty = same).
+    Harmless findings (columns that are entirely NULL in both frames) go to
+    `notes` instead: the classic reader gives them dtype object (None), the
+    Arrow reader float64 (NaN); every downstream use goes through pd.to_numeric."""
     out = []
     if len(a) != len(b):
         return [f"row count differs: {len(a):,} vs {len(b):,}"]
@@ -1019,6 +1118,10 @@ def _frame_differences(a: pd.DataFrame, b: pd.DataFrame):
         return [f"columns differ: {list(a.columns)} vs {list(b.columns)}"]
     for c in a.columns:
         x, y = a[c], b[c]
+        if x.dtype != y.dtype and x.isna().all() and y.isna().all():
+            if notes is not None:
+                notes.append(c)
+            continue
         if x.dtype != y.dtype:
             out.append(f"{c}: dtype {x.dtype} vs {y.dtype}")
         if x.dtype.kind in 'iufb' and y.dtype.kind in 'iufb':
@@ -1049,13 +1152,19 @@ def verify_read_methods(conn_params, year, month, data_table='data') -> bool:
         times[name] = time.perf_counter() - t0
         n = 0 if frames[name] is None else len(frames[name])
         emit(f"  {name:<11} {times[name]:8.2f}s   {n:,} rows")
+        for stage, (sec, _calls) in TIMER.t.items():
+            emit(f"      {stage.split('/', 1)[-1]:<24}{sec:8.2f}s")
     TIMER.reset()
     a, b = frames['sqlalchemy'], frames['adbc']
     if a is None or b is None:
         emit("  no rows returned by one of the readers - nothing to compare"
              if (a is None) == (b is None) else "  ONE READER RETURNED NO ROWS")
         return (a is None) == (b is None)
-    diffs = _frame_differences(a, b)
+    notes = []
+    diffs = _frame_differences(a, b, notes)
+    if notes:
+        emit(f"  note: {len(notes)} column(s) are entirely NULL in this month "
+             f"(object/None vs float64/NaN, harmless): {', '.join(notes)}")
     if diffs:
         emit("  DIFFERENCES FOUND:")
         for d in diffs:
