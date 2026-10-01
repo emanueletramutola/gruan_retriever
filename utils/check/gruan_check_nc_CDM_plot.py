@@ -37,21 +37,22 @@ from matplotlib.backends.backend_pdf import PdfPages
 # These are ASSUMPTIONS made for a quick screening (generous, so that only
 # clearly unphysical values are flagged); adapt them to your needs.
 PLAUSIBLE_RANGES = {
-    "shortwave radiation": (0.0, 1600.0),                       # W m-2
-    "eastward wind speed": (-150.0, 150.0),                     # m/s
-    "northward wind speed": (-150.0, 150.0),                    # m/s
-    "wind from direction": (0.0, 360.0),                        # deg
-    "wind speed": (0.0, 180.0),                                 # m/s
-    "frost point temperature": (150.0, 330.0),                  # K
-    "geopotential height": (-100.0, 50000.0),                   # m
-    "vertical speed of radiosonde": (-10.0, 30.0),              # m/s
-    "water vapour mixing ratio": (0.0, 0.05),                   # mol/mol
-    "air relative humidity effective vertical resolution": (0.0, 1000.0),  # s
-    "altitude": (-100.0, 50000.0),                              # m
-    "air temperature": (178.15, 323.15),                          # K
-    "relative humidity": (0.0, 105.0),                          # % (small supersaturation tolerated)
-    "pressure": (1.0, 110000.0),                                # Pa
-    "time since launch": (0.0, 21600.0),                        # s (6 h)
+    "air temperature": (178.15, 323.15),                                    # K
+    "relative humidity": (0.0, 100.0),                                      # %
+    "wind speed": (0.0, 180.0),                                             # m/s
+    "wind from direction": (0.0, 360.0),                                    # deg
+    "pressure": (1.0, 108000.0),                                            # Pa
+    "water vapour mixing ratio": (0.0, 0.05),                               # mol/mol
+    "frost point temperature": (150.0, 330.0),                              # K
+    "shortwave radiation": (0.0, 1600.0),                                   # W m-2
+    "vertical speed of radiosonde": (-10.0, 30.0),                          # m/s
+    "geopotential height": (-100.0, 47000.0),                               # m
+    "altitude": (-100.0, 47000.0),                                          # m
+
+    "eastward wind speed": (-150.0, 150.0),                                 # m/s
+    "northward wind speed": (-150.0, 150.0),                                # m/s
+    "air relative humidity effective vertical resolution": (0.0, 1000.0),   # s
+    "time since launch": (0.0, 21600.0),                                    # s (6 h)
 }
 
 # Relative tolerance used in the uncertainty-consistency test
