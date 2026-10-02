@@ -159,7 +159,7 @@ QC_REJECTION_WARN_FRACTION = 0.5
 # TIMER collects one month; export_month prints its report and folds it into
 # RUN_TIMER, which main() prints at the end (whole run).
 
-SCRIPT_REVISION = '2026-10-02a'   # shown in the log header: tells which code produced a log
+SCRIPT_REVISION = '2026-10-02b'   # shown in the log header: tells which code produced a log
 LOG_PATH = None     # set by init_log(); None = no log file
 
 
@@ -372,8 +372,76 @@ def _chunk_rows(itemsize_bytes: int) -> int:
     return max(CHUNK_BYTES // max(itemsize_bytes, 1), 1024)
 
 
+class _LongColumn:
+    """One column of the CDM long format, NEVER materialised.
+
+    The long format is `len(pieces)` consecutive pieces of `n_levels` rows (one
+    piece per CDM variable). A piece is a numpy array of n_levels values (e.g.
+    observation_value) or a scalar that is constant over the piece (e.g. the
+    variable code). Slicing a row range rebuilds just that block, so memory
+    stays at ONE level-column instead of 15 copies of it. Tiled columns (the
+    same value for every variable: station, time, position...) simply share the
+    same array object in every piece.
+    """
+    __slots__ = ('n_levels', 'pieces')
+
+    def __init__(self, n_levels, pieces):
+        self.n_levels, self.pieces = int(n_levels), list(pieces)
+
+    def __len__(self):
+        return self.n_levels * len(self.pieces)
+
+    def __getitem__(self, sl):
+        i, j, _ = sl.indices(len(self))
+        L = self.n_levels
+        if j <= i:
+            return np.asarray(self.pieces[0])[:0] if isinstance(self.pieces[0], np.ndarray) else np.empty(0)
+        parts = []
+        for v in range(i // L, (j - 1) // L + 1):
+            a, b = max(i, v * L) - v * L, min(j, (v + 1) * L) - v * L
+            piece = self.pieces[v]
+            parts.append(piece[a:b] if isinstance(piece, (np.ndarray, pd.Series))
+                         else np.full(b - a, piece))
+        return parts[0] if len(parts) == 1 else np.concatenate(parts)
+
+
+class CdmLong:
+    """CDM long format as a set of virtual columns (see _LongColumn).
+    Same access pattern as the DataFrame of build_cdm_dataframe:
+    len(cdm) = rows, cdm['column'] = the column."""
+
+    def __init__(self, n_levels, n_vars, columns):
+        self.n_levels, self.n_vars, self.columns = n_levels, n_vars, columns
+
+    def __len__(self):
+        return self.n_levels * self.n_vars
+
+    def __getitem__(self, name):
+        return self.columns[name]
+
+    def to_dataframe(self) -> pd.DataFrame:
+        """Materialise everything (tests / debugging only: this is what
+        the lean path avoids)."""
+        out = {}
+        for name, col in self.columns.items():
+            if isinstance(col.pieces[0], pd.Series):            # string columns
+                out[name] = pd.concat(col.pieces, ignore_index=True)
+            else:
+                out[name] = col[0:len(col)]
+        return pd.DataFrame(out)
+
+
+def _src_any(arr):
+    """Series -> ndarray; virtual long column / ndarray unchanged."""
+    if isinstance(arr, _LongColumn):
+        return arr
+    return arr.to_numpy() if isinstance(arr, pd.Series) else np.asarray(arr)
+
+
 def _src_numeric(arr):
     """Series/array -> numpy array, zero-copy when it is already plain numpy."""
+    if isinstance(arr, _LongColumn):
+        return arr
     if isinstance(arr, pd.Series):
         if isinstance(arr.dtype, np.dtype) and arr.dtype.kind in 'fiub':
             return arr.to_numpy()
@@ -383,6 +451,8 @@ def _src_numeric(arr):
 
 def _src_integer(arr, sentinel, dtype):
     """Series/array -> numpy integer-like array; NULLs replaced by `sentinel`."""
+    if isinstance(arr, _LongColumn):
+        return arr
     if isinstance(arr, pd.Series):
         if isinstance(arr.dtype, np.dtype) and arr.dtype.kind in 'iub':
             return arr.to_numpy()
@@ -513,10 +583,15 @@ class _NcWriter:
 
     def char(self, name, arr, **attrs):
         with TIMER('write_netcdf/string_factorize'):
-            codes, table = _factorize_strings(arr)
+            if isinstance(arr, _LongColumn):           # tiled strings: factorise ONE level-column
+                codes_level, table = _factorize_strings(arr.pieces[0])
+                codes = _LongColumn(arr.n_levels, [codes_level] * len(arr.pieces))
+                used = np.bincount(codes_level, minlength=len(table)) > 0   # ignore unused categories
+            else:
+                codes, table = _factorize_strings(arr)
+                used = np.bincount(codes, minlength=len(table)) > 0
         enc = [t.encode('utf-8', errors='replace') for t in table]
         lens = np.fromiter((len(b) for b in enc), dtype=np.int64, count=len(enc))
-        used = np.bincount(codes, minlength=len(enc)) > 0    # ignore unused categories
         maxlen = max(int(lens[used].max()) if used.any() else 1, 1)
 
         sdim = f"string{maxlen}"
@@ -809,6 +884,102 @@ def build_cdm_dataframe(df_merged: pd.DataFrame,
     return cdm
 
 
+def build_cdm_long(df_merged: pd.DataFrame, station_lookup: dict) -> CdmLong:
+    """Lean replacement of build_cdm_dataframe: same CDM long format, but as
+    virtual columns (CdmLong) instead of a DataFrame with 15 copies of every
+    level. All per-level derivations are computed ONCE (n_levels work instead
+    of 15 x), and the writer rebuilds each block of rows on demand.
+
+    build_cdm_dataframe is kept as the reference implementation: the two must
+    produce identical files (see --legacy-cdm and the tests)."""
+    L = len(df_merged)
+    n_vars = len(CDM_VARIABLES)
+
+    ts_raw = df_merged['report_timestamp']
+    if pd.api.types.is_datetime64_any_dtype(ts_raw):
+        if ts_raw.dt.tz is None:
+            ts_raw = ts_raw.dt.tz_localize('UTC')
+        else:
+            ts_raw = ts_raw.dt.tz_convert('UTC')
+        ts_epoch = ts_raw.values.astype('datetime64[s]').astype('int64')
+    else:
+        ts_epoch = pd.to_datetime(ts_raw, utc=True).values.astype(
+            'datetime64[s]').astype('int64')
+
+    def _str_col(column_name_cf_1_4, column_name_cf_1_7):
+        if column_name_cf_1_4 in df_merged.columns and column_name_cf_1_7 in df_merged.columns:
+            combined = df_merged[column_name_cf_1_4].fillna(df_merged[column_name_cf_1_7])
+            return combined.fillna('').astype(str)
+        return pd.Series('', index=df_merged.index)           # columns not available
+
+    primary_station_id = _str_col('g_general_sitecode', 'g_site_key')
+    _MISSING_REC = np.iinfo(np.int32).min                       # sentinel for unknown stations
+    record_number_vals = (primary_station_id.map(station_lookup)
+                          .fillna(_MISSING_REC).astype(np.int32).values)
+    station_name = _str_col('g_general_sitename', 'g_site_name')
+    sensor_id    = _str_col('g_product_code', 'g_product_key')
+
+    arr = lambda series: series.to_numpy()                      # no copy for numpy-backed Series
+    lat_station = arr(_col_or_nan(df_merged, 'g_measuringsystem_latitude', 'g_measurementsystem_latitude'))
+    lon_station = arr(_col_or_nan(df_merged, 'g_measuringsystem_longitude', 'g_measurementsystem_longitude'))
+    alt_station = arr(_col_or_nan(df_merged, 'g_measuringsystem_altitude', 'g_measurementsystem_altitude'))
+    lat_obs     = arr(_col_or_nan(df_merged, 'lat', 'lat'))
+    lon_obs     = arr(_col_or_nan(df_merged, 'lon', 'lon'))
+    z_coord     = arr(_col_or_nan(df_merged, 'alt', 'alt'))
+
+    # strings as Categoricals (built once): the writer factorises one level-column
+    primary_station_id_c = primary_station_id.astype('category')
+    station_name_c       = station_name.astype('category')
+    sensor_id_c          = sensor_id.astype('category')
+    report_id_c          = df_merged['g_product_id'].astype('category')
+    observation_id       = df_merged['observation_id'].to_numpy()
+
+    # per-variable pieces: arrays that differ (value, uncertainties) and constants
+    obs_val, uc1, uc2, uc5, codes, units_l = [], [], [], [], [], []
+    for entry in CDM_VARIABLES:
+        cdm_code, v14, v17, units, units_str, uc_rand_col, uc_sys_14, uc_sys_17, uc_tot_14, uc_tot_17 = entry
+        obs_val.append(arr(_col_or_nan(df_merged, v14, v17)))
+        uc1.append(arr(_col_or_nan(df_merged, uc_rand_col, None)))
+        uc2.append(arr(_col_or_nan(df_merged, uc_sys_14, uc_sys_17)))
+        uc5.append(arr(_col_or_nan(df_merged, uc_tot_14, uc_tot_17)))
+        codes.append(np.uint16(cdm_code))
+        units_l.append(units)
+
+    tiled = lambda a: _LongColumn(L, [a] * n_vars)             # same for every variable
+    const = lambda v: _LongColumn(L, [v] * n_vars)             # one constant everywhere
+    columns = {
+        'observed_variable':                  _LongColumn(L, codes),
+        'observation_value':                  _LongColumn(L, obs_val),
+        'units':                              _LongColumn(L, units_l),
+        'z_coordinate':                       tiled(z_coord),
+        'z_coordinate_type':                  const(np.uint8(0)),        # 0 = altitude above MSL
+        'uncertainty_value1':                 _LongColumn(L, uc1),
+        'uncertainty_type1':                  const(np.uint8(1)),
+        'uncertainty_units1':                 _LongColumn(L, units_l),
+        'uncertainty_value2':                 _LongColumn(L, uc2),
+        'uncertainty_type2':                  const(np.uint8(2)),
+        'uncertainty_units2':                 _LongColumn(L, units_l),
+        'uncertainty_value5':                 _LongColumn(L, uc5),
+        'uncertainty_type5':                  const(np.uint8(5)),
+        'uncertainty_units5':                 _LongColumn(L, units_l),
+        'report_timestamp':                   tiled(ts_epoch),
+        'report_meaning_of_timestamp':        const(np.uint8(1)),
+        'report_id':                          tiled(report_id_c),
+        'report_duration':                    const(np.uint8(9)),
+        'observation_id':                     tiled(observation_id),
+        'primary_station_id':                 tiled(primary_station_id_c),
+        'station_name|station_configuration': tiled(station_name_c),
+        'latitude|station_configuration':     tiled(lat_station),
+        'longitude|station_configuration':    tiled(lon_station),
+        'height_of_station_above_sea_level':  tiled(alt_station),
+        'latitude|observations_table':        tiled(lat_obs),
+        'longitude|observations_table':       tiled(lon_obs),
+        'record_number':                      tiled(record_number_vals),
+        'sensor_id':                          tiled(sensor_id_c),
+    }
+    return CdmLong(L, n_vars, columns)
+
+
 # ── NetCDF writer ─────────────────────────────────────────────────────────────
 
 # All CDM variable codes exported  (used for observed_variable labels attr)
@@ -832,8 +1003,9 @@ ALL_CDM_LABELS = {
 }
 
 
-def write_cdm_netcdf(cdm: pd.DataFrame, output_file: Path, threads: int = None):
-    """Write a CDM long-format DataFrame to a GRUAN-convention NetCDF4 file.
+def write_cdm_netcdf(cdm, output_file: Path, threads: int = None):
+    """Write the CDM long format (a DataFrame from build_cdm_dataframe or the
+    virtual CdmLong from build_cdm_long) to a GRUAN-convention NetCDF4 file.
 
     threads: compression threads (default DEFAULT_THREADS). 1 = sequential.
     """
@@ -868,10 +1040,10 @@ def write_cdm_netcdf(cdm: pd.DataFrame, output_file: Path, threads: int = None):
         # build_cdm_dataframe uses int32-min as "unknown station" sentinel. A
         # plain astype(int8) would turn it into 0 (a valid-looking id), so it
         # is mapped explicitly to the int8 fill value.
-        rec = cdm['record_number'].to_numpy()
-        rec = np.where(rec == np.iinfo(np.int32).min,
-                       np.iinfo(np.int8).min, rec).astype(np.int8)
-        w._numeric('record_number', np.int8, rec, lambda b: b, shuffle=False,
+        w._numeric('record_number', np.int8, _src_any(cdm['record_number']),
+                   lambda b: np.where(b == np.iinfo(np.int32).min,
+                                      np.iinfo(np.int8).min, b).astype(np.int8),
+                   shuffle=False,
                    fill_value=np.iinfo(np.int8).min,
                    long_name='station record number',
                    comment='integer primary key (id) of the matching row '
@@ -892,7 +1064,7 @@ def write_cdm_netcdf(cdm: pd.DataFrame, output_file: Path, threads: int = None):
 
         # ── CDM core: observed variable & value ───────────────────────────────
         w._numeric('observed_variable', np.int16,
-                   cdm['observed_variable'].to_numpy(),
+                   _src_any(cdm['observed_variable']),
                    lambda b: b.astype(np.int16, copy=False), shuffle=False,
                    codes=np.array(codes_used, dtype=np.int32),
                    labels=', '.join(labels_used))
@@ -1218,7 +1390,8 @@ def verify_read_methods(conn_params, year, month, data_table='data') -> bool:
 def export_month(conn_params, year, month, output_dir,
                  data_table='data', header_table='header',
                  station_lookup: dict = None, apply_qc: bool = True,
-                 threads: int = None, read_method: str = 'adbc'):
+                 threads: int = None, read_method: str = 'adbc',
+                 legacy_cdm: bool = False):
     start_date = datetime(year, month, 1, tzinfo=timezone.utc)
     end_date   = (
         datetime(year + 1, 1, 1, tzinfo=timezone.utc) if month == 12
@@ -1286,7 +1459,8 @@ def export_month(conn_params, year, month, output_dir,
             df_data, df_header,
             on=['g_product_id'],
             how='inner', suffixes=('', '_header')
-        ).copy()
+        )
+    del df_data, df_header                  # free ~1.7 KB per level before the CDM build
     print(f"  Merged rows : {len(df_merged):,}")
 
     # ── plausibility QC (must run BEFORE the unit transforms) ─────────────────
@@ -1300,8 +1474,12 @@ def export_month(conn_params, year, month, output_dir,
                 df_merged[col] = df_merged[col] * scale + offset
 
     # ── pivot to CDM long format ──────────────────────────────────────────────
-    with TIMER('build_cdm_dataframe'):
-        cdm = build_cdm_dataframe(df_merged, station_lookup or {})
+    if legacy_cdm:      # reference implementation: materialises 15 x the levels (slow, ~2x RAM)
+        with TIMER('build_cdm_dataframe'):
+            cdm = build_cdm_dataframe(df_merged, station_lookup or {})
+    else:
+        with TIMER('build_cdm_columns'):
+            cdm = build_cdm_long(df_merged, station_lookup or {})
     print(f"  CDM rows    : {len(cdm):,}  ({len(CDM_VARIABLES)} vars × {len(df_merged):,} levels)")
 
     # ── write NetCDF ──────────────────────────────────────────────────────────
@@ -1339,6 +1517,10 @@ def main():
                          help="How the data table is read: 'adbc' (default: Arrow/binary COPY, "
                               "needs `pip install adbc-driver-postgresql pyarrow`) or "
                               "'sqlalchemy' (pandas.read_sql, the original, ~2x slower).")
+    parser.add_argument('--legacy-cdm',   action='store_true',
+                         help='Build the CDM long format as a full DataFrame (the original, '
+                              'reference implementation: slower, about twice the RAM). '
+                              'Output files are identical.')
     parser.add_argument('--verify-read',  metavar='YYYY-MM', default=None,
                          help='Read that month with BOTH methods, compare them and exit '
                               '(no export). Run it once before using --read-method adbc.')
@@ -1383,7 +1565,7 @@ def main():
             f"h5py {h5py.__version__ if _HAVE_H5PY else 'NOT INSTALLED'}",
             f"settings: threads={args.threads} (parallel compression "
             f"{'ON' if args.threads > 1 and _HAVE_H5PY else 'OFF'}), "
-            f"read={args.read_method}, "
+            f"read={args.read_method}, cdm={'legacy' if args.legacy_cdm else 'lean'}, "
             f"deflate={DEFLATE_LEVEL}, qc={'off' if args.skip_qc else 'on'}, "
             f"max_alt={MAX_ALTITUDE_M} m",
             f"output  : {output_dir}",
@@ -1430,7 +1612,8 @@ def main():
         for y, m in months:
             export_month(conn_params, y, m, output_dir, args.data_table, args.header_table,
                          station_lookup=station_lookup, apply_qc=not args.skip_qc,
-                         threads=args.threads, read_method=args.read_method)
+                         threads=args.threads, read_method=args.read_method,
+                         legacy_cdm=args.legacy_cdm)
     except BaseException as exc:
         # keep what was measured so far, and record why the run stopped
         log(f"\n!! RUN INTERRUPTED after {time.perf_counter() - start_time:.2f}s: "
