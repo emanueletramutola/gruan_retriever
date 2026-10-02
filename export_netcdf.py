@@ -159,6 +159,7 @@ QC_REJECTION_WARN_FRACTION = 0.5
 # TIMER collects one month; export_month prints its report and folds it into
 # RUN_TIMER, which main() prints at the end (whole run).
 
+SCRIPT_REVISION = '2026-10-02a'   # shown in the log header: tells which code produced a log
 LOG_PATH = None     # set by init_log(); None = no log file
 
 
@@ -199,6 +200,10 @@ class StageTimer:
     def reset(self):
         self.t = {}            # stage -> [seconds, calls]   (insertion = pipeline order)
         self.var_times = {}    # NetCDF variable -> seconds  (writer detail)
+        self.cpu = {}          # stage -> summed thread CPU-seconds (parallel sections)
+
+    def add_cpu(self, name, cpu_seconds):
+        self.cpu[name] = self.cpu.get(name, 0.0) + cpu_seconds
 
     def add(self, name, seconds):
         e = self.t.setdefault(name, [0.0, 0])
@@ -221,6 +226,8 @@ class StageTimer:
             e[1] += calls
         for k, sec in other.var_times.items():
             self.var_times[k] = self.var_times.get(k, 0.0) + sec
+        for k, sec in other.cpu.items():
+            self.cpu[k] = self.cpu.get(k, 0.0) + sec
 
     def report(self, title, note=''):
         """Print the timing table to the console and append it to the log file."""
@@ -257,6 +264,11 @@ class StageTimer:
             worst = sorted(self.var_times.items(), key=lambda kv: -kv[1])[:5]
             out.append("  slowest NetCDF variables: " +
                        ", ".join(f"{k} {v:.2f}s" for k, v in worst))
+        for stage, cpu in self.cpu.items():          # how parallel were the threaded sections?
+            wall = self.t.get(stage, [0.0])[0]
+            if wall > 0:
+                out.append(f"  threads: {stage.split('/')[-1]} used {cpu:,.1f} CPU-s in "
+                           f"{wall:,.1f}s wall = {cpu / wall:.1f} busy threads on average")
         emit('\n'.join(out))
 
 
@@ -515,7 +527,9 @@ class _NcWriter:
         table_s1 = np.array(enc, dtype=f'S{maxlen}').view('S1').reshape(len(enc), maxlen)
         chunk = (min(_chunk_rows(maxlen), max(self.n, 1)), maxlen)
         return self._add(name, 'S1', (self.dim, sdim), chunk, False,
-                         lambda i, j: table_s1[codes[i:j]], **attrs)
+                         # np.take (not table_s1[codes[i:j]]): it releases the GIL, so the
+                         # worker threads build char blocks in parallel instead of in turn
+                         lambda i, j: np.take(table_s1, codes[i:j], axis=0), **attrs)
 
     # parallel phase --------------------------------------------------------
     def _fill_parallel(self):
@@ -525,7 +539,16 @@ class _NcWriter:
 
         level, n = DEFLATE_LEVEL, self.n
 
+        cpu_used = []
+
         def compress_chunk(spec, i):
+            t_cpu = time.thread_time()
+            try:
+                return _compress_chunk(spec, i)
+            finally:
+                cpu_used.append(time.thread_time() - t_cpu)
+
+        def _compress_chunk(spec, i):
             cr = spec.chunk[0]
             j = min(i + cr, n)
             blk = np.ascontiguousarray(spec.get_block(i, j))
@@ -560,6 +583,7 @@ class _NcWriter:
                 while window:
                     flush_one()
                 TIMER.var_times[spec.name] = time.perf_counter() - t_var
+        TIMER.add_cpu('write_netcdf/parallel_compress_and_write', sum(cpu_used))
         self._pending = []
 
 # ── plausibility QC ───────────────────────────────────────────────────────────
@@ -1093,8 +1117,12 @@ def read_data_adbc(conn_params, year, month, data_table):
             from concurrent.futures import ThreadPoolExecutor
             n_rows, step = len(df), 1 << 18          # tasks = (column, row range): balanced over threads
 
+            cpu_used = []
+
             def _convert(src, dst, a, b):
+                t0 = time.thread_time()
                 dst[a:b] = float32_as_pg_text_float64(src[a:b])
+                cpu_used.append(time.thread_time() - t0)
 
             converted, futures = {}, []
             with ThreadPoolExecutor(max_workers=max(DEFAULT_THREADS, 1)) as pool:
@@ -1111,6 +1139,7 @@ def read_data_adbc(conn_params, year, month, data_table):
                     f.result()                       # re-raise any worker error
             for c, values in converted.items():
                 df[c] = values
+            TIMER.add_cpu('db_read_data/float32_to_double', sum(cpu_used))
     return df
 
 
@@ -1345,6 +1374,7 @@ def main():
     if not args.no_log:
         import pandas, numpy
         log_path = init_log(args.log_dir or output_dir, [
+            f"script  : export_netcdf.py revision {SCRIPT_REVISION}",
             f"command : {' '.join(sys.argv)}",
             f"host    : {platform.node()} ({platform.system()} {platform.release()}), "
             f"{os.cpu_count()} logical CPUs ({_available_cpus()} usable by this process)",
