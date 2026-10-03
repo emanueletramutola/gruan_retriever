@@ -166,7 +166,8 @@ QC_REJECTION_WARN_FRACTION = 0.5
 # TIMER collects one month; export_month prints its report and folds it into
 # RUN_TIMER, which main() prints at the end (whole run).
 
-SCRIPT_REVISION = '2026-10-03c'   # shown in the log header: tells which code produced a log
+SCRIPT_REVISION = '2026-10-03d'   # shown in the log header: tells which code produced a log
+PG_SESSION_SETTINGS = []   # [(name, value)] applied with SET to every connection (--pg-set)
 LOG_PATH = None     # set by init_log(); None = no log file
 
 
@@ -296,6 +297,8 @@ def _set_session_utc(dbapi_conn, *_unused):
     cur = dbapi_conn.cursor()
     try:
         cur.execute("SET TIME ZONE 'UTC'")
+        for name, value in PG_SESSION_SETTINGS:
+            cur.execute(f"SET {name} TO '{value}'")
     finally:
         cur.close()
     dbapi_conn.commit()
@@ -1190,8 +1193,10 @@ def _adbc_uri(conn_params) -> str:
 # the last bit. To make both readers return the SAME float64, the shortest
 # round-tripping decimal is recomputed here, vectorised (bisection over 1..9
 # significant digits). Validated against PostgreSQL's own text output on
-# ~5M values (0 mismatches); ~9M values/s per thread (blocks of 32k elements
-# keep the temporaries in cache: 1.7x faster than 256k-element blocks).
+# ~5M values (0 mismatches). Blocks of 256k elements, one task per COLUMN: on the 24-core
+# production machine this was 1.6x faster (2.0 s vs 3.3 s for 2004-07) than 32k-element
+# blocks split in row ranges, which looked better on a single thread but made the
+# threads wait for each other (many small numpy calls).
 
 # 10**k is exactly representable in float64 for k <= 22
 _POW10 = 10.0 ** np.arange(0, 23, dtype=np.float64)
@@ -1206,7 +1211,7 @@ def _round_sig(x, e, d):
     return np.where(pos, n / p, n * p)
 
 
-def float32_as_pg_text_float64(x32: np.ndarray, block: int = 1 << 15) -> np.ndarray:
+def float32_as_pg_text_float64(x32: np.ndarray, block: int = 1 << 18) -> np.ndarray:
     """float32 -> float64, giving for every value the float64 that psycopg2 would
     obtain from PostgreSQL's text output of the same REAL (PostgreSQL >= 12 prints
     the SHORTEST decimal that round-trips to the float4, and float() parses it)."""
@@ -1281,6 +1286,8 @@ def read_data_adbc(conn_params, year, month, data_table, sql_order: bool = False
     with adbc_dbapi.connect(_adbc_uri(conn_params)) as conn, conn.cursor() as cur:
         with TIMER('db_read_data/arrow_fetch'):
             cur.execute("SET TIME ZONE 'UTC'")
+            for name, value in PG_SESSION_SETTINGS:
+                cur.execute(f"SET {name} TO '{value}'")
             cur.execute(query)
             table = cur.fetch_arrow_table()
     if table.num_rows == 0:
@@ -1323,28 +1330,18 @@ def read_data_adbc(conn_params, year, month, data_table, sql_order: bool = False
     if f32_cols:
         with TIMER('db_read_data/float32_to_double'):
             from concurrent.futures import ThreadPoolExecutor
-            n_rows, step = len(df), 1 << 18          # tasks = (column, row range): balanced over threads
-
             cpu_used = []
 
-            def _convert(src, dst, a, b):
+            def _convert(c):                          # one task per column
                 t0 = time.thread_time()
-                dst[a:b] = float32_as_pg_text_float64(src[a:b])
+                arr = df[c].to_numpy()
+                out = (arr.astype(np.float64) if np.isnan(arr).all()      # entirely NULL
+                       else float32_as_pg_text_float64(arr))
                 cpu_used.append(time.thread_time() - t0)
+                return out
 
-            converted, futures = {}, []
             with ThreadPoolExecutor(max_workers=max(DEFAULT_THREADS, 1)) as pool:
-                for c in f32_cols:
-                    src = df[c].to_numpy()
-                    dst = np.empty(src.shape, dtype=np.float64)
-                    converted[c] = dst
-                    if np.isnan(src).all():          # entirely NULL: nothing to recompute
-                        dst[:] = src
-                        continue
-                    futures += [pool.submit(_convert, src, dst, a, min(a + step, n_rows))
-                                for a in range(0, n_rows, step)]
-                for f in futures:
-                    f.result()                       # re-raise any worker error
+                converted = dict(zip(f32_cols, pool.map(_convert, f32_cols)))
             for c, values in converted.items():
                 df[c] = values
             TIMER.add_cpu('db_read_data/float32_to_double', sum(cpu_used))
@@ -1620,6 +1617,19 @@ BASE_PEAK_GB       = 0.4            # interpreter + libraries
 DEFAULT_LEVELS_EST = 7_000_000      # when PostgreSQL has no row estimate for a partition
 
 
+def _parse_pg_settings(items) -> list:
+    """['name=value', ...] -> [(name, value)]; only plain identifiers/numbers are accepted
+    (the text goes into a SET statement)."""
+    import re
+    out = []
+    for item in items or []:
+        m = re.fullmatch(r'([a-z_][a-z0-9_.]*)=([A-Za-z0-9_.\-]+)', item)
+        if not m:
+            sys.exit(f"--pg-set expects NAME=VALUE with letters/digits/_.- only, got: {item!r}")
+        out.append((m.group(1), m.group(2)))
+    return out
+
+
 def _estimate_peak_gb(levels: int) -> float:
     return BASE_PEAK_GB + levels * KB_PER_LEVEL_PEAK * 1e3 / 1e9
 
@@ -1650,9 +1660,9 @@ def _month_levels(conn_params, data_table: str, months) -> dict:
     return sizes
 
 
-def _worker_init(log_path, threads):
-    global LOG_PATH, DEFAULT_THREADS
-    LOG_PATH, DEFAULT_THREADS = log_path, threads
+def _worker_init(log_path, threads, pg_settings):
+    global LOG_PATH, DEFAULT_THREADS, PG_SESSION_SETTINGS
+    LOG_PATH, DEFAULT_THREADS, PG_SESSION_SETTINGS = log_path, threads, pg_settings
 
 
 def _worker_run(conn_params, year, month, output_dir, data_table, header_table,
@@ -1697,7 +1707,7 @@ def run_months_parallel(conn_params, months, output_dir, args, station_lookup, j
     t0 = time.perf_counter()
     ctx = multiprocessing.get_context('spawn')
     with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx, initializer=_worker_init,
-                             initargs=(LOG_PATH, per_worker_threads)) as pool:
+                             initargs=(LOG_PATH, per_worker_threads, PG_SESSION_SETTINGS)) as pool:
         while (queue and failure is None) or running:
             while queue and failure is None and len(running) < jobs:
                 ym = queue[0]
@@ -1768,6 +1778,10 @@ def main():
                               '(~1.45 KB per level) fit in --max-ram-gb. Default: 1.')
     parser.add_argument('--max-ram-gb',   type=float, default=None,
                          help='RAM budget for --jobs (default: 80%% of the memory available now).')
+    parser.add_argument('--pg-set',       action='append', metavar='NAME=VALUE',
+                         help='PostgreSQL setting applied with SET to every connection of this run '
+                              '(repeatable), e.g. --pg-set max_parallel_workers_per_gather=2 '
+                              '--pg-set jit=off. No change to the server needed.')
     parser.add_argument('--legacy-cdm',   action='store_true',
                          help='Build the CDM long format as a full DataFrame (the original, '
                               'reference implementation: slower, about twice the RAM). '
@@ -1784,6 +1798,7 @@ def main():
     parser.add_argument('--skip-qc', action='store_true',
                         help='Do not replace implausible values with NULL.')
     args = parser.parse_args()
+    PG_SESSION_SETTINGS[:] = _parse_pg_settings(args.pg_set)      # in place: read by every connection helper
 
     if args.month and not args.year:
         sys.exit('--month requires --year to be set as well.')
@@ -1817,6 +1832,7 @@ def main():
             f"settings: threads={args.threads} (parallel compression "
             f"{'ON' if args.threads > 1 and _HAVE_H5PY else 'OFF'}), "
             f"read={args.read_method}, cdm={'legacy' if args.legacy_cdm else 'lean'}, jobs={args.jobs}, "
+            f"pg_set={dict(PG_SESSION_SETTINGS) or '-'}, "
             f"deflate={DEFLATE_LEVEL}, qc={'off' if args.skip_qc else 'on'}, "
             f"max_alt={MAX_ALTITUDE_M} m",
             f"output  : {output_dir}",
