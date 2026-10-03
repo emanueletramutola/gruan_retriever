@@ -164,7 +164,7 @@ QC_REJECTION_WARN_FRACTION = 0.5
 # TIMER collects one month; export_month prints its report and folds it into
 # RUN_TIMER, which main() prints at the end (whole run).
 
-SCRIPT_REVISION = '2026-10-02c'   # shown in the log header: tells which code produced a log
+SCRIPT_REVISION = '2026-10-03a'   # shown in the log header: tells which code produced a log
 LOG_PATH = None     # set by init_log(); None = no log file
 
 
@@ -1522,11 +1522,11 @@ def export_month(conn_params, year, month, output_dir,
 # ── several months in parallel ────────────────────────────────────────────────
 # Months are independent, so --jobs N exports N of them at once in separate
 # processes (spawn: no state is inherited, HDF5/Arrow stay safe). RAM is the
-# limit, not CPU: a month needs ~1.3 KB per level at peak (measured: 2023-10,
-# 6.7M levels, 8.7 GB). The scheduler starts the biggest months first and only
+# limit, not CPU: a month needs ~1.2-1.3 KB per level at peak (measured: 2023-10,
+# 6.7M levels, 8.7 GB; 4 parallel jobs: 7.4-8.1 GB each). The scheduler starts the biggest months first and only
 # admits another one while the sum of the estimated peaks fits the RAM budget.
 
-KB_PER_LEVEL_PEAK  = 1.7            # measured 1.3 KB/level (+ margin for QC and real data)
+KB_PER_LEVEL_PEAK  = 1.45           # measured 1.21-1.29 KB/level on real months (QC on), + ~12% margin
 BASE_PEAK_GB       = 0.4            # interpreter + libraries
 DEFAULT_LEVELS_EST = 7_000_000      # when PostgreSQL has no row estimate for a partition
 
@@ -1675,7 +1675,7 @@ def main():
     parser.add_argument('--jobs',         type=int, default=1,
                          help='Months exported in parallel (separate processes). RAM is the '
                               'limit: another month is started only while the estimated peaks '
-                              '(~1.7 KB per level) fit in --max-ram-gb. Default: 1.')
+                              '(~1.45 KB per level) fit in --max-ram-gb. Default: 1.')
     parser.add_argument('--max-ram-gb',   type=float, default=None,
                          help='RAM budget for --jobs (default: 80%% of the memory available now).')
     parser.add_argument('--legacy-cdm',   action='store_true',
