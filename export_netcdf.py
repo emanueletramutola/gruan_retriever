@@ -11,6 +11,7 @@ import pandas as pd
 import netCDF4 as nc
 try:                                    # optional: faster DB reads (--read-method adbc)
     import pyarrow as pa
+    import pyarrow.compute as pc
     import adbc_driver_postgresql.dbapi as adbc_dbapi
     _HAVE_ADBC = True
 except ImportError:
@@ -165,7 +166,7 @@ QC_REJECTION_WARN_FRACTION = 0.5
 # TIMER collects one month; export_month prints its report and folds it into
 # RUN_TIMER, which main() prints at the end (whole run).
 
-SCRIPT_REVISION = '2026-10-03b'   # shown in the log header: tells which code produced a log
+SCRIPT_REVISION = '2026-10-03c'   # shown in the log header: tells which code produced a log
 LOG_PATH = None     # set by init_log(); None = no log file
 
 
@@ -1129,7 +1130,8 @@ COLUMNS_DATA_TABLE = [
 # --read-method adbc (pip install adbc-driver-postgresql pyarrow) and check it
 # on one month first with --verify-read YYYY-MM.
 
-def _data_query(year: int, month: int, data_table: str, max_alt_sql: str) -> str:
+def _data_query(year: int, month: int, data_table: str, max_alt_sql: str,
+                ordered: bool = True) -> str:
     # The altitude filter is pushed down to PostgreSQL (server-side), so only
     # the levels we actually need are transferred and held in memory.
     # NOTE: "alt <= X" alone would already drop NULLs (comparison yields NULL)
@@ -1140,8 +1142,8 @@ def _data_query(year: int, month: int, data_table: str, max_alt_sql: str) -> str
         f"FROM {data_table}_{year:04d}{month:02d} "
         f"WHERE alt IS NOT NULL "
         f"  AND alt <> 'NaN'::float8 "
-        f"  AND alt <= {max_alt_sql} "
-        f"ORDER BY report_timestamp, observation_id"
+        f"  AND alt <= {max_alt_sql}"
+        + (" ORDER BY report_timestamp, observation_id" if ordered else "")
     )
 
 
@@ -1260,14 +1262,21 @@ def _shortest_exact(v):
     return x
 
 
-def read_data_adbc(conn_params, year, month, data_table):
+def read_data_adbc(conn_params, year, month, data_table, sql_order: bool = False):
     """Arrow-native reader (binary COPY, no per-value Python objects).
-    Returns a DataFrame with the same columns/dtypes as read_data_sqlalchemy,
-    or None if no rows."""
+    Returns a DataFrame with the same columns/dtypes/ROW ORDER as
+    read_data_sqlalchemy, or None if no rows.
+
+    By default the rows are NOT sorted by PostgreSQL: with ORDER BY the server has
+    to scan, sort and merge the whole month before it can send the first byte
+    (and with several jobs those phases compete for the server). Without it the
+    scan streams straight into the transfer, and the sort is done here (Arrow,
+    on the two key columns): same order, because (report_timestamp,
+    observation_id) is unique. sql_order=True puts ORDER BY back in the query."""
     if not _HAVE_ADBC:
         raise RuntimeError("--read-method adbc needs: "
                            "pip install adbc-driver-postgresql pyarrow")
-    query = _data_query(year, month, data_table, repr(float(MAX_ALTITUDE_M)))
+    query = _data_query(year, month, data_table, repr(float(MAX_ALTITUDE_M)), ordered=sql_order)
     print("data_query: ", query)
     with adbc_dbapi.connect(_adbc_uri(conn_params)) as conn, conn.cursor() as cur:
         with TIMER('db_read_data/arrow_fetch'):
@@ -1276,6 +1285,12 @@ def read_data_adbc(conn_params, year, month, data_table):
             table = cur.fetch_arrow_table()
     if table.num_rows == 0:
         return None
+    if not sql_order:
+        with TIMER('db_read_data/client_sort'):
+            order = pc.sort_indices(table, sort_keys=[('report_timestamp', 'ascending'),
+                                                      ('observation_id', 'ascending')])
+            table = table.take(order)
+            del order
     # NUMERIC -> float64, as psycopg2 + pandas (coerce_float) would give.
     # ADBC returns NUMERIC as an *opaque* Arrow type (string storage); passing
     # that to to_pandas() fails, so convert it here. Any other opaque type is
@@ -1336,7 +1351,11 @@ def read_data_adbc(conn_params, year, month, data_table):
     return df
 
 
-READ_METHODS = {'sqlalchemy': read_data_sqlalchemy, 'adbc': read_data_adbc}
+READ_METHODS = {
+    'sqlalchemy':     read_data_sqlalchemy,
+    'adbc':           read_data_adbc,                                   # sorts on the client
+    'adbc-sql-order': lambda *a: read_data_adbc(*a, sql_order=True),    # ORDER BY on the server
+}
 
 
 def _frame_differences(a: pd.DataFrame, b: pd.DataFrame, notes: list = None):
@@ -1741,6 +1760,7 @@ def main():
     parser.add_argument('--read-method',  choices=sorted(READ_METHODS), default='adbc',
                          help="How the data table is read: 'adbc' (default: Arrow/binary COPY, "
                               "needs `pip install adbc-driver-postgresql pyarrow`) or "
+                              "'adbc-sql-order' (same, but PostgreSQL does the sorting) or "
                               "'sqlalchemy' (pandas.read_sql, the original, ~2x slower).")
     parser.add_argument('--jobs',         type=int, default=1,
                          help='Months exported in parallel (separate processes). RAM is the '
@@ -1803,7 +1823,7 @@ def main():
         ])
         print(f"Timing log: {log_path}")
 
-    if args.read_method == 'adbc' and not _HAVE_ADBC and not args.verify_read:
+    if args.read_method.startswith('adbc') and not _HAVE_ADBC and not args.verify_read:
         sys.exit("--read-method adbc (the default) needs: "
                  "pip install adbc-driver-postgresql pyarrow\n"
                  "or run with --read-method sqlalchemy")
