@@ -26,7 +26,12 @@ from sqlalchemy import create_engine, event
 from dotenv import load_dotenv
 from typing import Optional
 import time
+import io
+import contextlib
 import platform
+import resource
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from urllib.parse import quote
 import traceback
 from contextlib import contextmanager
@@ -159,7 +164,7 @@ QC_REJECTION_WARN_FRACTION = 0.5
 # TIMER collects one month; export_month prints its report and folds it into
 # RUN_TIMER, which main() prints at the end (whole run).
 
-SCRIPT_REVISION = '2026-10-02b'   # shown in the log header: tells which code produced a log
+SCRIPT_REVISION = '2026-10-02c'   # shown in the log header: tells which code produced a log
 LOG_PATH = None     # set by init_log(); None = no log file
 
 
@@ -304,8 +309,9 @@ def get_psycopg2_connection(conn_params):
     return conn
 
 def get_sqlalchemy_engine(conn_params):
+    # explicit driver: SQLAlchemy 2.1+ would pick psycopg (v3) for a bare postgresql:// URL
     url = (
-        f"postgresql://{conn_params['user']}:{conn_params['password']}"
+        f"postgresql+psycopg2://{conn_params['user']}:{conn_params['password']}"
         f"@{conn_params['host']}:{conn_params['port']}/{conn_params['dbname']}"
     )
     engine = create_engine(url)
@@ -1003,7 +1009,7 @@ ALL_CDM_LABELS = {
 }
 
 
-def write_cdm_netcdf(cdm, output_file: Path, threads: int = None):
+def _write_cdm_netcdf_to(cdm, output_file: Path, threads: int = None):
     """Write the CDM long format (a DataFrame from build_cdm_dataframe or the
     virtual CdmLong from build_cdm_long) to a GRUAN-convention NetCDF4 file.
 
@@ -1079,10 +1085,24 @@ def write_cdm_netcdf(cdm, output_file: Path, threads: int = None):
             w.uint8(f'uncertainty_type{idx}',    cdm[f'uncertainty_type{idx}'])
             w.uint16(f'uncertainty_units{idx}',  cdm[f'uncertainty_units{idx}'])
 
-    size_mb = output_file.stat().st_size / 1e6
-    mode = f"{w.threads} threads" if w.parallel else "sequential"
-    print(f"  Written: {output_file}  ({size_mb:.1f} MB, {mode}, "
-          f"{time.perf_counter() - t0:.1f}s)")
+    return (f"{w.threads} threads" if w.parallel else "sequential"), time.perf_counter() - t0
+
+
+def write_cdm_netcdf(cdm, output_file: Path, threads: int = None):
+    """Write the CDM long format to `output_file`, atomically: the data go to
+    '<name>.partial' and the file is renamed only when complete. A killed or
+    failed run therefore never leaves a truncated file under the final name
+    (which a later run would skip as 'already exists')."""
+    final_file = Path(output_file)
+    partial = final_file.with_name(final_file.name + '.partial')
+    try:
+        mode, seconds = _write_cdm_netcdf_to(cdm, partial, threads=threads)
+        os.replace(partial, final_file)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    print(f"  Written: {final_file}  ({final_file.stat().st_size / 1e6:.1f} MB, "
+          f"{mode}, {seconds:.1f}s)")
 
 
 # ── Main export logic ─────────────────────────────────────────────────────────
@@ -1387,6 +1407,11 @@ def verify_read_methods(conn_params, year, month, data_table='data') -> bool:
     return not diffs
 
 
+def _month_output_file(output_dir, year: int, month: int) -> Path:
+    return Path(output_dir) / (
+        f"insitu-observations-gruan-reference-network_GRUAN_{year:04d}_{month:02d}.nc")
+
+
 def export_month(conn_params, year, month, output_dir,
                  data_table='data', header_table='header',
                  station_lookup: dict = None, apply_qc: bool = True,
@@ -1397,7 +1422,7 @@ def export_month(conn_params, year, month, output_dir,
         datetime(year + 1, 1, 1, tzinfo=timezone.utc) if month == 12
         else datetime(year, month + 1, 1, tzinfo=timezone.utc)
     )
-    output_file = output_dir / f"insitu-observations-gruan-reference-network_GRUAN_{year:04d}_{month:02d}.nc"
+    output_file = _month_output_file(output_dir, year, month)
     if output_file.exists():
         print(f"  {output_file} already exists, skipping.")
         log(f"\n{year:04d}-{month:02d}: output already exists, skipped ({output_file.name})")
@@ -1494,6 +1519,136 @@ def export_month(conn_params, year, month, output_dir,
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+# ── several months in parallel ────────────────────────────────────────────────
+# Months are independent, so --jobs N exports N of them at once in separate
+# processes (spawn: no state is inherited, HDF5/Arrow stay safe). RAM is the
+# limit, not CPU: a month needs ~1.3 KB per level at peak (measured: 2023-10,
+# 6.7M levels, 8.7 GB). The scheduler starts the biggest months first and only
+# admits another one while the sum of the estimated peaks fits the RAM budget.
+
+KB_PER_LEVEL_PEAK  = 1.7            # measured 1.3 KB/level (+ margin for QC and real data)
+BASE_PEAK_GB       = 0.4            # interpreter + libraries
+DEFAULT_LEVELS_EST = 7_000_000      # when PostgreSQL has no row estimate for a partition
+
+
+def _estimate_peak_gb(levels: int) -> float:
+    return BASE_PEAK_GB + levels * KB_PER_LEVEL_PEAK * 1e3 / 1e9
+
+
+def _mem_available_gb() -> float:
+    with open('/proc/meminfo') as fh:
+        for line in fh:
+            if line.startswith('MemAvailable:'):
+                return int(line.split()[1]) / 1048576
+    return 8.0                                        # unknown platform: stay conservative
+
+
+def _month_levels(conn_params, data_table: str, months) -> dict:
+    """Rows of every monthly partition, from pg_class.reltuples (an estimate that
+    costs nothing: no table scan)."""
+    sizes = {}
+    conn = get_psycopg2_connection(conn_params)
+    try:
+        with conn.cursor() as cur:
+            for y, m in months:
+                cur.execute("SELECT reltuples::bigint AS n FROM pg_class WHERE relname = %s",
+                            (f"{data_table}_{y:04d}{m:02d}",))
+                row = cur.fetchone()
+                n = row['n'] if row else None
+                sizes[(y, m)] = int(n) if n and n > 0 else DEFAULT_LEVELS_EST
+    finally:
+        conn.close()
+    return sizes
+
+
+def _worker_init(log_path, threads):
+    global LOG_PATH, DEFAULT_THREADS
+    LOG_PATH, DEFAULT_THREADS = log_path, threads
+
+
+def _worker_run(conn_params, year, month, output_dir, data_table, header_table,
+                station_lookup, apply_qc, threads, read_method, legacy_cdm):
+    """Runs in a worker process: exports ONE month, returns its timings."""
+    TIMER.reset()
+    RUN_TIMER.reset()
+    t_start = time.time()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):  # the per-month report goes to the log
+            export_month(conn_params, year, month, output_dir, data_table, header_table,
+                         station_lookup=station_lookup, apply_qc=apply_qc, threads=threads,
+                         read_method=read_method, legacy_cdm=legacy_cdm)
+    except Exception as exc:
+        # Return the error as plain DATA, never raise it across the process boundary:
+        # some exceptions (e.g. ADBC's) pickle fine but cannot be unpickled, which makes
+        # concurrent.futures declare the WHOLE pool broken and kill the healthy months too.
+        return dict(month=(year, month), error=f"{type(exc).__name__}: {exc}",
+                    traceback=traceback.format_exc())
+    return dict(month=(year, month), t_start=t_start, t_end=time.time(),
+                rss_gb=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1048576,
+                stages=RUN_TIMER.t, cpu=RUN_TIMER.cpu, var_times=RUN_TIMER.var_times)
+
+
+def run_months_parallel(conn_params, months, output_dir, args, station_lookup, jobs, budget_gb):
+    """Export `months` with up to `jobs` processes, RAM permitting."""
+    todo = [(y, m) for y, m in months
+            if not _month_output_file(output_dir, y, m).exists()]
+    for y, m in months:
+        if (y, m) not in todo:
+            emit(f"  {y:04d}-{m:02d}: output already exists, skipped")
+    if not todo:
+        return
+    sizes = _month_levels(conn_params, args.data_table, todo)
+    queue = sorted(todo, key=lambda ym: -sizes[ym])             # biggest first
+    per_worker_threads = max(1, args.threads // jobs)
+    emit(f"\nParallel export: {len(todo)} month(s), jobs={jobs}, {per_worker_threads} thread(s) per job, "
+         f"RAM budget {budget_gb:.0f} GB (available now: {_mem_available_gb():.0f} GB), "
+         f"largest month ~{_estimate_peak_gb(sizes[queue[0]]):.1f} GB estimated")
+
+    running, reserved, done, failure = {}, 0.0, 0, None
+    t0 = time.perf_counter()
+    ctx = multiprocessing.get_context('spawn')
+    with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx, initializer=_worker_init,
+                             initargs=(LOG_PATH, per_worker_threads)) as pool:
+        while (queue and failure is None) or running:
+            while queue and failure is None and len(running) < jobs:
+                ym = queue[0]
+                est = _estimate_peak_gb(sizes[ym])
+                if running and reserved + est > budget_gb:     # wait until RAM is free again
+                    break
+                queue.pop(0)
+                fut = pool.submit(_worker_run, conn_params, ym[0], ym[1], output_dir,
+                                  args.data_table, args.header_table, station_lookup,
+                                  not args.skip_qc, per_worker_threads, args.read_method,
+                                  args.legacy_cdm)
+                running[fut] = (ym, est)
+                reserved += est
+            finished, _ = wait(list(running), return_when=FIRST_COMPLETED)
+            for fut in finished:
+                (y, m), est = running.pop(fut)
+                reserved -= est
+                res = None
+                try:
+                    res = fut.result()
+                    if 'error' in res:                       # the worker reported a failed month
+                        raise RuntimeError(f"{y:04d}-{m:02d}: {res['error']}")
+                except BaseException as exc:                  # let running months finish, then stop
+                    failure = failure or exc
+                    emit(f"  !! {y:04d}-{m:02d} FAILED: {exc}")
+                    if res and 'traceback' in res:
+                        log(res['traceback'])
+                    continue
+                done += 1
+                snap = StageTimer()
+                snap.t, snap.cpu, snap.var_times = res['stages'], res['cpu'], res['var_times']
+                RUN_TIMER.merge(snap)
+                emit(f"  [{done}/{len(todo)}] {y:04d}-{m:02d} done in {res['t_end'] - res['t_start']:.0f}s "
+                     f"(worker peak RSS {res['rss_gb']:.1f} GB) | running {len(running)}, "
+                     f"~{reserved:.0f} GB reserved, {len(queue)} queued, "
+                     f"elapsed {(time.perf_counter() - t0) / 60:.1f} min")
+    if failure is not None:
+        raise failure
+
+
 def main():
     start_time = time.perf_counter()
 
@@ -1517,6 +1672,12 @@ def main():
                          help="How the data table is read: 'adbc' (default: Arrow/binary COPY, "
                               "needs `pip install adbc-driver-postgresql pyarrow`) or "
                               "'sqlalchemy' (pandas.read_sql, the original, ~2x slower).")
+    parser.add_argument('--jobs',         type=int, default=1,
+                         help='Months exported in parallel (separate processes). RAM is the '
+                              'limit: another month is started only while the estimated peaks '
+                              '(~1.7 KB per level) fit in --max-ram-gb. Default: 1.')
+    parser.add_argument('--max-ram-gb',   type=float, default=None,
+                         help='RAM budget for --jobs (default: 80%% of the memory available now).')
     parser.add_argument('--legacy-cdm',   action='store_true',
                          help='Build the CDM long format as a full DataFrame (the original, '
                               'reference implementation: slower, about twice the RAM). '
@@ -1565,7 +1726,7 @@ def main():
             f"h5py {h5py.__version__ if _HAVE_H5PY else 'NOT INSTALLED'}",
             f"settings: threads={args.threads} (parallel compression "
             f"{'ON' if args.threads > 1 and _HAVE_H5PY else 'OFF'}), "
-            f"read={args.read_method}, cdm={'legacy' if args.legacy_cdm else 'lean'}, "
+            f"read={args.read_method}, cdm={'legacy' if args.legacy_cdm else 'lean'}, jobs={args.jobs}, "
             f"deflate={DEFLATE_LEVEL}, qc={'off' if args.skip_qc else 'on'}, "
             f"max_alt={MAX_ALTITUDE_M} m",
             f"output  : {output_dir}",
@@ -1609,11 +1770,16 @@ def main():
     station_lookup = load_station_record_numbers(conn_params)
     RUN_TIMER.add('startup: station_lookup', time.perf_counter() - _t)
     try:
-        for y, m in months:
-            export_month(conn_params, y, m, output_dir, args.data_table, args.header_table,
-                         station_lookup=station_lookup, apply_qc=not args.skip_qc,
-                         threads=args.threads, read_method=args.read_method,
-                         legacy_cdm=args.legacy_cdm)
+        if args.jobs > 1:
+            budget = args.max_ram_gb or 0.8 * _mem_available_gb()
+            run_months_parallel(conn_params, months, output_dir, args, station_lookup,
+                                args.jobs, budget)
+        else:
+            for y, m in months:
+                export_month(conn_params, y, m, output_dir, args.data_table, args.header_table,
+                             station_lookup=station_lookup, apply_qc=not args.skip_qc,
+                             threads=args.threads, read_method=args.read_method,
+                             legacy_cdm=args.legacy_cdm)
     except BaseException as exc:
         # keep what was measured so far, and record why the run stopped
         log(f"\n!! RUN INTERRUPTED after {time.perf_counter() - start_time:.2f}s: "
@@ -1624,7 +1790,10 @@ def main():
         raise
 
     print('\nDone.')
-    RUN_TIMER.report(f"WHOLE RUN ({len(months)} month(s))")
+    RUN_TIMER.report(
+        f"WHOLE RUN ({len(months)} month(s))",
+        note=(f"{args.jobs} parallel jobs: the stage times below are summed over all jobs "
+              f"(wall clock: {time.perf_counter() - start_time:,.0f}s)") if args.jobs > 1 else '')
 
     end_time = time.perf_counter()
     elapsed_time = end_time - start_time
