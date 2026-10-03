@@ -29,6 +29,7 @@ import time
 import io
 import contextlib
 import platform
+import threading
 import resource
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
@@ -164,7 +165,7 @@ QC_REJECTION_WARN_FRACTION = 0.5
 # TIMER collects one month; export_month prints its report and folds it into
 # RUN_TIMER, which main() prints at the end (whole run).
 
-SCRIPT_REVISION = '2026-10-03a'   # shown in the log header: tells which code produced a log
+SCRIPT_REVISION = '2026-10-03b'   # shown in the log header: tells which code produced a log
 LOG_PATH = None     # set by init_log(); None = no log file
 
 
@@ -1519,6 +1520,75 @@ def export_month(conn_params, year, month, output_dir,
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+# ── network monitor ───────────────────────────────────────────────────────────
+# Reading is ~70% of the run and (with several jobs) can be limited by the link
+# between this machine and the database, not by either machine. This samples the
+# system-wide receive counters (/proc/net/dev, Linux) every 2 s and, at the end,
+# writes how much came in, the average/peak rate and the link speed to the log.
+
+class _NetSampler(threading.Thread):
+    def __init__(self, interval: float = 2.0, include_loopback: bool = False):
+        super().__init__(daemon=True)
+        self.interval, self.include_loopback = interval, include_loopback
+        self._stop_evt = threading.Event()
+        self.samples = []                       # (monotonic time, {interface: rx bytes})
+
+    def _read(self) -> dict:
+        out = {}
+        try:
+            with open('/proc/net/dev') as fh:
+                for line in fh.readlines()[2:]:
+                    name, data = line.split(':', 1)
+                    name = name.strip()
+                    if name == 'lo' and not self.include_loopback:
+                        continue
+                    out[name] = int(data.split()[0])
+        except (OSError, ValueError):
+            return {}
+        return out
+
+    def run(self):
+        while not self._stop_evt.is_set():
+            self.samples.append((time.perf_counter(), self._read()))
+            self._stop_evt.wait(self.interval)
+
+    def stop(self):
+        self._stop_evt.set()
+        self.join(timeout=5)
+        self.samples.append((time.perf_counter(), self._read()))
+
+    def summary(self):
+        """One text line (+ a hint when the link looks saturated), or None."""
+        samples = [x for x in self.samples if x[1]]
+        if len(samples) < 2:
+            return None
+        first, last = samples[0], samples[-1]
+        totals = {k: last[1].get(k, 0) - first[1].get(k, 0) for k in first[1]}
+        iface = max(totals, key=totals.get)
+        duration = last[0] - first[0]
+        if totals[iface] <= 0 or duration <= 0:
+            return None
+        rates = [(b[1][iface] - a[1][iface]) / (b[0] - a[0])
+                 for a, b in zip(samples, samples[1:]) if iface in a[1] and iface in b[1] and b[0] > a[0]]
+        peak = max(rates) / 1e6
+        link_mbps = None
+        try:
+            with open(f'/sys/class/net/{iface}/speed') as fh:
+                v = int(fh.read().strip())
+                link_mbps = v if v > 0 else None
+        except (OSError, ValueError):
+            pass
+        line = (f"network : {iface} received {totals[iface] / 1e9:.1f} GB in {duration:.0f}s = "
+                f"{totals[iface] / duration / 1e6:.0f} MB/s average, {peak:.0f} MB/s peak (2 s windows)")
+        if link_mbps:
+            usable = link_mbps / 8 * 0.94                      # ~94% of the line rate is TCP payload
+            line += f"; link {link_mbps} Mb/s (~{usable:.0f} MB/s usable)"
+            if peak >= 0.85 * usable:
+                line += ("\n          -> peak is at the link capacity: reading is probably NETWORK-BOUND "
+                         "(more jobs will not help)")
+        return line
+
+
 # ── several months in parallel ────────────────────────────────────────────────
 # Months are independent, so --jobs N exports N of them at once in separate
 # processes (spawn: no state is inherited, HDF5/Arrow stay safe). RAM is the
@@ -1769,6 +1839,8 @@ def main():
     _t = time.perf_counter()
     station_lookup = load_station_record_numbers(conn_params)
     RUN_TIMER.add('startup: station_lookup', time.perf_counter() - _t)
+    net = _NetSampler()
+    net.start()
     try:
         if args.jobs > 1:
             budget = args.max_ram_gb or 0.8 * _mem_available_gb()
@@ -1786,10 +1858,17 @@ def main():
             f"{type(exc).__name__}: {exc}")
         if not isinstance(exc, KeyboardInterrupt):
             log(traceback.format_exc())
+        net.stop()
+        if net.summary():
+            emit(net.summary())
         RUN_TIMER.report("PARTIAL RUN (interrupted)")
         raise
 
+    net.stop()
+
     print('\nDone.')
+    if net.summary():
+        emit("\n" + net.summary())
     RUN_TIMER.report(
         f"WHOLE RUN ({len(months)} month(s))",
         note=(f"{args.jobs} parallel jobs: the stage times below are summed over all jobs "
