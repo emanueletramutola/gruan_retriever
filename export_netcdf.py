@@ -166,7 +166,7 @@ QC_REJECTION_WARN_FRACTION = 0.5
 # TIMER collects one month; export_month prints its report and folds it into
 # RUN_TIMER, which main() prints at the end (whole run).
 
-SCRIPT_REVISION = '2026-10-03d'   # shown in the log header: tells which code produced a log
+SCRIPT_REVISION = '2026-10-03e'   # shown in the log header: tells which code produced a log
 PG_SESSION_SETTINGS = []   # [(name, value)] applied with SET to every connection (--pg-set)
 LOG_PATH = None     # set by init_log(); None = no log file
 
@@ -1193,10 +1193,8 @@ def _adbc_uri(conn_params) -> str:
 # the last bit. To make both readers return the SAME float64, the shortest
 # round-tripping decimal is recomputed here, vectorised (bisection over 1..9
 # significant digits). Validated against PostgreSQL's own text output on
-# ~5M values (0 mismatches). Blocks of 256k elements, one task per COLUMN: on the 24-core
-# production machine this was 1.6x faster (2.0 s vs 3.3 s for 2004-07) than 32k-element
-# blocks split in row ranges, which looked better on a single thread but made the
-# threads wait for each other (many small numpy calls).
+# ~5M values (0 mismatches). Block size and task layout depend on the thread count:
+# see _convert_float32_columns.
 
 # 10**k is exactly representable in float64 for k <= 22
 _POW10 = 10.0 ** np.arange(0, 23, dtype=np.float64)
@@ -1267,6 +1265,49 @@ def _shortest_exact(v):
     return x
 
 
+def _convert_float32_columns(df: pd.DataFrame, cols: list, threads: int) -> float:
+    """Replace the float32 columns of `df` by the float64 values psycopg2 would give
+    (see float32_as_pg_text_float64), converting in a thread pool. Returns the CPU-seconds
+    used by the workers.
+
+    The best strategy depends on how many threads this job has - measured on the 24-core
+    production machine:
+      * many threads (one job, 24): one task per COLUMN with 256k-element blocks.
+        2004-07: 2.0 s, against 3.3-3.5 s with small blocks (the threads waited for each
+        other: many small numpy calls, ~28% of the work holding the GIL).
+      * few threads (--jobs N, 4 per job): tasks of (column, 256k rows) with 32k-element
+        blocks, which stay in the CPU cache: 487 CPU-s / 156 s wall for 12 months, against
+        723 CPU-s / 202 s with 256k blocks."""
+    from concurrent.futures import ThreadPoolExecutor
+    few_threads = threads <= 8
+    block = 1 << 15 if few_threads else 1 << 18
+    n_rows, step = len(df), 1 << 18
+    cpu_used = []
+
+    def _task(src, dst, a, b):
+        t0 = time.thread_time()
+        dst[a:b] = float32_as_pg_text_float64(src[a:b], block=block)
+        cpu_used.append(time.thread_time() - t0)
+
+    converted, futures = {}, []
+    with ThreadPoolExecutor(max_workers=max(threads, 1)) as pool:
+        for c in cols:
+            src = df[c].to_numpy()
+            dst = np.empty(src.shape, dtype=np.float64)
+            converted[c] = dst
+            if np.isnan(src).all():                   # entirely NULL: nothing to recompute
+                dst[:] = src
+                continue
+            ranges = range(0, n_rows, step) if few_threads else [0]
+            futures += [pool.submit(_task, src, dst, a, min(a + step, n_rows) if few_threads else n_rows)
+                        for a in ranges]
+        for f in futures:
+            f.result()                                # re-raise any worker error
+    for c, values in converted.items():
+        df[c] = values
+    return sum(cpu_used)
+
+
 def read_data_adbc(conn_params, year, month, data_table, sql_order: bool = False):
     """Arrow-native reader (binary COPY, no per-value Python objects).
     Returns a DataFrame with the same columns/dtypes/ROW ORDER as
@@ -1329,22 +1370,8 @@ def read_data_adbc(conn_params, year, month, data_table, sql_order: bool = False
             f32_cols.append(c)
     if f32_cols:
         with TIMER('db_read_data/float32_to_double'):
-            from concurrent.futures import ThreadPoolExecutor
-            cpu_used = []
-
-            def _convert(c):                          # one task per column
-                t0 = time.thread_time()
-                arr = df[c].to_numpy()
-                out = (arr.astype(np.float64) if np.isnan(arr).all()      # entirely NULL
-                       else float32_as_pg_text_float64(arr))
-                cpu_used.append(time.thread_time() - t0)
-                return out
-
-            with ThreadPoolExecutor(max_workers=max(DEFAULT_THREADS, 1)) as pool:
-                converted = dict(zip(f32_cols, pool.map(_convert, f32_cols)))
-            for c, values in converted.items():
-                df[c] = values
-            TIMER.add_cpu('db_read_data/float32_to_double', sum(cpu_used))
+            TIMER.add_cpu('db_read_data/float32_to_double',
+                          _convert_float32_columns(df, f32_cols, DEFAULT_THREADS))
     return df
 
 
