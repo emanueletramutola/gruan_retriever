@@ -1,0 +1,3 @@
+il file export_netcdf_bck.py funziona e impiega 51 minuti per l'intero run.
+
+il comando da lanciare è: python export_netcdf.py --output-dir /storage/<nuova-cartella> --jobs 6 --max-ram-gb 62
