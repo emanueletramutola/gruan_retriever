@@ -134,6 +134,7 @@ UNIT_TRANSFORMS: dict[str, tuple[float, float]] = {
 QC_INPUT_COLUMNS = {
     'height':                   [('alt', 1.0)],
     'temperature':              [('temp', 1.0)],
+    'temperature_uc_tot':       [('u_temp', 1.0), ('temp_uc', 1.0)],
     'relative_humidity':        [('rh', 0.01)],
     'relative_humidity_uc_tot': [('u_rh', 0.01), ('rh_uc', 0.01)],
     'wind_speed':               [('wspeed', 1.0)],
@@ -150,8 +151,12 @@ QC_INPUT_COLUMNS = {
 # Use None to check every level.
 QC_MAX_ALTITUDE_M = qc_pipeline.PLAUSIBILITY_MAX_ALTITUDE_M
 
-# When True, the uncertainty columns (random / systematic / total) of a value
+# When True, the uncertainty columns (random / systematic / total) of ANY value
 # that has been set to NULL are set to NULL as well.
+# Independently of this flag, when the TOTAL uncertainty of a level is outside
+# its plausible range (temperature 0-10 K, RH 0-100 %, pressure 0-1000 Pa, see
+# qc_pipeline.PLAUSIBILITY_UNCERTAINTY_RANGES) the value and its random,
+# systematic and total uncertainties are always set to NULL.
 QC_NULLIFY_UNCERTAINTIES = False
 
 # A warning is printed when more than this fraction of the values of a
@@ -166,7 +171,7 @@ QC_REJECTION_WARN_FRACTION = 0.5
 # TIMER collects one month; export_month prints its report and folds it into
 # RUN_TIMER, which main() prints at the end (whole run).
 
-SCRIPT_REVISION = '2026-10-04a'   # shown in the log header: tells which code produced a log
+SCRIPT_REVISION = '2026-10-03e'   # shown in the log header: tells which code produced a log
 PG_SESSION_SETTINGS = []   # [(name, value)] applied with SET to every connection (--pg-set)
 LOG_PATH = None     # set by init_log(); None = no log file
 
@@ -723,8 +728,10 @@ def apply_plausibility_qc(df_merged: pd.DataFrame,
 
     # 2) level-by-level flags, profile by profile
     with TIMER('plausibility_qc/flag_implausible_levels'):
-        implausible = qc_pipeline.flag_implausible_levels(
-            qc_df, profile_id_column='profile_id', max_altitude_m=max_altitude_m)
+        implausible, implausible_uncertainty = (
+            qc_pipeline.flag_implausible_levels(
+                qc_df, profile_id_column='profile_id',
+                max_altitude_m=max_altitude_m))
 
     # 3) replace implausible values with NULL
     print(f"  Plausibility QC ({qc_df['profile_id'].nunique():,} profiles):")
@@ -738,15 +745,34 @@ def apply_plausibility_qc(df_merged: pd.DataFrame,
         if fraction > QC_REJECTION_WARN_FRACTION:
             print(f"    WARNING: more than {100 * QC_REJECTION_WARN_FRACTION:.0f}% of "
                   f"'{var}' rejected - check the units in QC_INPUT_COLUMNS.")
-        if n_rejected == 0:
+        # Levels whose TOTAL uncertainty is outside the plausible range: value,
+        # random, systematic and total uncertainty are all set to NULL.
+        if var in implausible_uncertainty.columns:
+            uncertainty_mask = implausible_uncertainty[var].to_numpy()
+        else:
+            uncertainty_mask = np.zeros(len(df_merged), dtype=bool)
+        n_uncertainty = int(uncertainty_mask.sum())
+        if n_uncertainty:
+            print(f"    {'':<18}  of which {n_uncertainty:>10,} levels with "
+                  f"total uncertainty out of range")
+        if n_rejected == 0 and n_uncertainty == 0:
             continue
         value_columns = {c for c, _ in QC_INPUT_COLUMNS[var]}
-        columns = set(value_columns)
-        if nullify_uncertainties:
-            columns.update(_uncertainty_columns(value_columns))
-        for column in columns:
+        uncertainty_columns = _uncertainty_columns(value_columns)
+        # Values rejected by any check.
+        for column in value_columns:
             if column in df_merged.columns:
-                df_merged[column] = df_merged[column].mask(mask)
+                df_merged[column] = df_merged[column].mask(mask | uncertainty_mask)
+        # Uncertainties: always for the uncertainty-range rejections, for all
+        # the rejections only if requested.
+        uncertainty_columns_mask = (
+            (mask | uncertainty_mask) if nullify_uncertainties
+            else uncertainty_mask)
+        if uncertainty_columns_mask.any():
+            for column in set(uncertainty_columns):
+                if column in df_merged.columns:
+                    df_merged[column] = df_merged[column].mask(
+                        uncertainty_columns_mask)
 
     print(f"  Plausibility QC time: {time.perf_counter() - start:.2f}s")
     return df_merged
@@ -1134,14 +1160,14 @@ COLUMNS_DATA_TABLE = [
 # on one month first with --verify-read YYYY-MM.
 
 def _data_query(year: int, month: int, data_table: str, max_alt_sql: str,
-                ordered: bool = True, columns_sql: str = None) -> str:
+                ordered: bool = True) -> str:
     # The altitude filter is pushed down to PostgreSQL (server-side), so only
     # the levels we actually need are transferred and held in memory.
     # NOTE: "alt <= X" alone would already drop NULLs (comparison yields NULL)
     # and NaNs (PostgreSQL sorts NaN above every other value), but the checks
     # are kept explicit for clarity and robustness.
     return (
-        f"SELECT {columns_sql or ', '.join(COLUMNS_DATA_TABLE)} "
+        f"SELECT {', '.join(COLUMNS_DATA_TABLE)} "
         f"FROM {data_table}_{year:04d}{month:02d} "
         f"WHERE alt IS NOT NULL "
         f"  AND alt <> 'NaN'::float8 "
@@ -1174,7 +1200,7 @@ def read_data_sqlalchemy(conn_params, year, month, data_table):
     t_concat = time.perf_counter()
     df = pd.concat(chunks, ignore_index=True)
     TIMER.add('db_read_data/concat_chunks', time.perf_counter() - t_concat)
-    return df if len(df) else None              # an empty month is None for every reader
+    return df
 
 
 def _adbc_uri(conn_params) -> str:
@@ -1375,230 +1401,10 @@ def read_data_adbc(conn_params, year, month, data_table, sql_order: bool = False
     return df
 
 
-# ── reader 3: binary COPY decoded with numpy ──────────────────────────────────
-# With ADBC one stream is limited by the decoder (~10 us per level), about 4x slower
-# than the raw COPY stream. PostgreSQL's binary COPY format is simple: a header, then
-# per row an int16 field count and, per field, an int32 length followed by the value
-# (big endian). When no field is NULL every row has the SAME length, so a block of rows
-# is decoded by numpy at once. REAL/DOUBLE NULLs are turned into NaN in the query
-# (COALESCE: pandas gives NaN for them anyway); a NULL in any other column, an
-# unexpected type or a misaligned stream makes the reader fall back to ADBC (same
-# result, slower).
-
-PGCOPY_CHUNK_BYTES = 1 << 22                 # rows decoded in blocks of ~4 MB (cache friendly)
-_PGCOPY_SIGNATURE = b'PGCOPY\n\xff\r\n\x00'
-_PG_EPOCH_US = 946_684_800 * 1_000_000       # 1970-01-01 -> 2000-01-01, microseconds
-# type oid -> (big-endian dtype, width in bytes, native dtype, role)
-_PG_FIXED_TYPES = {
-    700:  ('>f4', 4, np.float32, 'real'),    # real
-    701:  ('>f8', 8, np.float64, 'double'),  # double precision
-    21:   ('>i2', 2, np.int64,   'int'),     # smallint
-    23:   ('>i4', 4, np.int64,   'int'),     # integer
-    20:   ('>i8', 8, np.int64,   'int'),     # bigint
-    1184: ('>i8', 8, np.int64,   'ts'),      # timestamptz (microseconds since 2000-01-01 UTC)
-}
-
-
-class _PgCopyFallback(Exception):
-    """The fast path cannot be used for this month: use read_data_adbc."""
-
-
-def _quote_ident(name: str) -> str:
-    return name if name.startswith('"') else f'"{name}"'
-
-
-class _PgCopyLayout:
-    """Fixed layout of a binary COPY row for the 54 exported columns."""
-
-    def __init__(self, oids):
-        self.names = [c.strip('"') for c in COLUMNS_DATA_TABLE]
-        self.oids = oids
-        bad = [(n, o) for n, o in zip(self.names, oids) if o not in _PG_FIXED_TYPES]
-        if bad:
-            raise _PgCopyFallback(f"unsupported column type(s): {bad[:3]}")
-        self.ncols = len(oids)
-        self.native = [_PG_FIXED_TYPES[o][2] for o in oids]
-        self.role = [_PG_FIXED_TYPES[o][3] for o in oids]
-        self.width = [_PG_FIXED_TYPES[o][1] for o in oids]
-        names, formats, offsets, off = ['nf'], ['>i2'], [0], 2
-        for i, o in enumerate(oids):
-            names += [f'l{i}', f'v{i}']
-            formats += ['>i4', _PG_FIXED_TYPES[o][0]]
-            offsets += [off, off + 4]
-            off += 4 + self.width[i]
-        self.stride = off
-        self.row_dtype = np.dtype({'names': names, 'formats': formats,
-                                   'offsets': offsets, 'itemsize': off})
-
-    def select_list(self) -> str:
-        """The select list of the COPY query: REAL/DOUBLE NULL -> NaN."""
-        out = []
-        for name, o in zip(COLUMNS_DATA_TABLE, self.oids):
-            q = _quote_ident(name)
-            if o == 700:
-                out.append(f"COALESCE({q}, 'NaN'::real)")
-            elif o == 701:
-                out.append(f"COALESCE({q}, 'NaN'::float8)")
-            else:
-                out.append(q)
-        return ', '.join(out)
-
-
-class _BinaryCopySink:
-    """File-like object handed to psycopg2's copy_expert: collects the byte stream
-    and decodes it, block by block, into one numpy array per column."""
-
-    def __init__(self, layout: _PgCopyLayout, chunk_bytes: int = None):
-        self.L = layout
-        self.chunk_bytes = chunk_bytes or PGCOPY_CHUNK_BYTES
-        self.buf = bytearray()
-        self.header_done = False
-        self.first_block = True
-        self.parts = [[] for _ in range(layout.ncols)]
-        self.rows = 0
-        self.parse_seconds = 0.0
-
-    def write(self, data) -> int:
-        self.buf += data
-        if len(self.buf) >= self.chunk_bytes:
-            self._consume(final=False)
-        return len(data)
-
-    def finish(self):
-        self._consume(final=True)
-        if self.buf != b'\xff\xff' and not (self.rows == 0 and len(self.buf) in (0, 2)):
-            raise _PgCopyFallback("unexpected end of the COPY stream")
-
-    def _consume(self, final: bool):
-        t0 = time.perf_counter()
-        buf, L = self.buf, self.L
-        if not self.header_done:
-            if len(buf) < 19:
-                if final:
-                    raise _PgCopyFallback("COPY stream shorter than its header")
-                return
-            if bytes(buf[:11]) != _PGCOPY_SIGNATURE:
-                raise _PgCopyFallback("not a binary COPY stream")
-            if int.from_bytes(buf[11:15], 'big') != 0:
-                raise _PgCopyFallback("unsupported COPY flags")
-            header_len = 19 + int.from_bytes(buf[15:19], 'big')
-            if len(buf) < header_len:
-                if final:
-                    raise _PgCopyFallback("truncated COPY header")
-                return
-            del buf[:header_len]
-            self.header_done = True
-        n_rows = len(buf) // L.stride
-        if n_rows:
-            view = memoryview(buf)[:n_rows * L.stride]
-            try:
-                self._decode(view, n_rows)
-            finally:
-                view.release()
-            del buf[:n_rows * L.stride]
-            self.rows += n_rows
-        self.parse_seconds += time.perf_counter() - t0
-
-    def _decode(self, view, n_rows: int):
-        L = self.L
-        arr = np.frombuffer(view, dtype=L.row_dtype, count=n_rows)
-        try:
-            if not (arr['nf'] == L.ncols).all():
-                raise _PgCopyFallback("row layout differs (a NULL in a non-REAL column?)")
-            check = range(L.ncols) if self.first_block else (0, L.ncols - 1)
-            for i in check:                     # every length field once, then first/last
-                if not (arr[f'l{i}'] == L.width[i]).all():
-                    raise _PgCopyFallback(f"column {L.names[i]}: NULL or unexpected length")
-            self.first_block = False
-            for i in range(L.ncols):
-                self.parts[i].append(arr[f'v{i}'].astype(L.native[i]))   # byte swap + contiguous copy
-        finally:
-            del arr
-
-    def columns(self) -> dict:
-        out = {}
-        for i, name in enumerate(self.L.names):
-            parts = self.parts[i]
-            out[name] = parts[0] if len(parts) == 1 else np.concatenate(parts)
-            self.parts[i] = None                # free the blocks as soon as the column is built
-        return out
-
-
-def _pgcopy_layout(conn_params, table: str) -> _PgCopyLayout:
-    conn = get_psycopg2_connection(conn_params)
-    try:
-        with conn.cursor() as cur:
-            cur.execute(f"SELECT {', '.join(_quote_ident(c) for c in COLUMNS_DATA_TABLE)} "
-                        f"FROM {table} LIMIT 0")
-            oids = [d.type_code for d in cur.description]
-    finally:
-        conn.close()
-    return _PgCopyLayout(oids)
-
-
-def _read_data_pgcopy(conn_params, year, month, data_table):
-    table = f"{data_table}_{year:04d}{month:02d}"
-    layout = _pgcopy_layout(conn_params, table)
-    query = _data_query(year, month, data_table, repr(float(MAX_ALTITUDE_M)),
-                        ordered=False, columns_sql=layout.select_list())
-    print("data_query: ", query)
-    sink = _BinaryCopySink(layout)
-    conn = get_psycopg2_connection(conn_params)
-    t0 = time.perf_counter()
-    try:
-        with conn.cursor() as cur:
-            cur.copy_expert(f"COPY ({query}) TO STDOUT (FORMAT binary)", sink)
-        sink.finish()
-    finally:
-        conn.close()
-    TIMER.add('db_read_data/pgcopy_transfer', time.perf_counter() - t0 - sink.parse_seconds)
-    TIMER.add('db_read_data/pgcopy_parse', sink.parse_seconds)
-    if sink.rows == 0:
-        return None
-    cols = sink.columns()
-    del sink
-
-    # the same order as ORDER BY report_timestamp, observation_id (unique key)
-    with TIMER('db_read_data/client_sort'):
-        order = np.lexsort((cols['observation_id'], cols['report_timestamp']))
-        for name in list(cols):
-            cols[name] = np.take(cols[name], order)
-        del order
-
-    data, f32_cols = {}, []
-    for name, role in zip(layout.names, layout.role):
-        arr = cols.pop(name)
-        if role == 'ts':
-            data[name] = pd.Series((arr + _PG_EPOCH_US).view('datetime64[us]')).dt.tz_localize('UTC')
-        else:
-            data[name] = arr                    # int -> int64, double -> float64, real -> float32
-            if role == 'real':
-                f32_cols.append(name)
-    df = pd.DataFrame(data, copy=False)
-    if f32_cols:
-        with TIMER('db_read_data/float32_to_double'):
-            TIMER.add_cpu('db_read_data/float32_to_double',
-                          _convert_float32_columns(df, f32_cols, DEFAULT_THREADS))
-    return df
-
-
-def read_data_pgcopy(conn_params, year, month, data_table):
-    """Fast reader (binary COPY + numpy). Same DataFrame as read_data_adbc / read_data_sqlalchemy;
-    falls back to ADBC (and says so in the log) when the fast path does not apply."""
-    try:
-        return _read_data_pgcopy(conn_params, year, month, data_table)
-    except _PgCopyFallback as exc:
-        msg = f"  pgcopy: {year:04d}-{month:02d} falling back to adbc ({exc})"
-        print(msg)
-        log(msg)
-        return read_data_adbc(conn_params, year, month, data_table)
-
-
 READ_METHODS = {
     'sqlalchemy':     read_data_sqlalchemy,
     'adbc':           read_data_adbc,                                   # sorts on the client
     'adbc-sql-order': lambda *a: read_data_adbc(*a, sql_order=True),    # ORDER BY on the server
-    'pgcopy':         read_data_pgcopy,                                 # binary COPY + numpy
 }
 
 
@@ -1637,13 +1443,11 @@ def _frame_differences(a: pd.DataFrame, b: pd.DataFrame, notes: list = None):
     return out
 
 
-def verify_read_methods(conn_params, year, month, data_table='data',
-                        methods=('adbc', 'pgcopy')) -> bool:
-    """Read one month with the original reader (sqlalchemy, ORDER BY on the server)
-    and with each of `methods`; report times and any difference against the original."""
+def verify_read_methods(conn_params, year, month, data_table='data') -> bool:
+    """Read one month with BOTH readers, report time and any difference."""
     emit(f"\n── Verifying read methods on {year:04d}-{month:02d} ──")
     frames, times = {}, {}
-    for name in ('sqlalchemy',) + tuple(methods):
+    for name in ('sqlalchemy', 'adbc'):
         TIMER.reset()
         t0 = time.perf_counter()
         frames[name] = READ_METHODS[name](conn_params, year, month, data_table)
@@ -1653,29 +1457,24 @@ def verify_read_methods(conn_params, year, month, data_table='data',
         for stage, (sec, _calls) in TIMER.t.items():
             emit(f"      {stage.split('/', 1)[-1]:<24}{sec:8.2f}s")
     TIMER.reset()
-    ref, all_ok = frames['sqlalchemy'], True
-    for name in methods:
-        other = frames[name]
-        if ref is None or other is None:
-            ok = (ref is None) == (other is None)
-            emit(f"  {name}: " + ("no rows in either reader - nothing to compare" if ok
-                                  else "ONE READER RETURNED NO ROWS"))
-            all_ok &= ok
-            continue
-        notes = []
-        diffs = _frame_differences(ref, other, notes)
-        if notes:
-            emit(f"  {name}: {len(notes)} column(s) are entirely NULL in this month "
-                 f"(object/None vs float64/NaN, harmless): {', '.join(notes)}")
-        if diffs:
-            emit(f"  {name}: DIFFERENCES FOUND:")
-            for d in diffs:
-                emit(f"    - {d}")
-        else:
-            emit(f"  {name}: identical to sqlalchemy (same columns, dtypes, values, row order); "
-                 f"{times['sqlalchemy'] / times[name]:.1f}x faster")
-        all_ok &= not diffs
-    return all_ok
+    a, b = frames['sqlalchemy'], frames['adbc']
+    if a is None or b is None:
+        emit("  no rows returned by one of the readers - nothing to compare"
+             if (a is None) == (b is None) else "  ONE READER RETURNED NO ROWS")
+        return (a is None) == (b is None)
+    notes = []
+    diffs = _frame_differences(a, b, notes)
+    if notes:
+        emit(f"  note: {len(notes)} column(s) are entirely NULL in this month "
+             f"(object/None vs float64/NaN, harmless): {', '.join(notes)}")
+    if diffs:
+        emit("  DIFFERENCES FOUND:")
+        for d in diffs:
+            emit(f"    - {d}")
+    else:
+        emit(f"  identical: same columns, dtypes and values  "
+             f"(adbc is {times['sqlalchemy'] / times['adbc']:.1f}x faster)")
+    return not diffs
 
 
 def _month_output_file(output_dir, year: int, month: int) -> Path:
@@ -2024,8 +1823,7 @@ def main():
     parser.add_argument('--read-method',  choices=sorted(READ_METHODS), default='adbc',
                          help="How the data table is read: 'adbc' (default: Arrow/binary COPY, "
                               "needs `pip install adbc-driver-postgresql pyarrow`) or "
-                              "'pgcopy' (binary COPY decoded with numpy; falls back to adbc by itself), "
-                              "'adbc-sql-order' (same as adbc, but PostgreSQL does the sorting) or "
+                              "'adbc-sql-order' (same, but PostgreSQL does the sorting) or "
                               "'sqlalchemy' (pandas.read_sql, the original, ~2x slower).")
     parser.add_argument('--jobs',         type=int, default=1,
                          help='Months exported in parallel (separate processes). RAM is the '
