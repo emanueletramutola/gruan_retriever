@@ -16,6 +16,11 @@ Numeric codes are decoded with the official CDM lookup tables
 (https://github.com/ecmwf-projects/cdm-obs), downloaded at start-up.
 Use --units-table / --variable-table to point to local copies (offline use).
 
+For the observation it also counts, level by level, the valid values below /
+above the plausible range of the variable (PLAUSIBLE_RANGES_BY_CODE) and writes
+the bounds used, so that the report script can quantify the number and fraction
+of out-of-bounds levels (not only the file minimum / maximum).
+
 Output: one CSV file with one row per (file, observed_variable).
 
 Usage examples
@@ -49,8 +54,8 @@ import pandas as pd
 # USER SETTINGS - edit these values to change the defaults.
 # Each one can still be overridden from the command line.
 # --------------------------------------------------------------------------- #
-# INPUT_DIR = "/Data/GRUAN_CDS"         # directory containing the NetCDF files
-INPUT_DIR = "/Data/GRUAN_TEST/output"         # directory containing the NetCDF files
+INPUT_DIR = "/Data/GRUAN_CDS"         # directory containing the NetCDF files
+# INPUT_DIR = "/Data/GRUAN_TEST/output"         # directory containing the NetCDF files
 # OUTPUT_CSV = "/home/emanuele/logs/gruan_check_nc_CDM.csv"  # output CSV: full path + file name
 OUTPUT_CSV = "/Data/GRUAN_TEST/output/gruan_check_nc_CDM.csv"  # output CSV: full path + file name
 N_WORKERS = 23                             # parallel worker processes (1 = serial)
@@ -68,6 +73,33 @@ VALUE_VARS = {
     "uncertainty_value2": ("uncertainty_systematic", "uncertainty_units2"),
     "uncertainty_value5": ("uncertainty_total", "uncertainty_units5"),
 }
+
+# Plausible range of observation_value for each CDM observed_variable code,
+# as a closed interval (lower, upper) in the units written to the NetCDF files.
+# They are generous screening limits meant to catch gross errors only, NOT
+# GRUAN acceptance limits. The check counts, level by level, how many valid
+# observation values fall below / above them. The bounds themselves are written
+# to the CSV (observation_value_range_lo / _hi), so that the report script uses
+# exactly the same limits. Codes not listed here are not range-checked.
+PLAUSIBLE_RANGES_BY_CODE = {
+    126: (178.15, 323.15),    # air temperature                [K]
+    138: (0.0, 100.0),        # relative humidity              [%]
+    106: (0.0, 360.0),        # wind from direction            [deg]
+    107: (0.0, 180.0),        # wind speed                     [m s-1]
+    104: (-150.0, 150.0),     # eastward wind speed            [m s-1]
+    105: (-150.0, 150.0),     # northward wind speed           [m s-1]
+    123: (0.0, 0.05),         # water vapour mixing ratio      [mol mol-1]
+    122: (-10.0, 30.0),       # vertical speed of radiosonde   [m s-1]
+    117: (-100.0, 47000.0),   # geopotential height            [m]
+    116: (150.0, 330.0),      # frost point temperature        [K]
+    124: (0.0, 1000.0),       # RH effective vertical resolution [s]
+    73:  (0.0, 1600.0),       # shortwave radiation            [W m-2]
+    125: (-100.0, 47000.0),   # altitude                       [m]
+    142: (1.0, 108000.0),     # pressure                       [Pa]
+    143: (0.0, 21600.0),      # time since launch              [s]
+}
+RANGE_LO = {c: lo for c, (lo, hi) in PLAUSIBLE_RANGES_BY_CODE.items()}
+RANGE_HI = {c: hi for c, (lo, hi) in PLAUSIBLE_RANGES_BY_CODE.items()}
 
 CDM_BASE = "https://raw.githubusercontent.com/ecmwf-projects/cdm-obs/refs/heads/main/tables/"
 UNITS_TABLE_URL = CDM_BASE + "units.csv"
@@ -167,10 +199,18 @@ def analyse_file(path: Path, chunk_size: int) -> pd.DataFrame:
                         bad = df[df[v].notna() & (df[uvar] != df[UNITS_VAR])]
                         unc_mismatch.update(int(c) for c in bad[GROUP_VAR].unique())
 
+            # Level-by-level range check of the observation (NaN never counts:
+            # comparisons with NaN are False; codes without bounds give NaN limits)
+            obs = df["observation_value"]
+            df["_below"] = (obs < df[GROUP_VAR].map(RANGE_LO)).astype("int64")
+            df["_above"] = (obs > df[GROUP_VAR].map(RANGE_HI)).astype("int64")
+
             grouped = df.groupby(GROUP_VAR)
             agg = grouped[list(VALUE_VARS)].agg(["min", "max", "count"])
             agg.columns = [f"{v}_{s}" for v, s in agg.columns]
             agg["n_records"] = grouped.size()
+            agg["n_below"] = grouped["_below"].sum()
+            agg["n_above"] = grouped["_above"].sum()
             partial.append(agg)
 
     if not partial:
@@ -185,8 +225,18 @@ def analyse_file(path: Path, chunk_size: int) -> pd.DataFrame:
         result[f"{label}_min"] = by_code[f"{v}_min"].min()
         result[f"{label}_max"] = by_code[f"{v}_max"].max()
 
+    result["observation_value_n_below_range"] = by_code["n_below"].sum()
+    result["observation_value_n_above_range"] = by_code["n_above"].sum()
+
     result.index.name = "observed_variable_code"
     result = result.reset_index()
+    # Bounds used (NaN counters for codes that are not range-checked)
+    codes = result["observed_variable_code"].astype(int)
+    result["observation_value_range_lo"] = codes.map(RANGE_LO)
+    result["observation_value_range_hi"] = codes.map(RANGE_HI)
+    unchecked = result["observation_value_range_lo"].isna()
+    for c in ("observation_value_n_below_range", "observation_value_n_above_range"):
+        result[c] = result[c].astype("float64").where(~unchecked)
     result["units_code"] = result["observed_variable_code"].map(
         lambda c: ";".join(str(u) for u in sorted(units_seen.get(int(c), [])))
     )
@@ -217,6 +267,10 @@ def decorate(summary: pd.DataFrame, units_lookup: dict, variable_lookup: dict) -
     ]
     for label, _ in VALUE_VARS.values():
         ordered += [f"{label}_min", f"{label}_max", f"{label}_n_valid"]
+    ordered += [
+        "observation_value_n_below_range", "observation_value_n_above_range",
+        "observation_value_range_lo", "observation_value_range_hi",
+    ]
     ordered.append("uncertainty_units_match")
     return summary[ordered]
 

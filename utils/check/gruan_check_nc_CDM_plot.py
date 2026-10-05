@@ -20,6 +20,8 @@ Dependencies: numpy, pandas, matplotlib
 INPUT_CSV_PATH = "/Data/GRUAN_TEST/output/gruan_check_nc_CDM.csv"      # input CSV file
 # OUTPUT_PDF_PATH = "/home/emanuele/logs/gruan_quality_report.pdf"   # output PDF file
 OUTPUT_PDF_PATH = "/Data/GRUAN_TEST/output/gruan_quality_report.pdf"   # output PDF file
+# Table of every file/variable row with at least one out-of-bounds level (QA/QC follow-up)
+OUTPUT_FLAGGED_CSV_PATH = "/Data/GRUAN_TEST/output/gruan_out_of_bounds_levels.csv"
 # --------------------------------------------------------------------------
 
 import textwrap
@@ -32,6 +34,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.colors import LogNorm
 
 # Physically plausible ranges used to flag suspicious min / max values.
 # These are ASSUMPTIONS made for a quick screening (generous, so that only
@@ -58,6 +61,40 @@ PLAUSIBLE_RANGES = {
 # Relative tolerance used in the uncertainty-consistency test
 CONSISTENCY_TOL = 1e-3
 
+# Saturation ("cap") values of the TOTAL uncertainty, identified empirically from the
+# pile-up of the file maxima (see the pressure and wind uncertainty pages). A file is
+# counted as "at cap" when its maximum total uncertainty lies within CAP_REL_TOL below
+# (or marginally above) one of these values. Adapt them if the dataset changes.
+CAP_REL_TOL = 0.02
+PRESSURE_UNC_CAP = 1000.0                     # Pa  (= 10 hPa)
+WIND_UNC_CAP = 50.0                           # m/s (eastward / northward component, wind speed)
+DIRECTION_UNC_CAPS = (180.0, 360.0)           # deg (wind from direction)
+# Upper axis limit of the pressure-uncertainty time series (larger maxima are flagged off scale)
+PRESSURE_UNC_YMAX = 1e6                       # Pa
+
+# --------------------------------------------------------------------------
+# Level-resolved out-of-bounds statistics
+# --------------------------------------------------------------------------
+# Columns written by gruan_check_nc_CDM.py for every file x variable: the number of
+# VALID levels of the observation lying below / above the plausible range, and the
+# range itself (closed interval). When the range columns are present they REPLACE
+# PLAUSIBLE_RANGES above, so that report and check always use the same bounds.
+# If the counters are missing (CSV from an older version of the check), the report
+# falls back to a rigorous LOWER BOUND derived from the file minimum / maximum
+# (see add_level_bounds) and says so on the pages.
+COL_N_BELOW = "observation_value_n_below_range"
+COL_N_ABOVE = "observation_value_n_above_range"
+COL_RANGE_LO = "observation_value_range_lo"
+COL_RANGE_HI = "observation_value_range_hi"
+
+# Severity classes of a file/variable row, from the fraction of valid levels
+# that are out of bounds:  clean (none) | isolated (< e0) | moderate (< e1) | severe (>= e1)
+SEVERITY_EDGES = (1e-4, 1e-2)                       # 0.01 % and 1 %
+SEVERITY_COLORS = ["#a6d96a", "#fee08b", "#fdae61", "#d73027"]
+
+# Lower colour limit (fraction) of the out-of-bounds heatmap
+HEATMAP_FLOOR = 1e-6
+
 # Page sizes (inches)
 LANDSCAPE = (11.69, 8.27)
 PORTRAIT = (8.27, 11.69)
@@ -78,6 +115,7 @@ plt.rcParams.update({
 def load_data(path):
     """Read the CSV and add derived columns (date, labels, flags, fractions)."""
     df = pd.read_csv(path, encoding="utf-8-sig")
+    adopt_ranges_from_csv(df)
 
     # Month of each file, parsed from the file name (..._GRUAN_YYYY_MM.nc)
     df["date"] = pd.to_datetime(
@@ -105,6 +143,7 @@ def load_data(path):
     df["min_below"] = df["observation_value_min"] < lo
     df["max_above"] = df["observation_value_max"] > hi
     df["out_of_range"] = df["min_below"] | df["max_above"]
+    add_level_bounds(df)
     return df.sort_values(["observed_variable_code", "date"]).reset_index(drop=True)
 
 
@@ -118,6 +157,108 @@ def variable_order(df):
     )
 
 
+def adopt_ranges_from_csv(df):
+    """Take the plausible ranges from the input table (written by the NetCDF check)."""
+    if COL_RANGE_LO not in df.columns or COL_RANGE_HI not in df.columns:
+        return
+    r = df.dropna(subset=[COL_RANGE_LO, COL_RANGE_HI]).drop_duplicates("observed_variable_name")
+    for name, lo, hi in zip(r["observed_variable_name"], r[COL_RANGE_LO], r[COL_RANGE_HI]):
+        PLAUSIBLE_RANGES[name] = (float(lo), float(hi))
+
+
+def level_counts_exact(df):
+    """True if the input table carries per-level out-of-bounds counters."""
+    return COL_N_BELOW in df.columns and COL_N_ABOVE in df.columns
+
+
+def severity_labels():
+    """Human-readable names of the severity classes (see SEVERITY_EDGES)."""
+    e0, e1 = (100 * e for e in SEVERITY_EDGES)
+    return ["Clean (none)", f"Isolated (<{e0:g} %)", f"Moderate ({e0:g}-{e1:g} %)", f"Severe (>={e1:g} %)"]
+
+
+def add_level_bounds(df):
+    """
+    Add the level-resolved out-of-bounds columns (in place):
+
+    n_below, n_above, n_out : number of valid levels below / above / outside the bounds
+    out_frac                : n_out / number of valid levels (NaN if undefined)
+    severity                : 0 clean, 1 isolated, 2 moderate, 3 severe (NaN if undefined)
+
+    With per-level counters in the input table the counts are exact. Otherwise
+    they are the rigorous LOWER BOUND implied by the file minimum / maximum:
+    a minimum below the range proves at least one level below it, and a maximum
+    above the range proves at least one (different) level above it.
+    """
+    has_range = df["range_lo"].notna() & df["range_hi"].notna()
+    if level_counts_exact(df):
+        n_below = pd.to_numeric(df[COL_N_BELOW], errors="coerce")
+        n_above = pd.to_numeric(df[COL_N_ABOVE], errors="coerce")
+    else:
+        n_below = df["min_below"].astype(float)
+        n_above = df["max_above"].astype(float)
+    df["n_below"] = n_below.where(has_range)
+    df["n_above"] = n_above.where(has_range)
+    df["n_out"] = df["n_below"] + df["n_above"]
+
+    n_valid = df["observation_value_n_valid"].where(df["observation_value_n_valid"] > 0)
+    df["out_frac"] = df["n_out"] / n_valid
+
+    lo, hi = SEVERITY_EDGES
+    f = df["out_frac"]
+    sev = pd.Series(np.select([df["n_out"] == 0, f < lo, f < hi], [0, 1, 2], default=3),
+                    index=df.index, dtype=float)
+    sev[f.isna()] = np.nan
+    df["severity"] = sev
+
+
+def input_checks(df):
+    """Consistency checks of the input table; returns a list of messages."""
+    msgs = []
+    if level_counts_exact(df):
+        msgs.append("Per-level counters found in the input table: out-of-bounds counts are exact.")
+        a = int(((df["n_out"] > 0) & ~df["out_of_range"]).sum())
+        b = int(((df["n_out"] == 0) & df["out_of_range"]).sum())
+        c = int((df["n_out"] > df["observation_value_n_valid"]).sum())
+        msgs.append(f"Rows with counters > 0 but file min/max inside the bounds: {a} "
+                    "(non-zero means the bounds used for the counters differ from the bounds now in use).")
+        msgs.append(f"Rows with counters = 0 but file min/max outside the bounds: {b} "
+                    "(non-zero means the bounds used for the counters differ from the bounds now in use).")
+        msgs.append(f"Rows where out-of-bounds levels exceed the number of valid levels: {c} "
+                    "(must be zero).")
+    else:
+        msgs.append(f"Per-level counters ({COL_N_BELOW}, {COL_N_ABOVE}) NOT found in the input table: "
+                    "all level counts are LOWER BOUNDS derived from the file minimum / maximum.")
+    if COL_RANGE_LO in df.columns and COL_RANGE_HI in df.columns:
+        msgs.append("Plausible ranges read from the input table (written by the NetCDF check): "
+                    "report and check use identical bounds.")
+    else:
+        msgs.append("Plausible ranges taken from PLAUSIBLE_RANGES of this script (the input table has no "
+                    "range columns): make sure they match the bounds of the NetCDF check.")
+    no_rng = sorted(df.loc[df["range_lo"].isna(), "observed_variable_name"].unique())
+    if no_rng:
+        msgs.append("No plausible range defined (not assessed): " + ", ".join(no_rng) + ".")
+    return msgs
+
+
+def level_summary_sentence(df):
+    """One sentence on the level-resolved out-of-bounds statistics (summary page)."""
+    ok = df["n_out"].notna()
+    n_out = int(df.loc[ok, "n_out"].sum())
+    n_valid = int(df.loc[ok, "observation_value_n_valid"].sum())
+    frac = n_out / n_valid if n_valid else np.nan
+    affected = df["n_out"] > 0
+    n_aff = int(affected.sum())
+    iso = int((df["severity"] == 1).sum())
+    sev = int((df["severity"] == 3).sum())
+    e0, e1 = (100 * e for e in SEVERITY_EDGES)
+    prefix = "At level resolution" if level_counts_exact(df) else "At level resolution (LOWER BOUND, no per-level counters)"
+    share_iso = 100 * iso / n_aff if n_aff else 0.0
+    return (f"{prefix}: {n_out:,} of {n_valid:,} valid levels are out of bounds (fraction {frac:.2e}); "
+            f"{n_aff} rows are affected, of which {share_iso:.0f}% are isolated outliers (<{e0:g}% of the levels) "
+            f"and {sev} are severe (>={e1:g}%).")
+
+
 def pivot_months(df, value_col, var_names):
     """Pivot to a (variable x every month) matrix; missing months -> NaN."""
     months = pd.date_range(df["date"].min(), df["date"].max(), freq="MS")
@@ -125,14 +266,17 @@ def pivot_months(df, value_col, var_names):
     return p.reindex(index=var_names, columns=months), months
 
 
-def heatmap(ax, matrix, months, labels, cmap="viridis", vmin=0, vmax=1):
+def heatmap(ax, matrix, months, labels, cmap="viridis", vmin=0, vmax=1, norm=None, under=None):
     """Draw a variable x time heatmap with a proper date axis."""
     cm = plt.get_cmap(cmap).copy()
     cm.set_bad("#d9d9d9")  # grey = no file / no data
+    if under is not None:
+        cm.set_under(under)  # values below the colour scale (e.g. "none")
+    scale = {"norm": norm} if norm is not None else {"vmin": vmin, "vmax": vmax}
     x0 = mdates.date2num(months[0])
     x1 = mdates.date2num(months[-1] + pd.offsets.MonthBegin(1))
     im = ax.imshow(
-        np.ma.masked_invalid(matrix.values), aspect="auto", cmap=cm, vmin=vmin, vmax=vmax,
+        np.ma.masked_invalid(matrix.values), aspect="auto", cmap=cm, **scale,
         extent=[x0, x1, matrix.shape[0], 0], interpolation="nearest",
     )
     ax.xaxis_date()
@@ -158,6 +302,9 @@ def per_variable_summary(df, var_names):
     for v in var_names:
         d = df[df["observed_variable_name"] == v]
         rec = d["n_records"].sum()
+        defined = d["out_frac"].notna()
+        n_valid_def = d.loc[d["n_out"].notna(), "observation_value_n_valid"].sum()
+        n_out = d["n_out"].sum(min_count=1)
         rows.append({
             "Variable": d["label"].iloc[0].replace("\n", " "),
             "name": v,
@@ -168,6 +315,14 @@ def per_variable_summary(df, var_names):
             "Files out of range (%)": 100 * d["out_of_range"].mean(),
             "Lowest min": d["observation_value_min"].min(),
             "Highest max": d["observation_value_max"].max(),
+            # level-resolved out-of-bounds statistics (pooled over all files)
+            "Valid levels": n_valid_def,
+            "Levels below": d["n_below"].sum(min_count=1),
+            "Levels above": d["n_above"].sum(min_count=1),
+            "Levels out": n_out,
+            "Levels out (%)": 100 * n_out / n_valid_def if n_valid_def > 0 else np.nan,
+            "Files affected (%)": 100 * (d.loc[defined, "n_out"] > 0).mean() if defined.any() else np.nan,
+            "Files severe (%)": 100 * (d.loc[defined, "severity"] == 3).mean() if defined.any() else np.nan,
         })
     return pd.DataFrame(rows)
 
@@ -323,6 +478,25 @@ def page_summary(pdf, df, var_names, summ):
         lo_v, hi_v = consistency_flags(d)
         viol[v] = (int((lo_v | hi_v).sum()), len(d))
 
+    # saturation of the total uncertainty of pressure and wind
+    st_p = total_unc_cap_stats(df, "pressure", [PRESSURE_UNC_CAP])
+    st_w = {n: total_unc_cap_stats(df, n, [WIND_UNC_CAP])
+            for n in ("eastward wind speed", "northward wind speed", "wind speed")}
+    st_d = total_unc_cap_stats(df, "wind from direction", DIRECTION_UNC_CAPS)
+    p_unc = df.loc[df["observed_variable_name"] == "pressure", "uncertainty_total_max"]
+    w_cap = sum(v["n_at_cap"] for v in st_w.values())
+    w_tot = sum(v["n_with_unc"] for v in st_w.values())
+
+    lvl_txt = level_summary_sentence(df)
+    if level_counts_exact(df):
+        last_txt = ("Per-level counters make the outlier frequency quantifiable, but the table still stores no "
+                    "vertical or distributional information: out-of-bounds levels cannot be attributed to altitude "
+                    "layers or to the launch phase.")
+    else:
+        last_txt = ("The table only stores min / max / counts per file: the number of out-of-bounds levels cannot "
+                    "be determined (only a lower bound is shown), so one single bad value flags a whole month. "
+                    "Add per-level counters to the NetCDF check to quantify it.")
+
     strengths = [
         f"Long and nearly continuous record: {n_files} monthly files from {df['date'].min():%Y-%m} to "
         f"{df['date'].max():%Y-%m}; {len(gaps)} months missing ({gap_txt}).",
@@ -336,7 +510,7 @@ def page_summary(pdf, df, var_names, summ):
     ]
     weaknesses = [
         f"Unphysical extremes: {oor_rows:.1f}% of the file/variable rows have a minimum or maximum outside "
-        f"the assumed plausible range. Worst variables: {worst_txt}.",
+        f"the assumed plausible range. Worst variables: {worst_txt}. {lvl_txt}",
         f"Shortwave radiation collapses in time: {sw_peak / 1e6:.0f} M valid values in {sw_peak_year} vs "
         f"{sw_last_full / 1e6:.2f} M in the last complete year; {int((df.loc[df['observed_variable_name'] == 'shortwave radiation', 'observation_value_n_valid'] == 0).sum())} "
         f"files have no valid value at all.",
@@ -348,22 +522,27 @@ def page_summary(pdf, df, var_names, summ):
         f"(temperature) and {viol['relative humidity'][0]}/{viol['relative humidity'][1]} (RH) files, or exceeds "
         "their sum. Absurd values also occur (RH systematic uncertainty up to ~1e19 %, pressure total "
         "uncertainty up to ~1e9 Pa).",
+        f"Pressure and wind total uncertainties also look saturated: the pressure file maximum lies at about "
+        f"{PRESSURE_UNC_CAP:g} Pa in {st_p['n_at_cap']}/{st_p['n_with_unc']} files (up to {p_unc.max():.1e} Pa "
+        f"in the worst file); wind-component and wind-speed maxima sit at about {WIND_UNC_CAP:g} m/s in "
+        f"{w_cap}/{w_tot} files; the wind-direction uncertainty saturates at {DIRECTION_UNC_CAPS[0]:g} deg and then "
+        f"{DIRECTION_UNC_CAPS[1]:g} deg ({st_d['n_at_cap']}/{st_d['n_with_unc']} files), i.e. a fill value rather "
+        "than an estimate.",
         f"{n_no_unc} variables have no uncertainty at all, and wind/pressure/altitude carry only a total "
         "uncertainty (no random / systematic split), which limits error propagation.",
-        "The table only stores min / max / counts per file: outlier frequency, distributions and "
-        "vertical structure cannot be assessed, and one single bad value flags a whole month.",
+        last_txt,
     ]
 
-    y = 0.86
+    y = 0.875
 
     def block(title, items, y, color):
         fig.text(0.05, y, title, fontsize=13, weight="bold", color=color)
-        y -= 0.04
+        y -= 0.036
         for it in items:
-            lines = textwrap.wrap(it, 150)
+            lines = textwrap.wrap(it, 165)
             fig.text(0.06, y, "\u2022", fontsize=10, va="top")
-            fig.text(0.075, y, "\n".join(lines), fontsize=9.5, va="top", linespacing=1.35)
-            y -= 0.028 * len(lines) + 0.022
+            fig.text(0.075, y, "\n".join(lines), fontsize=9, va="top", linespacing=1.3)
+            y -= 0.0225 * len(lines) + 0.011
         return y
 
     y = block("Strengths", strengths, y, "#1a7f37")
@@ -559,6 +738,141 @@ def page_uncertainty_timeseries(pdf, df):
     plt.close(fig)
 
 
+def cap_mask(values, cap, rel_tol=CAP_REL_TOL):
+    """True where a file maximum sits at a saturation value: cap*(1-tol) <= x <= cap*(1+tol)."""
+    v = pd.Series(values)
+    return (v >= cap * (1 - rel_tol)) & (v <= cap * (1 + rel_tol))
+
+
+def total_unc_cap_stats(df, name, caps):
+    """
+    Saturation statistics of the total-uncertainty file maxima of one variable.
+    Returns a dict with the number of files with a total uncertainty, the number of files
+    whose maximum lies at one of `caps` (and the first month), and the dominant cap per year.
+    """
+    d = df[df["observed_variable_name"] == name]
+    have = d[d["uncertainty_total_n_valid"] > 0]
+    mask = pd.Series(False, index=have.index)
+    for c in caps:
+        mask |= cap_mask(have["uncertainty_total_max"], c)
+    return {
+        "n_files": len(d),
+        "n_with_unc": len(have),
+        "n_at_cap": int(mask.sum()),
+        "first_cap": have.loc[mask, "date"].min() if mask.any() else pd.NaT,
+        "have": have,
+        "mask": mask,
+    }
+
+
+def _band_axes(ax, d, mask, cap_lines, unit, log=False, ylim=None):
+    """Min-max band + maximum line of the total uncertainty; files at cap highlighted in red."""
+    tmin = d["uncertainty_total_min"]
+    if log:
+        tmin = tmin.where(tmin > 0)
+    ax.fill_between(d["date"], tmin, d["uncertainty_total_max"], color="#009e73", alpha=0.2,
+                    label="total: min-max range per file")
+    ax.plot(d["date"], d["uncertainty_total_max"], "-", lw=1.0, color="#009e73", label="total (max per file)")
+    ax.plot(d.loc[mask, "date"], d.loc[mask, "uncertainty_total_max"], ".", ms=4, color="#d73027",
+            label="max at cap value")
+    for c, txt in cap_lines:
+        ax.axhline(c, color="red", ls=":", lw=1)
+        ax.text(d["date"].max(), c * (1.08 if log else 1.0) + (0 if log else 0.015 * (ylim[1] - ylim[0])),
+                txt, color="red", fontsize=8, ha="right", va="bottom")
+    if log:
+        ax.set_yscale("log")
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    ax.set_ylabel(f"Total uncertainty [{unit}]")
+
+
+def page_pressure_uncertainty(pdf, df):
+    """Total uncertainty of pressure: file-level time series (a) and distribution per year (b)."""
+    name = "pressure"
+    st = total_unc_cap_stats(df, name, [PRESSURE_UNC_CAP])
+    d, mask = st["have"], st["mask"]
+    unit = df.loc[df["observed_variable_name"] == name, "units_abbreviation"].iloc[0]
+
+    fig, axes = plt.subplots(2, 1, figsize=LANDSCAPE, gridspec_kw={"height_ratios": [1.2, 1]})
+
+    ax = axes[0]
+    n_off = int((d["uncertainty_total_max"] > PRESSURE_UNC_YMAX).sum())
+    _band_axes(ax, d, mask, [(PRESSURE_UNC_CAP, f"{PRESSURE_UNC_CAP:g} Pa")], unit, log=True,
+               ylim=(0.1, PRESSURE_UNC_YMAX))
+    ax.set_xlabel("Date")
+    ax.set_title("(a) Total uncertainty of pressure per monthly file (log scale)")
+    ax.legend(fontsize=7.5, ncol=3, loc="upper left")
+    if n_off:
+        ax.text(0.99, 0.95, f"{n_off} file(s) with maxima > {PRESSURE_UNC_YMAX:.0e} {unit} are off scale "
+                f"(largest: {d['uncertainty_total_max'].max():.1e} {unit})",
+                transform=ax.transAxes, ha="right", va="top", fontsize=8, color="red")
+    first = f"; first occurrence {st['first_cap']:%Y-%m}" if st["n_at_cap"] else ""
+    ax.text(0.01, 0.04, f"{st['n_at_cap']}/{st['n_with_unc']} files have a maximum within "
+            f"{100 * CAP_REL_TOL:g} % of {PRESSURE_UNC_CAP:g} {unit}{first}",
+            transform=ax.transAxes, ha="left", va="bottom", fontsize=8, color="red")
+
+    ax = axes[1]
+    years = sorted(d["year"].unique())
+    data = [d.loc[d["year"] == y, "uncertainty_total_max"].dropna().values for y in years]
+    ax.boxplot(data, positions=years, widths=0.6, flierprops=dict(marker=".", ms=3, markeredgecolor="red"),
+               medianprops=dict(color="black"))
+    ax.set_yscale("log")
+    ax.set_ylim(0.1, PRESSURE_UNC_YMAX)
+    ax.axhline(PRESSURE_UNC_CAP, color="red", ls=":", lw=1)
+    if n_off:
+        ax.text(0.99, 0.95, f"{n_off} file(s) > {PRESSURE_UNC_YMAX:.0e} {unit} not shown",
+                transform=ax.transAxes, ha="right", va="top", fontsize=8, color="red")
+    ax.set_xticks(years[::2])
+    ax.set_xticklabels([str(y) for y in years[::2]])
+    ax.set_xlabel("Year")
+    ax.set_ylabel(f"Max total uncertainty per file [{unit}]")
+    ax.set_title("(b) Distribution of the file maxima per year (box = quartiles, red dots = outlier files)")
+
+    fig.suptitle("Pressure: total uncertainty (no random / systematic components available)",
+                 fontsize=13, weight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def page_wind_uncertainty(pdf, df):
+    """Total uncertainty of the wind variables: one panel per variable, file-level time series."""
+    panels = [
+        ("eastward wind speed", (WIND_UNC_CAP,), (0, 56), None),
+        ("northward wind speed", (WIND_UNC_CAP,), (0, 56), None),
+        ("wind speed", (WIND_UNC_CAP,), (0, 56), None),
+        ("wind from direction", DIRECTION_UNC_CAPS, (0, 400), [0, 90, 180, 270, 360]),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=LANDSCAPE, sharex=True)
+    for ax, (name, caps, ylim, yticks) in zip(axes.ravel(), panels):
+        dd = df[df["observed_variable_name"] == name]
+        unit = dd["units_abbreviation"].iloc[0]
+        st = total_unc_cap_stats(df, name, caps)
+        d, mask = st["have"], st["mask"]
+        # Files without any valid total uncertainty are left as gaps (NaN) in the series
+        full = dd[["date", "uncertainty_total_min", "uncertainty_total_max"]].copy()
+        full.loc[dd["uncertainty_total_n_valid"] == 0, ["uncertainty_total_min", "uncertainty_total_max"]] = np.nan
+        full_mask = pd.Series(False, index=full.index)
+        full_mask.loc[mask.index[mask]] = True
+        _band_axes(ax, full, full_mask, [(c, f"{c:g} {unit}") for c in caps], unit, log=False, ylim=ylim)
+        if yticks is not None:
+            ax.set_yticks(yticks)
+        ax.set_title(name)
+        n_none = st["n_files"] - st["n_with_unc"]
+        ax.text(0.01, 0.96, f"{st['n_at_cap']}/{st['n_with_unc']} files at cap; "
+                f"{n_none} file(s) without total uncertainty",
+                transform=ax.transAxes, ha="left", va="top", fontsize=7.5, color="red")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=3, fontsize=8, frameon=False)
+    for ax in axes[1]:
+        ax.set_xlabel("Date")
+    fig.suptitle("Wind: total uncertainty per monthly file (maximum and min-max range; "
+                 "no random / systematic components available)", fontsize=12, weight="bold")
+    fig.tight_layout(rect=(0, 0.04, 1, 0.95))
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
 def page_uncertainty_extremes(pdf, df, var_names):
     """Distribution across files of the maximum reported uncertainty, per variable."""
     fig, axes = plt.subplots(1, 3, figsize=LANDSCAPE, sharey=True)
@@ -700,6 +1014,269 @@ def page_consistency(pdf, df):
     pdf.savefig(fig)
     plt.close(fig)
 
+# ==========================================================================
+# Level-resolved out-of-bounds pages
+# ==========================================================================
+def _lower_bound_note(fig, df):
+    """Red footnote on level-resolved pages when only lower bounds are available."""
+    if not level_counts_exact(df):
+        msg = (f"LOWER BOUND: per-level counters ({COL_N_BELOW}, {COL_N_ABOVE}) are not in the input table; "
+               "counts are derived from the file minimum / maximum only and underestimate the true numbers.")
+        fig.text(0.5, 0.012, "\n".join(textwrap.wrap(msg, 150)), ha="center", va="bottom",
+                 fontsize=7.5, color="#b42318", weight="bold")
+
+
+def _fmt_pct(x):
+    if pd.isna(x):
+        return "n/a"
+    if x == 0:
+        return "0"
+    return f"{x:.2e}" if x < 1e-3 else f"{x:.3f}"
+
+
+def page_bounds_overview(pdf, df, var_names, summ):
+    """Pooled fraction of out-of-bounds levels and severity classes per variable."""
+    exact = level_counts_exact(df)
+    fig, axes = plt.subplots(1, 2, figsize=LANDSCAPE, sharey=True, gridspec_kw={"width_ratios": [1.2, 1]})
+    y = np.arange(len(var_names))
+    labs = ["\n".join(textwrap.wrap(f"{v} [{df.loc[df['observed_variable_name'] == v, 'units_abbreviation'].iloc[0]}]", 30))
+            for v in var_names]
+    n_valid = summ["Valid levels"].to_numpy(float)
+    n_out = summ["Levels out"].to_numpy(float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        below = 100 * summ["Levels below"].to_numpy(float) / n_valid
+        above = 100 * summ["Levels above"].to_numpy(float) / n_valid
+
+    # (a) pooled fraction, log axis (zero values are annotated, not plotted)
+    ax = axes[0]
+    pos = np.concatenate([below[below > 0], above[above > 0]])
+    xmin = pos.min() / 10 if len(pos) else 1e-6
+    xmax = pos.max() * 300 if len(pos) else 1.0
+    ax.set_xscale("log")
+    ax.set_xlim(xmin, xmax)
+    for i in range(len(var_names)):
+        if np.isnan(n_out[i]):
+            ax.text(xmin * 1.5, i, "no range defined", va="center", fontsize=7, color="gray")
+        elif n_out[i] == 0:
+            ax.text(xmin * 1.5, i, "none", va="center", fontsize=7, color="#1a7f37", weight="bold")
+        else:
+            top = max(below[i], above[i])
+            ax.hlines(i, xmin, top, color="#bbbbbb", lw=0.8)
+            if below[i] > 0:
+                ax.plot(below[i], i - 0.12, "v", color="#0072b2", ms=5)
+            if above[i] > 0:
+                ax.plot(above[i], i + 0.12, "^", color="#d55e00", ms=5)
+            ax.text(top * 1.5, i, f"{int(n_out[i]):,} / {n_valid[i]:.2e}", va="center", fontsize=6.5)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labs, fontsize=7)
+    ax.invert_yaxis()
+    ax.set_xlabel("Out-of-bounds levels / valid levels  [%]  (log scale)")
+    ax.set_title("(a) Pooled fraction of valid levels outside the plausible range\n"
+                 "(labels: out-of-bounds levels / valid levels)")
+    ax.legend(handles=[plt.Line2D([], [], marker="v", ls="", color="#0072b2", label="below lower bound"),
+                       plt.Line2D([], [], marker="^", ls="", color="#d55e00", label="above upper bound")],
+              fontsize=7, loc="lower right")
+
+    # (b) share of files in each severity class
+    ax = axes[1]
+    labels = severity_labels()
+    left = np.zeros(len(var_names))
+    for k in range(4):
+        share = []
+        for v in var_names:
+            sev = df.loc[df["observed_variable_name"] == v, "severity"].dropna()
+            share.append(100 * (sev == k).mean() if len(sev) else np.nan)
+        share = np.array(share)
+        ax.barh(y, np.nan_to_num(share), left=left, height=0.7, color=SEVERITY_COLORS[k],
+                label=labels[k], edgecolor="white", lw=0.3)
+        left += np.nan_to_num(share)
+    for i, v in enumerate(var_names):
+        if df.loc[df["observed_variable_name"] == v, "severity"].notna().sum() == 0:
+            ax.text(50, i, "n/a", ha="center", va="center", fontsize=7, color="gray")
+    ax.set_xlim(0, 100)
+    ax.set_xlabel("% of monthly files")
+    ax.set_title("(b) Files by severity of the out-of-bounds levels\n(share of files with valid levels)")
+    ax.legend(fontsize=7, ncol=2, loc="upper center", bbox_to_anchor=(0.5, -0.09), frameon=False)
+
+    fig.suptitle("Out-of-bounds levels: pooled fractions and severity" + ("" if exact else "  [lower bound]"),
+                 fontsize=13, weight="bold")
+    fig.tight_layout(rect=(0, 0.045, 1, 0.95))
+    _lower_bound_note(fig, df)
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def page_bounds_heatmap(pdf, df, var_names):
+    """Heatmap: fraction of valid levels out of bounds per variable and month."""
+    mat, months = pivot_months(df, "out_frac", var_names)
+    plot = mat.clip(lower=HEATMAP_FLOOR).where(mat > 0, 1e-12).where(mat.notna())  # 0 -> "under" colour
+    labels = [df.loc[df["observed_variable_name"] == v, "label"].iloc[0] for v in var_names]
+    fig, ax = plt.subplots(figsize=LANDSCAPE)
+    im = heatmap(ax, plot, months, labels, cmap="YlOrRd", norm=LogNorm(vmin=HEATMAP_FLOOR, vmax=1.0),
+                 under="#c7e9c0")
+    cb = fig.colorbar(im, ax=ax, pad=0.015, extend="min")
+    cb.set_label(f"Out-of-bounds levels / valid levels (log; values < {HEATMAP_FLOOR:g} shown at the floor;\n"
+                 "green triangle = no out-of-bounds level; grey = no file / no valid data)")
+    ax.set_title("Fraction of valid levels outside the plausible range, per variable and month"
+                 + ("" if level_counts_exact(df) else "  [lower bound]"))
+    ax.set_xlabel("Date")
+    fig.tight_layout(rect=(0, 0.045, 1, 1))
+    _lower_bound_note(fig, df)
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def page_bounds_timeseries(pdf, df, summ):
+    """Yearly pooled fraction and absolute number of out-of-bounds levels (variables with exceedances)."""
+    tot = summ.set_index("name")["Levels out"].fillna(0).sort_values(ascending=False)
+    top = [v for v in tot.index if tot[v] > 0][:8]
+    fig, axes = plt.subplots(2, 1, figsize=LANDSCAPE, sharex=True)
+    if not top:
+        axes[0].text(0.5, 0.5, "No out-of-bounds level found in any variable", transform=axes[0].transAxes,
+                     ha="center", va="center", fontsize=12, color="#1a7f37")
+        axes[1].axis("off")
+    else:
+        d = df[df["n_out"].notna()]
+        g = d.groupby(["observed_variable_name", "year"]).agg(n_out=("n_out", "sum"),
+                                                              n_valid=("observation_value_n_valid", "sum"))
+        cmap = plt.get_cmap("tab10")
+        for k, v in enumerate(top):
+            if v not in g.index.get_level_values(0):
+                continue
+            gv = g.loc[v]
+            frac = (100 * gv["n_out"] / gv["n_valid"]).where(gv["n_out"] > 0)
+            cnt = gv["n_out"].where(gv["n_out"] > 0)
+            axes[0].plot(gv.index, frac, "o-", ms=3, lw=1, color=cmap(k), label=v)
+            axes[1].plot(gv.index, cnt, "o-", ms=3, lw=1, color=cmap(k), label=v)
+        axes[0].set_yscale("log")
+        axes[1].set_yscale("log")
+        axes[0].set_ylabel("Out-of-bounds / valid levels [%]")
+        axes[1].set_ylabel("Out-of-bounds levels [count]")
+        axes[0].set_title("(a) Yearly pooled fraction of out-of-bounds levels")
+        axes[1].set_title("(b) Yearly number of out-of-bounds levels")
+        ymax = axes[0].get_ylim()[1]
+        axes[0].set_ylim(top=ymax * 30)  # head-room for the legend
+        axes[0].legend(fontsize=7, ncol=4, loc="upper left")
+        axes[1].xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+        axes[1].set_xlabel("Year (years without out-of-bounds levels are not drawn on the log axis)")
+    fig.suptitle("Temporal evolution of out-of-bounds levels (variables with the most exceedances)"
+                 + ("" if level_counts_exact(df) else "  [lower bound]"), fontsize=13, weight="bold")
+    fig.tight_layout(rect=(0, 0.045, 1, 0.95))
+    _lower_bound_note(fig, df)
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def page_bounds_table(pdf, summ, df):
+    """Appendix: level-resolved out-of-bounds table per variable."""
+    fig, ax = plt.subplots(figsize=LANDSCAPE)
+    ax.axis("off")
+    cols = ["Variable", "Valid levels", "Levels below", "Levels above", "Levels out (%)",
+            "Files affected (%)", "Files severe (%)"]
+    cell = []
+    for _, r in summ.iterrows():
+        def cnt(x):
+            return "n/a" if pd.isna(x) else f"{x:,.0f}"
+        cell.append([textwrap.fill(r["Variable"], 40),
+                     "n/a" if r["Valid levels"] == 0 else f"{r['Valid levels']:.3e}",
+                     cnt(r["Levels below"]), cnt(r["Levels above"]),
+                     _fmt_pct(r["Levels out (%)"]),
+                     "n/a" if pd.isna(r["Files affected (%)"]) else f"{r['Files affected (%)']:.1f}",
+                     "n/a" if pd.isna(r["Files severe (%)"]) else f"{r['Files severe (%)']:.1f}"])
+    tbl = ax.table(cellText=cell, colLabels=[textwrap.fill(c, 14) for c in cols], loc="center",
+                   cellLoc="center", colWidths=[0.30, 0.12, 0.11, 0.11, 0.12, 0.12, 0.12])
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(7.5)
+    tbl.scale(1, 2.0)
+    for j in range(len(cols)):
+        tbl[0, j].set_facecolor("#dbe5f1")
+        tbl[0, j].set_text_props(weight="bold")
+    e1 = 100 * SEVERITY_EDGES[1]
+    for i, (_, r) in enumerate(summ.iterrows(), start=1):
+        tbl[i, 0].set_text_props(ha="left")
+        if pd.notna(r["Levels out (%)"]):
+            if r["Levels out (%)"] >= e1:
+                tbl[i, 4].set_facecolor("#f8c9c4")
+            elif r["Levels out (%)"] > 0:
+                tbl[i, 4].set_facecolor("#fde9c4")
+            else:
+                tbl[i, 4].set_facecolor("#d8efd3")
+        if pd.notna(r["Files severe (%)"]) and r["Files severe (%)"] > 0:
+            tbl[i, 6].set_facecolor("#f8c9c4")
+    ax.set_title("Appendix - out-of-bounds levels per variable, pooled over all files"
+                 + ("" if level_counts_exact(df) else "  [lower bound]")
+                 + f"\n(red: >= {e1:g} % of the levels; amber: some levels; green: none; "
+                 "severe = file with >= that fraction)", fontsize=11, weight="bold")
+    fig.tight_layout(rect=(0, 0.045, 1, 1))
+    _lower_bound_note(fig, df)
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def page_methods(pdf, df, var_names):
+    """Appendix: definitions, assumptions, limitations and input checks."""
+    e0, e1 = (100 * e for e in SEVERITY_EDGES)
+    gaps = month_gaps(df)
+    exact = level_counts_exact(df)
+    sections = [
+        ("1. Input and scope", [
+            f"Input table: {INPUT_CSV_PATH}. {len(df)} file/variable rows, {df['file'].nunique()} monthly files "
+            f"({df['date'].min():%Y-%m} to {df['date'].max():%Y-%m}, {len(gaps)} months without file), "
+            f"{len(var_names)} observed variables. Report generated on {pd.Timestamp.now():%Y-%m-%d %H:%M}."]),
+        ("2. Definitions", [
+            "Level: one record of a monthly file; n_records is the number of levels and n_valid the number of "
+            "levels with a non-missing observation.",
+            "Out-of-bounds level: a valid observation outside the closed interval [lower, upper] given for its "
+            "variable (PLAUSIBLE_RANGES_BY_CODE in the NetCDF check, copied into the input table). The bounds are "
+            "generous screening limits for gross errors, not "
+            "GRUAN-certified acceptance limits.",
+            "Out-of-bounds fraction: number of out-of-bounds levels divided by the number of valid levels "
+            "(denominator: valid levels, not records). Pooled fractions sum numerators and denominators over all "
+            "files; they are not averages of per-file fractions and therefore weight each level equally.",
+            f"Severity classes (per file and variable): clean = no level out of bounds; isolated = fraction < "
+            f"{e0:g} %; moderate = {e0:g} % to {e1:g} %; severe = >= {e1:g} %. Isolated outliers typically indicate "
+            "sporadic sensor or processing glitches, severe rows indicate a systematic failure of the file.",
+            "File-level flag (previous version of the report): minimum or maximum outside the bounds. A single "
+            "level suffices to flag a file, so it cannot distinguish isolated outliers from systematic failures."]),
+        ("3. Provenance of the level counts", [
+            ("Exact counts: read from the columns " + f"{COL_N_BELOW} and {COL_N_ABOVE} of the input table, "
+             "computed level by level by gruan_check_nc_CDM.py with the bounds listed in the same table.") if exact else
+            ("LOWER BOUNDS: the input table has no per-level counters. A minimum below the range proves at least "
+             "one level below it, and a maximum above the range proves at least one other level above it; files "
+             "with minimum and maximum inside the bounds contain exactly zero out-of-bounds levels. Counts and "
+             "fractions of flagged files are therefore underestimated and the severity classes are minimum "
+             "classes.")]),
+        ("4. Limitations", [
+            "The range test detects gross errors only; physically plausible but wrong values pass. Counts are not "
+            "stratified by altitude, pressure layer, launch time or sonde type. Uncertainty variables are not "
+            "range-tested level by level; they are assessed through file-level maxima (consistency page).",
+            "Saturation (\"cap\") of the total uncertainty of pressure and wind: only file minima and maxima are "
+            "available, so a cap is inferred when the file maximum lies within "
+            f"{100 * CAP_REL_TOL:g} % of a characteristic value (pressure {PRESSURE_UNC_CAP:g} Pa; wind components "
+            f"and wind speed {WIND_UNC_CAP:g} m/s; wind direction {DIRECTION_UNC_CAPS[0]:g} and "
+            f"{DIRECTION_UNC_CAPS[1]:g} deg; constants at the top of the script). The counts are numbers of FILES "
+            "(not levels): they show that the cap value is reached in a file, not how many levels are capped, and "
+            "a file whose true maximum coincides with the cap by chance would also be counted. The caps were identified empirically from the pile-up of the file maxima, not from "
+            "GRUAN documentation. Random and systematic components are not available for these variables, so "
+            "the quadrature consistency test cannot be applied.",
+            "Missing files and files without valid levels are excluded from the fractions and shown in grey."]),
+        ("5. Input checks", input_checks(df)),
+    ]
+    fig = plt.figure(figsize=PORTRAIT)
+    fig.text(0.5, 0.965, "Appendix - methods, definitions and limitations", ha="center", fontsize=14, weight="bold")
+    y = 0.93
+    for title, paras in sections:
+        fig.text(0.07, y, title, fontsize=10.5, weight="bold", color="#1f3b63")
+        y -= 0.022
+        for p in paras:
+            lines = textwrap.wrap(p, 112)
+            fig.text(0.08, y, "\n".join(lines), fontsize=8.5, va="top", linespacing=1.3)
+            y -= 0.0167 * len(lines) + 0.010
+        y -= 0.008
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
 def page_table(pdf, summ):
     """Appendix: per-variable summary table."""
     fig, ax = plt.subplots(figsize=LANDSCAPE)
@@ -734,6 +1311,26 @@ def page_table(pdf, summ):
     plt.close(fig)
 
 
+def export_flagged_levels(df, path):
+    """Write every file/variable row with out-of-bounds levels, worst first (QA/QC follow-up list)."""
+    out = df[df["n_out"] > 0].copy()
+    out["month"] = out["date"].dt.strftime("%Y-%m")
+    out["counts_exact"] = level_counts_exact(df)
+    out["severity_class"] = out["severity"].map(dict(enumerate(severity_labels())))
+    out = out.rename(columns={
+        "n_below": "n_levels_below_range", "n_above": "n_levels_above_range",
+        "n_out": "n_levels_out_of_bounds", "out_frac": "out_of_bounds_fraction",
+        "observation_value_n_valid": "n_valid_levels",
+    })
+    cols = ["file", "month", "observed_variable_code", "observed_variable_name", "units_abbreviation",
+            "n_records", "n_valid_levels", "n_levels_below_range", "n_levels_above_range",
+            "n_levels_out_of_bounds", "out_of_bounds_fraction", "severity_class", "range_lo", "range_hi",
+            "observation_value_min", "observation_value_max", "counts_exact"]
+    out = out[cols].sort_values(["out_of_bounds_fraction", "n_levels_out_of_bounds"], ascending=False)
+    out.to_csv(path, index=False, encoding="utf-8")
+    return len(out)
+
+
 # ==========================================================================
 # Main
 # ==========================================================================
@@ -742,21 +1339,33 @@ def main():
     var_names = variable_order(df)
     summ = per_variable_summary(df, var_names)
 
+    for msg in input_checks(df):
+        print("[check]", msg)
+
     with PdfPages(OUTPUT_PDF_PATH) as pdf:
         page_summary(pdf, df, var_names, summ)
         page_volume(pdf, df)
         page_validity(pdf, df, var_names)
         page_uncertainty_availability(pdf, df, var_names, summ)
         page_plausibility(pdf, df, var_names)
+        page_bounds_overview(pdf, df, var_names, summ)
+        page_bounds_heatmap(pdf, df, var_names)
+        page_bounds_timeseries(pdf, df, summ)
         page_envelopes(pdf, df, var_names)
         page_uncertainty_timeseries(pdf, df)
+        page_pressure_uncertainty(pdf, df)
+        page_wind_uncertainty(pdf, df)
         page_uncertainty_extremes(pdf, df, var_names)
         page_consistency(pdf, df)
         page_table(pdf, summ)
+        page_bounds_table(pdf, summ, df)
+        page_methods(pdf, df, var_names)
         info = pdf.infodict()
         info["Title"] = "GRUAN dataset - quality screening report"
 
+    n_flagged = export_flagged_levels(df, OUTPUT_FLAGGED_CSV_PATH)
     print(f"Report written to: {OUTPUT_PDF_PATH}")
+    print(f"{n_flagged} rows with out-of-bounds levels written to: {OUTPUT_FLAGGED_CSV_PATH}")
 
 
 if __name__ == "__main__":
