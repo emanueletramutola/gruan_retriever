@@ -134,6 +134,7 @@ UNIT_TRANSFORMS: dict[str, tuple[float, float]] = {
 QC_INPUT_COLUMNS = {
     'height':                   [('alt', 1.0)],
     'temperature':              [('temp', 1.0)],
+    'temperature_uc_tot':       [('u_temp', 1.0), ('temp_uc', 1.0)],
     'relative_humidity':        [('rh', 0.01)],
     'relative_humidity_uc_tot': [('u_rh', 0.01), ('rh_uc', 0.01)],
     'wind_speed':               [('wspeed', 1.0)],
@@ -150,8 +151,12 @@ QC_INPUT_COLUMNS = {
 # Use None to check every level.
 QC_MAX_ALTITUDE_M = qc_pipeline.PLAUSIBILITY_MAX_ALTITUDE_M
 
-# When True, the uncertainty columns (random / systematic / total) of a value
+# When True, the uncertainty columns (random / systematic / total) of ANY value
 # that has been set to NULL are set to NULL as well.
+# Independently of this flag, when the TOTAL uncertainty of a level is outside
+# its plausible range (temperature 0-10 K, RH 0-100 %, pressure 0-1000 Pa, see
+# qc_pipeline.PLAUSIBILITY_UNCERTAINTY_RANGES) the value and its random,
+# systematic and total uncertainties are always set to NULL.
 QC_NULLIFY_UNCERTAINTIES = False
 
 # A warning is printed when more than this fraction of the values of a
@@ -723,8 +728,10 @@ def apply_plausibility_qc(df_merged: pd.DataFrame,
 
     # 2) level-by-level flags, profile by profile
     with TIMER('plausibility_qc/flag_implausible_levels'):
-        implausible = qc_pipeline.flag_implausible_levels(
-            qc_df, profile_id_column='profile_id', max_altitude_m=max_altitude_m)
+        implausible, implausible_uncertainty = (
+            qc_pipeline.flag_implausible_levels(
+                qc_df, profile_id_column='profile_id',
+                max_altitude_m=max_altitude_m))
 
     # 3) replace implausible values with NULL
     print(f"  Plausibility QC ({qc_df['profile_id'].nunique():,} profiles):")
@@ -738,15 +745,34 @@ def apply_plausibility_qc(df_merged: pd.DataFrame,
         if fraction > QC_REJECTION_WARN_FRACTION:
             print(f"    WARNING: more than {100 * QC_REJECTION_WARN_FRACTION:.0f}% of "
                   f"'{var}' rejected - check the units in QC_INPUT_COLUMNS.")
-        if n_rejected == 0:
+        # Levels whose TOTAL uncertainty is outside the plausible range: value,
+        # random, systematic and total uncertainty are all set to NULL.
+        if var in implausible_uncertainty.columns:
+            uncertainty_mask = implausible_uncertainty[var].to_numpy()
+        else:
+            uncertainty_mask = np.zeros(len(df_merged), dtype=bool)
+        n_uncertainty = int(uncertainty_mask.sum())
+        if n_uncertainty:
+            print(f"    {'':<18}  of which {n_uncertainty:>10,} levels with "
+                  f"total uncertainty out of range")
+        if n_rejected == 0 and n_uncertainty == 0:
             continue
         value_columns = {c for c, _ in QC_INPUT_COLUMNS[var]}
-        columns = set(value_columns)
-        if nullify_uncertainties:
-            columns.update(_uncertainty_columns(value_columns))
-        for column in columns:
+        uncertainty_columns = _uncertainty_columns(value_columns)
+        # Values rejected by any check.
+        for column in value_columns:
             if column in df_merged.columns:
-                df_merged[column] = df_merged[column].mask(mask)
+                df_merged[column] = df_merged[column].mask(mask | uncertainty_mask)
+        # Uncertainties: always for the uncertainty-range rejections, for all
+        # the rejections only if requested.
+        uncertainty_columns_mask = (
+            (mask | uncertainty_mask) if nullify_uncertainties
+            else uncertainty_mask)
+        if uncertainty_columns_mask.any():
+            for column in set(uncertainty_columns):
+                if column in df_merged.columns:
+                    df_merged[column] = df_merged[column].mask(
+                        uncertainty_columns_mask)
 
     print(f"  Plausibility QC time: {time.perf_counter() - start:.2f}s")
     return df_merged
