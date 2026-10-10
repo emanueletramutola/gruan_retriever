@@ -81,6 +81,22 @@ PLAUSIBILITY_LIMITS = {
     "vertical_speed": (-10.0, 30.0),
 }
 
+# (scale, unit label) used when the plausibility reasons are written (see
+# evaluate_level_plausibility(return_reasons=True)) and when the rejected values
+# are reported: pipeline value * scale = value shown in the report. RH is
+# handled as a fraction inside the pipeline but is reported in percent.
+PLAUSIBILITY_REPORT_UNITS = {
+    "temperature": (1.0, "K"),
+    "relative_humidity": (100.0, "%"),
+    "wind_speed": (1.0, "m s-1"),
+    "wind_direction": (1.0, "degree"),
+    "pressure": (1.0, "hPa"),
+    "wvmr": (1.0, "ppmv"),
+    "frost_point": (1.0, "K"),
+    "shortwave_radiation": (1.0, "W m-2"),
+    "vertical_speed": (1.0, "m s-1"),
+}
+
 # Plausibility range (lower, upper), BOTH INCLUDED, of the TOTAL uncertainty of
 # each variable, in the units used by this pipeline.
 TEMPERATURE_UNCERTAINTY_RANGE_K = (0.0, 10.0)  # 0 K - 10 K
@@ -343,8 +359,32 @@ def check_pressure_flags(pressure):
     return pmin, flag_p10, flag_p5
 
 
+def _compose_reasons(n_levels, evaluated_levels, parts):
+    """
+    Builds the text of the reasons of one variable of one profile.
+
+    `parts` is a list of (boolean mask over the EVALUATED levels, text). The
+    result is an object array with one item per level of the profile ("" =
+    no reason, several reasons are joined with "; "), or None if no level has
+    any reason.
+    """
+    reason_array = None
+    for mask, text in parts:
+        if not mask.any():
+            continue
+        if reason_array is None:
+            reason_array = np.full(n_levels, "", dtype=object)
+        full_length = np.zeros(n_levels, dtype=bool)
+        full_length[evaluated_levels] = mask
+        current = reason_array[full_length]
+        reason_array[full_length] = np.where(
+            current == "", text, current + "; " + text)
+    return reason_array
+
+
 def evaluate_level_plausibility(profile_data,
-                                max_altitude_m=PLAUSIBILITY_MAX_ALTITUDE_M):
+                                max_altitude_m=PLAUSIBILITY_MAX_ALTITUDE_M,
+                                return_reasons=False):
     """
     Level-by-level plausibility evaluation of a SINGLE profile.
 
@@ -411,6 +451,14 @@ def evaluate_level_plausibility(profile_data,
     uncertainty is not considered implausible by this check. If the
     uncertainty column is missing from `profile_data` the check is skipped
     for that variable (a warning is logged).
+
+    With return_reasons=True a 4th item is returned: a dict
+    {variable: object array | None}. The array has one item per level of the
+    profile with the text explaining why the level is rejected ("" for the
+    levels that are not rejected; several reasons are joined with "; ").
+    Limits are written in the units of PLAUSIBILITY_REPORT_UNITS. None means
+    that no level of the variable has a reason (or that it could not be
+    evaluated).
     """
     n_levels = len(profile_data)
     height = profile_data["height"].to_numpy()
@@ -420,17 +468,24 @@ def evaluate_level_plausibility(profile_data,
         # NaN heights compare as False, i.e. they are not evaluated.
         evaluated_levels = height <= max_altitude_m
     if not evaluated_levels.any():
-        return (
+        early = (
             evaluated_levels,
             {var: np.zeros(n_levels, dtype=bool)
              for var in PLAUSIBILITY_LIMITS},
             {var: np.zeros(n_levels, dtype=bool)
              for var in PLAUSIBILITY_UNCERTAINTY_RANGES},
         )
+        if return_reasons:
+            return early + ({var: None for var in PLAUSIBILITY_LIMITS},)
+        return early
     rejected = {}
     uncertainty_rejected = {}
+    reasons = {}
     for var, (lo, hi) in PLAUSIBILITY_LIMITS.items():
         try:
+            scale, unit = PLAUSIBILITY_REPORT_UNITS.get(var, (1.0, ""))
+            value_parts = []        # (mask over the evaluated levels, text)
+            uncertainty_parts = []
             # Total uncertainty range check. It is evaluated first because
             # it does not depend on the values of the variable.
             uncertainty_range_rejected = None
@@ -449,6 +504,10 @@ def evaluate_level_plausibility(profile_data,
                     full_length = np.zeros(n_levels, dtype=bool)
                     full_length[evaluated_levels] = uncertainty_range_rejected
                     uncertainty_rejected[var] = full_length
+                    uncertainty_parts.append((
+                        uncertainty_range_rejected,
+                        f"total uncertainty outside plausible range "
+                        f"[{unc_lo * scale:g}, {unc_hi * scale:g}] {unit}"))
                 else:
                     logging.warning(
                         f"Missing column: '{tot_column}': total uncertainty "
@@ -457,10 +516,20 @@ def evaluate_level_plausibility(profile_data,
             var_data = profile_data[var].to_numpy()[evaluated_levels]
             if np.all(np.isnan(var_data)):
                 rejected[var] = None
+                if return_reasons:
+                    reasons[var] = _compose_reasons(
+                        n_levels, evaluated_levels, uncertainty_parts)
                 continue
             # Step 1: levels outside the physical range (NaN never counts
             # as out of range: comparisons with NaN are False).
             level_rejected = (var_data < lo) | (var_data > hi)
+            if return_reasons and var not in PLAUSIBILITY_UNCERTAINTY_CHECKS:
+                value_parts = [
+                    (var_data < lo,
+                     f"value below physical minimum ({lo * scale:g} {unit})"),
+                    (var_data > hi,
+                     f"value above physical maximum ({hi * scale:g} {unit})"),
+                ]
             if var in PLAUSIBILITY_UNCERTAINTY_CHECKS:
                 uc_column, uc_max = PLAUSIBILITY_UNCERTAINTY_CHECKS[var]
                 uncertainty = profile_data[uc_column].to_numpy()[
@@ -477,6 +546,22 @@ def evaluate_level_plausibility(profile_data,
                 consistent = level_rejected & ~inconsistent
                 oversized_uncertainty = consistent & ~(uncertainty < uc_max)
                 level_rejected = inconsistent | oversized_uncertainty
+                if return_reasons:
+                    valid_range = f"[{lo * scale:g}, {hi * scale:g}] {unit}"
+                    missing_uncertainty = np.isnan(uncertainty)
+                    value_parts = [
+                        (inconsistent,
+                         f"value outside valid range {valid_range} and its "
+                         f"uncertainty interval does not overlap the valid "
+                         f"range"),
+                        (oversized_uncertainty & missing_uncertainty,
+                         f"value outside valid range {valid_range} and "
+                         f"total uncertainty missing"),
+                        (oversized_uncertainty & ~missing_uncertainty,
+                         f"value outside valid range {valid_range} and "
+                         f"total uncertainty not below the maximum accepted "
+                         f"({uc_max * scale:g} {unit})"),
+                    ]
             # Levels whose total uncertainty is outside the plausible range
             # are rejected whatever their value is.
             if uncertainty_range_rejected is not None:
@@ -484,15 +569,23 @@ def evaluate_level_plausibility(profile_data,
             full_length = np.zeros(n_levels, dtype=bool)
             full_length[evaluated_levels] = level_rejected
             rejected[var] = full_length
+            if return_reasons:
+                reasons[var] = _compose_reasons(
+                    n_levels, evaluated_levels,
+                    value_parts + uncertainty_parts)
         except KeyError:
             logging.error(f"Missing column: '{var}'")
             rejected[var] = None
+            reasons[var] = None
         except Exception as e:
             logging.error(f"Error checking '{var}': {e}")
             rejected[var] = None
+            reasons[var] = None
     # Variables whose uncertainty check could not be completed.
     for var in PLAUSIBILITY_UNCERTAINTY_RANGES:
         uncertainty_rejected.setdefault(var, None)
+    if return_reasons:
+        return evaluated_levels, rejected, uncertainty_rejected, reasons
     return evaluated_levels, rejected, uncertainty_rejected
 
 
@@ -517,7 +610,8 @@ def check_plausibility(profile_data, max_altitude_m=PLAUSIBILITY_MAX_ALTITUDE_M)
 
 
 def flag_implausible_levels(data, profile_id_column="profile_id",
-                            max_altitude_m=PLAUSIBILITY_MAX_ALTITUDE_M):
+                            max_altitude_m=PLAUSIBILITY_MAX_ALTITUDE_M,
+                            return_reasons=False):
     """
     Level-by-level plausibility flags for a DataFrame that contains MANY
     profiles stacked together (e.g. a whole month of soundings).
@@ -541,6 +635,13 @@ def flag_implausible_levels(data, profile_id_column="profile_id",
     Levels that could not be evaluated (unknown height, above
     `max_altitude_m`, variable without valid data in the profile, uncertainty
     column missing) are False, i.e. never reported as implausible.
+
+    With return_reasons=True a third item is returned: a dict
+    {variable: pandas Series} with the text explaining why each level is
+    rejected (see evaluate_level_plausibility). Only the rejected levels are
+    stored: the index of each Series holds the POSITIONAL row numbers of
+    `data` (sorted), so the memory used is proportional to the number of
+    rejections, not to the number of levels.
     """
     n_rows = len(data)
     implausible = {var: np.zeros(n_rows, dtype=bool)
@@ -549,17 +650,41 @@ def flag_implausible_levels(data, profile_id_column="profile_id",
                                for var in PLAUSIBILITY_UNCERTAINTY_RANGES}
     # Positional row indices of each profile (works with any index type).
     rows_by_profile = data.groupby(profile_id_column, sort=False).indices
+    reason_rows = {var: [] for var in PLAUSIBILITY_LIMITS}
+    reason_texts = {var: [] for var in PLAUSIBILITY_LIMITS}
     for rows in rows_by_profile.values():
-        _, rejected, uncertainty_rejected = evaluate_level_plausibility(
-            data.iloc[rows], max_altitude_m)
+        result = evaluate_level_plausibility(
+            data.iloc[rows], max_altitude_m, return_reasons=return_reasons)
+        _, rejected, uncertainty_rejected = result[:3]
+        if return_reasons:
+            for var, reason_array in result[3].items():
+                if reason_array is None:
+                    continue
+                has_reason = reason_array != ""
+                reason_rows[var].append(rows[has_reason])
+                reason_texts[var].append(reason_array[has_reason])
         for var, level_mask in rejected.items():
             if level_mask is not None:
                 implausible[var][rows] = level_mask
         for var, level_mask in uncertainty_rejected.items():
             if level_mask is not None:
                 implausible_uncertainty[var][rows] = level_mask
-    return (pd.DataFrame(implausible, index=data.index),
-            pd.DataFrame(implausible_uncertainty, index=data.index))
+    flags = (pd.DataFrame(implausible, index=data.index),
+             pd.DataFrame(implausible_uncertainty, index=data.index))
+    if not return_reasons:
+        return flags
+    reasons = {}
+    for var in PLAUSIBILITY_LIMITS:
+        if reason_rows[var]:
+            positions = np.concatenate(reason_rows[var])
+            texts = np.concatenate(reason_texts[var])
+            order = np.argsort(positions, kind="stable")
+            reasons[var] = pd.Series(texts[order], index=positions[order],
+                                     dtype=object)
+        else:
+            reasons[var] = pd.Series([], index=pd.Index([], dtype=np.int64),
+                                     dtype=object)
+    return flags + (reasons,)
 
 
 def check_variable_completeness(
