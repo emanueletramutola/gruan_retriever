@@ -147,6 +147,14 @@ QC_INPUT_COLUMNS = {
     'vertical_speed':           [('vspeed', 1.0), ('asc', 1.0)],
 }
 
+# Columns that are set to NULL, on the same levels, whenever the RH value is set
+# to NULL by the plausibility checks (they are derived from RH): water vapour
+# mixing ratio (value, systematic and total uncertainty) and RH response time.
+QC_RH_DEPENDENT_COLUMNS = (
+    'wvmr', 'wvmr_vol', 'wvmr_vol_uc_tcor', 'wvmr_vol_uc',
+    'res_rh', 'rh_res',
+)
+
 # Levels above this altitude (m) are not checked (same default as qc_pipeline).
 # Use None to check every level.
 QC_MAX_ALTITUDE_M = qc_pipeline.PLAUSIBILITY_MAX_ALTITUDE_M
@@ -773,6 +781,16 @@ def apply_plausibility_qc(df_merged: pd.DataFrame,
                 if column in df_merged.columns:
                     df_merged[column] = df_merged[column].mask(
                         uncertainty_columns_mask)
+        # RH set to NULL -> the variables derived from RH are set to NULL too.
+        if var == 'relative_humidity':
+            rh_nulled_mask = mask | uncertainty_mask
+            n_dependent = int(rh_nulled_mask.sum())
+            for column in QC_RH_DEPENDENT_COLUMNS:
+                if column in df_merged.columns:
+                    df_merged[column] = df_merged[column].mask(rh_nulled_mask)
+            print(f"    {'':<18}  RH-dependent columns "
+                  f"({', '.join(QC_RH_DEPENDENT_COLUMNS)}) set to NULL on "
+                  f"{n_dependent:,} levels")
 
     print(f"  Plausibility QC time: {time.perf_counter() - start:.2f}s")
     return df_merged

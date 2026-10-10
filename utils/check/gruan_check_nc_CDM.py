@@ -21,30 +21,19 @@ above the plausible range of the variable (PLAUSIBLE_RANGES_BY_CODE) and writes
 the bounds used, so that the report script can quantify the number and fraction
 of out-of-bounds levels (not only the file minimum / maximum).
 
-Outputs
--------
-1. Summary CSV: one row per (file, observed_variable).
-2. Implausible-values CSV: one row per single observation_value found outside
-   its plausible range, with the columns
-       file_name, report_timestamp, sonde, variable_name, variable_value,
-       implausibility_reason
-   (all columns are read from the NetCDF file itself; the names of the columns
-   written to the CSV are report_timestamp and sonde, see IMPLAUSIBLE_COLUMNS).
-   report_timestamp comes from the NetCDF variable "report_timestamp" and sonde
-   from the NetCDF variable "sensor_id".
+Output: one CSV file with one row per (file, observed_variable).
 
 Usage examples
 --------------
     (edit INPUT_DIR / OUTPUT_CSV / N_WORKERS at the top of this file, then)
-    python gruan_check_nc_CDM.py
+    python gruan_minmax_summary.py
 
     Any of them can be overridden from the command line:
-    python gruan_check_nc_CDM.py /path/to/netcdf_dir
-    python gruan_check_nc_CDM.py /path/to/netcdf_dir -o summary.csv
-    python gruan_check_nc_CDM.py /path/to/netcdf_dir --implausible-output bad_values.csv
-    python gruan_check_nc_CDM.py /path/to/netcdf_dir -r --pattern "*.nc"
-    python gruan_check_nc_CDM.py /path/to/netcdf_dir --chunk-size 2000000
-    python gruan_check_nc_CDM.py /path/to/netcdf_dir --workers 4
+    python gruan_minmax_summary.py /path/to/netcdf_dir
+    python gruan_minmax_summary.py /path/to/netcdf_dir -o summary.csv
+    python gruan_minmax_summary.py /path/to/netcdf_dir -r --pattern "*.nc"
+    python gruan_minmax_summary.py /path/to/netcdf_dir --chunk-size 2000000
+    python gruan_minmax_summary.py /path/to/netcdf_dir --workers 4
 
 Requirements: numpy, pandas, netCDF4  (pip install numpy pandas netCDF4)
 """
@@ -69,8 +58,6 @@ INPUT_DIR = "/Data/GRUAN_CDS"         # directory containing the NetCDF files
 # INPUT_DIR = "/Data/GRUAN_TEST/output"         # directory containing the NetCDF files
 # OUTPUT_CSV = "/home/emanuele/logs/gruan_check_nc_CDM.csv"  # output CSV: full path + file name
 OUTPUT_CSV = "/Data/GRUAN_TEST/output/gruan_check_nc_CDM.csv"  # output CSV: full path + file name
-# Implausible-values CSV (one row per out-of-range value): full path + file name
-OUTPUT_IMPLAUSIBLE_CSV = "/Data/GRUAN_TEST/output/gruan_check_nc_CDM_implausible.csv"
 N_WORKERS = 23                             # parallel worker processes (1 = serial)
 
 # --------------------------------------------------------------------------- #
@@ -78,12 +65,6 @@ N_WORKERS = 23                             # parallel worker processes (1 = seri
 # --------------------------------------------------------------------------- #
 GROUP_VAR = "observed_variable"
 UNITS_VAR = "units"  # numeric code of the units of observation_value
-
-# NetCDF variables used for the implausible-values CSV (same length as the
-# "index" dimension). If one is missing the column is left empty and a
-# warning is logged.
-TIMESTAMP_VAR = "report_timestamp"   # -> CSV column "report_timestamp"
-SONDE_VAR = "sensor_id"              # -> CSV column "sonde"
 
 # NetCDF variable -> (label used in the CSV, matching "uncertainty_unitsN" var)
 VALUE_VARS = {
@@ -130,104 +111,6 @@ log = logging.getLogger("gruan_minmax")
 
 
 # --------------------------------------------------------------------------- #
-# Helpers to read report_timestamp / sensor_id of selected rows
-# --------------------------------------------------------------------------- #
-_TIME_UNITS = {
-    "second": "s", "seconds": "s", "minute": "m", "minutes": "m",
-    "hour": "h", "hours": "h", "day": "D", "days": "D",
-}
-
-
-def _find_var(ds, name):
-    """Variable `name` if it exists and is aligned with the 'index' dimension, else None."""
-    n_total = ds.variables[GROUP_VAR].shape[0]
-    var = ds.variables.get(name)
-    if var is not None and var.ndim >= 1 and var.shape[0] == n_total:
-        var.set_auto_mask(False)
-        var.set_auto_scale(False)
-        return var
-    return None
-
-
-def _is_text(var) -> bool:
-    """True for vlen-string, char-array and fixed-string variables."""
-    dt = var.dtype
-    return dt is str or getattr(dt, "kind", "") in ("S", "U", "O")
-
-
-def _read_text(var, start, stop, positions):
-    """Read rows [start, stop) of a text-like variable and return those at `positions` as str."""
-    raw = var[start:stop]
-    raw = np.asarray(raw)
-    if raw.dtype.kind == "S" and raw.ndim == 2:      # char array (index, strlen)
-        raw = netCDF4.chartostring(raw)
-    raw = raw[positions]
-    out = []
-    for x in raw:
-        if isinstance(x, bytes):
-            x = x.decode("utf-8", errors="replace")
-        out.append(str(x).strip().strip("\x00"))
-    return out
-
-
-def _read_sonde(var, start, stop, positions):
-    """Value of sensor_id (char array / string) for the selected rows."""
-    if var is None:
-        return [""] * len(positions)
-    if _is_text(var):
-        return _read_text(var, start, stop, positions)
-    return [str(c) for c in np.asarray(var[start:stop])[positions].tolist()]  # numeric id
-
-
-def _read_timestamps(var, start, stop, positions):
-    """
-    Value of report_timestamp as ISO-8601 UTC string ('' where missing).
-    The exporter writes int64 seconds ("seconds since 1970-01-01 00:00:00")
-    and uses the int64 minimum as "missing" without a _FillValue attribute,
-    so that value, the NetCDF default fill value, the _FillValue (if any) and
-    NaN are all treated as missing.
-    """
-    if var is None:
-        return [""] * len(positions)
-    if _is_text(var):
-        return _read_text(var, start, stop, positions)
-    raw = np.asarray(var[start:stop])[positions]
-    ok = np.ones(len(raw), dtype=bool)
-    if raw.dtype.kind in "iu":
-        info = np.iinfo(raw.dtype)
-        ok &= raw != info.min
-        if raw.dtype == np.int64:
-            ok &= raw != -9223372036854775806   # NetCDF default int64 fill value
-    else:
-        ok &= np.isfinite(raw)
-    fill = getattr(var, "_FillValue", None)
-    if fill is not None:
-        ok &= raw != fill
-    out = [""] * len(raw)
-    units = str(getattr(var, "units", ""))
-    try:
-        step, since = units.split(" since ", 1)
-        unit = _TIME_UNITS[step.strip().lower()]
-        base = pd.Timestamp(since.strip())
-        if base.tzinfo is not None:
-            base = base.tz_convert("UTC").tz_localize(None)
-        stamps = base + pd.to_timedelta(raw[ok], unit=unit)
-        for i, t in zip(np.flatnonzero(ok), stamps):
-            out[i] = t.strftime("%Y-%m-%dT%H:%M:%SZ")
-    except Exception:
-        # unknown / missing units: keep the raw number rather than lose the information
-        for i in np.flatnonzero(ok):
-            out[i] = str(raw[i])
-    return out
-
-
-IMPLAUSIBLE_COLUMNS = [
-    "file_name", "report_timestamp", "sonde", "variable_name", "variable_value",
-    "implausibility_reason",
-]
-
-
-# --------------------------------------------------------------------------- #
 # Lookup tables
 # --------------------------------------------------------------------------- #
 def load_lookups(units_src: str, variable_src: str):
@@ -263,13 +146,10 @@ def load_lookups(units_src: str, variable_src: str):
 # --------------------------------------------------------------------------- #
 # Core logic
 # --------------------------------------------------------------------------- #
-def analyse_file(path: Path, chunk_size: int):
+def analyse_file(path: Path, chunk_size: int) -> pd.DataFrame:
     """
-    Analyse a single NetCDF file. Returns a tuple (summary, implausible):
-      - summary: one row per observed_variable with raw codes and, for every
-        variable in VALUE_VARS: n_valid, min, max;
-      - implausible: one row per observation_value outside its plausible range
-        (raw codes; names / reasons are added by decorate_implausible()).
+    Analyse a single NetCDF file. Returns one row per observed_variable with
+    raw codes and, for every variable in VALUE_VARS: n_valid, min, max.
     NaN / masked / infinite values are ignored.
     """
     with netCDF4.Dataset(path, "r") as ds:
@@ -289,15 +169,7 @@ def analyse_file(path: Path, chunk_size: int):
         has_units = UNITS_VAR in ds.variables
         n_total = group_var.shape[0]
 
-        time_var = _find_var(ds, TIMESTAMP_VAR)
-        sonde_var = _find_var(ds, SONDE_VAR)
-        if time_var is None:
-            log.warning("%s: variable '%s' not found (or not along 'index')", path.name, TIMESTAMP_VAR)
-        if sonde_var is None:
-            log.warning("%s: variable '%s' not found (or not along 'index')", path.name, SONDE_VAR)
-
         partial = []           # per-chunk aggregated DataFrames
-        bad_parts = []         # per-chunk implausible values
         units_seen = {}        # observed_variable code -> set of units codes
         unc_mismatch = set()   # observed_variable codes with uncertainty units != obs units
 
@@ -333,21 +205,6 @@ def analyse_file(path: Path, chunk_size: int):
             df["_below"] = (obs < df[GROUP_VAR].map(RANGE_LO)).astype("int64")
             df["_above"] = (obs > df[GROUP_VAR].map(RANGE_HI)).astype("int64")
 
-            # Single out-of-range values (for the detailed implausible-values file)
-            bad = df[(df["_below"] == 1) | (df["_above"] == 1)]
-            if len(bad):
-                pos = bad.index.to_numpy()   # row positions inside this chunk
-                code = bad[GROUP_VAR].to_numpy().astype(int)
-                bad_parts.append(pd.DataFrame({
-                    "file_name": path.name,
-                    "report_timestamp": _read_timestamps(time_var, start, stop, pos),
-                    "sonde": _read_sonde(sonde_var, start, stop, pos),
-                    "observed_variable_code": code,
-                    "units_code": bad[UNITS_VAR].to_numpy() if has_units else np.nan,
-                    "variable_value": bad["observation_value"].to_numpy(),
-                    "is_below": bad["_below"].to_numpy() == 1,
-                }))
-
             grouped = df.groupby(GROUP_VAR)
             agg = grouped[list(VALUE_VARS)].agg(["min", "max", "count"])
             agg.columns = [f"{v}_{s}" for v, s in agg.columns]
@@ -357,8 +214,7 @@ def analyse_file(path: Path, chunk_size: int):
             partial.append(agg)
 
     if not partial:
-        return pd.DataFrame(), pd.DataFrame()
-    implausible = pd.concat(bad_parts, ignore_index=True) if bad_parts else pd.DataFrame()
+        return pd.DataFrame()
 
     # Combine the chunks
     by_code = pd.concat(partial).groupby(level=0)
@@ -388,7 +244,7 @@ def analyse_file(path: Path, chunk_size: int):
         lambda c: "NO" if int(c) in unc_mismatch else "yes"
     )
     result.insert(0, "file", path.name)
-    return result.sort_values("observed_variable_code").reset_index(drop=True), implausible
+    return result.sort_values("observed_variable_code").reset_index(drop=True)
 
 
 def decorate(summary: pd.DataFrame, units_lookup: dict, variable_lookup: dict) -> pd.DataFrame:
@@ -419,37 +275,12 @@ def decorate(summary: pd.DataFrame, units_lookup: dict, variable_lookup: dict) -
     return summary[ordered]
 
 
-def decorate_implausible(bad: pd.DataFrame, units_lookup: dict, variable_lookup: dict) -> pd.DataFrame:
-    """Turn the raw implausible rows into the final, human-readable table."""
-    if bad.empty:
-        return pd.DataFrame(columns=IMPLAUSIBLE_COLUMNS)
-    bad = bad.copy()
-    codes = bad["observed_variable_code"].astype(int)
-    bad["variable_name"] = codes.map(lambda c: variable_lookup.get(c, f"code {c}"))
-
-    def unit_abbr(u):
-        if pd.isna(u):
-            return ""
-        return units_lookup.get(int(u), ("", ""))[1]
-
-    abbr = bad["units_code"].map(unit_abbr)
-    lo, hi = codes.map(RANGE_LO), codes.map(RANGE_HI)
-    suffix = abbr.map(lambda a: f" {a}" if a else "")
-    bad["implausibility_reason"] = np.where(
-        bad["is_below"],
-        "below plausible minimum (" + lo.map("{:g}".format) + suffix + ")",
-        "above plausible maximum (" + hi.map("{:g}".format) + suffix + ")",
-    )
-    bad = bad.sort_values(["file_name", "report_timestamp", "variable_name"], kind="stable")
-    return bad[IMPLAUSIBLE_COLUMNS].reset_index(drop=True)
-
-
 def _worker(path_str: str, chunk_size: int):
     """Process-pool entry point. Never raises: errors are returned to the parent."""
     t0 = time.time()
     try:
-        df, bad = analyse_file(Path(path_str), chunk_size)
-        return path_str, (df, bad), None, time.time() - t0
+        df = analyse_file(Path(path_str), chunk_size)
+        return path_str, df, None, time.time() - t0
     except Exception as exc:
         return path_str, None, str(exc), time.time() - t0
 
@@ -457,15 +288,15 @@ def _worker(path_str: str, chunk_size: int):
 def run_all(files, chunk_size: int, workers: int):
     """
     Analyse all files, serially (workers == 1) or with a pool of worker
-    processes. Returns (results, failed) with results (a list of
-    (summary, implausible) tuples) in the same order as `files`. Processes (not threads) are used because the HDF5 library is not
+    processes. Returns (results, failed) with results in the same order as
+    `files`. Processes (not threads) are used because the HDF5 library is not
     thread-safe.
     """
     done, failed = {}, []
     n = len(files)
     counter = 0
 
-    def handle(path_str, res, err, elapsed):
+    def handle(path_str, df, err, elapsed):
         nonlocal counter
         counter += 1
         name = Path(path_str).name
@@ -473,15 +304,12 @@ def run_all(files, chunk_size: int, workers: int):
             log.error("[%d/%d] %s FAILED: %s", counter, n, name, err)
             failed.append((name, err))
             return
-        df, bad = res
         log.info("[%d/%d] %s done in %.1f s (%d observed variables)",
                  counter, n, name, elapsed, len(df))
         if (df["uncertainty_units_match"] == "NO").any():
             log.warning("  %s: uncertainty units differ from observation units for some "
                         "variables (see column 'uncertainty_units_match')", name)
-        if len(bad):
-            log.info("  %s: %d implausible value(s)", name, len(bad))
-        done[path_str] = res
+        done[path_str] = df
 
     if workers <= 1:
         for f in files:
@@ -517,10 +345,6 @@ def main() -> int:
     parser.add_argument(
         "-o", "--output", type=Path, default=Path(OUTPUT_CSV),
         help=f"Output CSV path (default: {OUTPUT_CSV})",
-    )
-    parser.add_argument(
-        "--implausible-output", type=Path, default=Path(OUTPUT_IMPLAUSIBLE_CSV),
-        help=f"Output CSV with one row per implausible value (default: {OUTPUT_IMPLAUSIBLE_CSV})",
     )
     parser.add_argument("-p", "--pattern", default="*.nc", help='File name pattern (default: "*.nc")')
     parser.add_argument("-r", "--recursive", action="store_true", help="Search sub-directories too")
@@ -561,21 +385,11 @@ def main() -> int:
     log.info("Analysis finished in %.1f s", time.time() - t_start)
 
     if results:
-        summary = decorate(pd.concat([r[0] for r in results], ignore_index=True),
-                           units_lookup, variable_lookup)
+        summary = decorate(pd.concat(results, ignore_index=True), units_lookup, variable_lookup)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         # 'utf-8-sig' lets Excel open the file directly with correct encoding
         summary.to_csv(args.output, index=False, encoding="utf-8-sig")
         log.info("Summary written to %s (%d rows)", args.output, len(summary))
-
-        bad_parts = [r[1] for r in results if len(r[1])]
-        implausible = decorate_implausible(
-            pd.concat(bad_parts, ignore_index=True) if bad_parts else pd.DataFrame(),
-            units_lookup, variable_lookup,
-        )
-        args.implausible_output.parent.mkdir(parents=True, exist_ok=True)
-        implausible.to_csv(args.implausible_output, index=False, encoding="utf-8-sig")
-        log.info("Implausible values written to %s (%d rows)", args.implausible_output, len(implausible))
     else:
         log.error("No file could be analysed successfully")
 
