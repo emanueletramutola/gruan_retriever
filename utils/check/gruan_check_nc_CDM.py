@@ -90,12 +90,12 @@ PLAUSIBLE_RANGES_BY_CODE = {
     105: (-150.0, 150.0),     # northward wind speed           [m s-1]
     123: (0.0, 0.05),         # water vapour mixing ratio      [mol mol-1]
     122: (-10.0, 30.0),       # vertical speed of radiosonde   [m s-1]
-    117: (-100.0, 47000.0),   # geopotential height            [m]
+    117: (-10.0, 47000.0),   # geopotential height            [m]
     116: (150.0, 330.0),      # frost point temperature        [K]
     124: (0.0, 1000.0),       # RH effective vertical resolution [s]
     73:  (0.0, 1600.0),       # shortwave radiation            [W m-2]
-    125: (-100.0, 47000.0),   # altitude                       [m]
-    142: (1.0, 108000.0),     # pressure                       [Pa]
+    125: (-10.0, 47000.0),   # altitude                       [m]
+    142: (100.0, 108000.0),     # pressure                       [Pa]
     143: (0.0, 21600.0),      # time since launch              [s]
 }
 RANGE_LO = {c: lo for c, (lo, hi) in PLAUSIBLE_RANGES_BY_CODE.items()}

@@ -987,7 +987,8 @@ def apply_plausibility_qc(df_merged: pd.DataFrame,
         n_uncertainty = int(uncertainty_mask.sum())
         if n_uncertainty:
             print(f"    {'':<18}  of which {n_uncertainty:>10,} levels with "
-                  f"total uncertainty out of range")
+                  f"at least one uncertainty (total/random/systematic) "
+                  f"out of range")
         if n_rejected == 0 and n_uncertainty == 0:
             continue
         # DB columns of the value and of all its uncertainties (random,

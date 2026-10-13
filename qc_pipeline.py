@@ -408,8 +408,12 @@ def evaluate_level_plausibility(profile_data,
                               not be evaluated (missing column, error, no
                               valid data);
       - uncertainty_rejected: {variable: boolean array | None}; True where
-                              the TOTAL uncertainty is outside its plausible
-                              range. These levels are also True in `rejected`.
+                              AT LEAST ONE of the uncertainty columns of the
+                              variable (total, random, systematic) is
+                              outside its plausible `unc_range`. These levels
+                              are also True in `rejected`. None means the
+                              check could not be performed (no uncertainty
+                              column available).
     With return_reasons=True, a 4th item is returned:
       - reasons             : {variable: object array | None} with the text
                               explaining each rejection ("" for accepted
@@ -417,8 +421,10 @@ def evaluate_level_plausibility(profile_data,
                               a reason.
 
     Rules applied (per variable):
-      1. Total uncertainty range: if the total uncertainty is outside
-         `unc_range`, the level is rejected regardless of the value.
+      1. Uncertainty range: EVERY available uncertainty column (total,
+         random, systematic, see `unc_total_col` + `other_unc_cols`) is
+         compared with `unc_range`; the level is rejected if at least one of
+         them is outside the range, regardless of the value.
       2. Value plausibility: for out-of-range values the interval
          [value - unc, value + unc] is compared with `check_range`:
              value - unc > hi   OR   value + unc < lo
@@ -450,12 +456,13 @@ def evaluate_level_plausibility(profile_data,
                     {var: None for var in rules})
         return evaluated_levels, early_rejected, early_unc
 
+    n_evaluated = int(evaluated_levels.sum())
     rejected = {}
     uncertainty_rejected = {}
     reasons = {}
 
     # -------------------------------------------------------------
-    # Phase 1: total uncertainty range + value plausibility
+    # Phase 1: uncertainty range + value plausibility
     # -------------------------------------------------------------
     for var, info in rules.items():
         val_col = info["val_col"]
@@ -469,31 +476,48 @@ def evaluate_level_plausibility(profile_data,
         uncertainty_parts = []
         uncertainty_range_rejected = None
 
-        # --- Total uncertainty range ---
-        if unc_range is not None and unc_col is not None:
-            if unc_col in profile_data.columns:
-                tot = profile_data[unc_col].to_numpy()[evaluated_levels]
-                unc_lo, unc_hi = unc_range
-                rej = (tot < unc_lo) | (tot > unc_hi)
-                full = np.zeros(n_levels, dtype=bool)
-                full[evaluated_levels] = rej
-                uncertainty_rejected[var] = full
-                uncertainty_range_rejected = rej
-                uncertainty_parts.append((
-                    rej,
-                    f"total uncertainty outside plausible range "
-                    f"[{unc_lo * scale:g}, {unc_hi * scale:g}] {unit}"
-                ))
-            else:
+        # --- Uncertainty range check on EVERY available uncertainty ---
+        if unc_range is not None:
+            unc_lo, unc_hi = unc_range
+            # Total uncertainty first, then the extra ones (random,
+            # systematic) declared in `other_unc_cols`.
+            unc_cols_to_check = []
+            if unc_col is not None:
+                unc_cols_to_check.append(unc_col)
+            unc_cols_to_check.extend(info.get("other_unc_cols", []))
+
+            present = [c for c in unc_cols_to_check
+                       if c in profile_data.columns]
+            missing = [c for c in unc_cols_to_check
+                       if c not in profile_data.columns]
+            if missing:
                 logging.warning(
-                    f"Missing column: '{unc_col}': total uncertainty "
-                    f"range check skipped for '{var}'"
-                )
+                    f"Missing uncertainty column(s) for '{var}': "
+                    f"{missing}; their range check is skipped")
+
+            if present:
+                rej_any = np.zeros(n_evaluated, dtype=bool)
+                for col in present:
+                    vals = profile_data[col].to_numpy()[evaluated_levels]
+                    rej_col = (vals < unc_lo) | (vals > unc_hi)
+                    rej_any |= rej_col
+                    if return_reasons:
+                        label = ("total uncertainty" if col == unc_col
+                                 else f"uncertainty '{col}'")
+                        uncertainty_parts.append((
+                            rej_col,
+                            f"{label} outside plausible range "
+                            f"[{unc_lo * scale:g}, {unc_hi * scale:g}] {unit}"))
+                full = np.zeros(n_levels, dtype=bool)
+                full[evaluated_levels] = rej_any
+                uncertainty_rejected[var] = full
+                uncertainty_range_rejected = rej_any
+            else:
                 uncertainty_rejected[var] = None
         else:
             uncertainty_rejected[var] = None
 
-        # --- Value ---
+        # --- Value check ---
         if val_col not in profile_data.columns:
             logging.error(f"Missing column: '{val_col}'")
             rejected[var] = None
@@ -792,9 +816,10 @@ A variable is plausible (1) if no level up to 47 km is rejected, not
 plausible (0) otherwise. For each variable the following rules are
 applied level by level:
 
-1. Total uncertainty range: if the total uncertainty is outside the
-   plausible range of the variable, the level is rejected regardless of
-   the value.
+1. Uncertainty range: every available uncertainty column of the variable
+   (total, random, systematic) is compared with the plausible range of
+   the variable. The level is rejected if at least one of them is outside
+   the range, regardless of the value.
 2. Value plausibility: for out-of-range values the interval
    [value - unc, value + unc] is compared with the physical range. The
    level is rejected only if the whole interval is outside the range:
