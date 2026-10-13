@@ -130,31 +130,48 @@ UNIT_TRANSFORMS: dict[str, tuple[float, float]] = {
 #   * press is stored in hPa in the DB (converted to Pa only at export time)
 #   * wvmr (CF-1.4) is a dimensionless ratio  -> x 1e6 = ppmv
 #     wvmr_vol (CF-1.7) is already in ppmv (converted to mol mol-1 at export)
+#   * u/v are stored under different names in CF-1.4 ('u'/'v') and CF-1.7
+#     ('wzon'/'wmeri'); the first non-NULL column wins.
 # If the units of your DB differ, change the scale factors here.
 QC_INPUT_COLUMNS = {
-    'height':                   [('alt', 1.0)],
-    'temperature':              [('temp', 1.0)],
-    'temperature_uc_tot':       [('u_temp', 1.0), ('temp_uc', 1.0)],
-    'relative_humidity':        [('rh', 0.01)],
-    'relative_humidity_uc_tot': [('u_rh', 0.01), ('rh_uc', 0.01)],
-    'wind_speed':               [('wspeed', 1.0)],
-    'wind_direction':           [('wdir', 1.0)],
-    'pressure':                 [('press', 1.0)],
-    'pressure_uc_tot':          [('u_press', 1.0), ('press_uc', 1.0)],
-    'wvmr':                     [('wvmr', 1e6), ('wvmr_vol', 1.0)],
-    'frost_point':              [('fp', 1.0)],
-    'shortwave_radiation':     [('swrad', 1.0)],
-    'vertical_speed':           [('vspeed', 1.0), ('asc', 1.0)],
+    # --- Values ---
+    'height':                     [('alt', 1.0)],
+    'temperature':                [('temp', 1.0)],
+    'relative_humidity':          [('rh', 0.01)],
+    'wind_speed':                 [('wspeed', 1.0)],
+    'wind_direction':             [('wdir', 1.0)],
+    'u':                          [('u', 1.0), ('wzon', 1.0)],
+    'v':                          [('v', 1.0), ('wmeri', 1.0)],
+    'pressure':                   [('press', 1.0)],
+    'geopot':                     [('geopot', 1.0), ('alt_gph', 1.0)],
+    'wvmr':                       [('wvmr', 1e6), ('wvmr_vol', 1.0)],
+    'frost_point':                [('fp', 1.0)],
+    'shortwave_radiation':        [('swrad', 1.0)],
+    'vertical_speed':             [('vspeed', 1.0), ('asc', 1.0)],
+    'rh_resolution':              [('res_rh', 1.0), ('rh_res', 1.0)],
+    # --- Total uncertainties ---
+    'height_uc_tot':              [('alt_uc', 1.0)],
+    'temperature_uc_tot':         [('u_temp', 1.0), ('temp_uc', 1.0)],
+    'relative_humidity_uc_tot':   [('u_rh', 0.01), ('rh_uc', 0.01)],
+    'wind_speed_uc_tot':          [('u_wspeed', 1.0), ('wspeed_uc', 1.0)],
+    'wind_direction_uc_tot':      [('u_wdir', 1.0), ('wdir_uc', 1.0)],
+    'u_uc_tot':                   [('wzon_uc', 1.0)],
+    'v_uc_tot':                   [('wmeri_uc', 1.0)],
+    'pressure_uc_tot':            [('u_press', 1.0), ('press_uc', 1.0)],
+    'geopot_uc_tot':              [('alt_gph_uc', 1.0)],
+    'wvmr_uc_tot':                [('wvmr_vol_uc', 1.0)],
+    'frost_point_uc_tot':         [('fp_uc', 1.0)],
+    'shortwave_radiation_uc_tot': [('u_swrad', 1.0)],
+    'vertical_speed_uc_tot':      [('vspeed_uc', 1.0)],
+    # --- Random (uncorrelated) uncertainties ---
+    'temperature_uc_std':         [('u_std_temp', 1.0)],
+    'relative_humidity_uc_std':   [('u_std_rh', 0.01)],
+    # --- Systematic (correlated) uncertainties ---
+    'temperature_uc_sys':         [('temp_uc_tcor', 1.0)],
+    'relative_humidity_uc_sys':   [('rh_uc_tcor', 0.01)],
+    'wvmr_uc_sys':                [('wvmr_vol_uc_tcor', 1.0)],
+    'geopot_uc_sys':              [('alt_gph_uc_tcor', 1.0)],
 }
-
-# Columns that are set to NULL, on the same levels, whenever the RH value is set
-# to NULL by the plausibility checks (they are derived from RH): water vapour
-# mixing ratio (value, systematic and total uncertainty) and RH effective
-# vertical resolution.
-QC_RH_DEPENDENT_COLUMNS = (
-    'wvmr', 'wvmr_vol', 'wvmr_vol_uc_tcor', 'wvmr_vol_uc',
-    'res_rh', 'rh_res',
-)
 
 # Levels above this altitude (m) are not checked (same default as qc_pipeline).
 # Use None to check every level.
@@ -188,18 +205,15 @@ QC_REPORT_COLUMNS = [
     'observation_value', 'implausibility_reason',
 ]
 
-# Variables that are set to NULL because they are derived from RH (see
-# QC_RH_DEPENDENT_COLUMNS) and are therefore reported too, whenever RH is set
-# to NULL. identifier -> DB columns [(column, scale to report units)], first
-# not-NULL wins; None = the variable is also checked by the QC on its own
-# (identifier = name in QC_INPUT_COLUMNS), so its values come from the QC input
-# and its own reasons are merged with the "derived from RH" one in a single row.
-# The name written in 'observed_variable_name' is always ALL_CDM_LABELS[code].
-# Their uncertainty columns are set to NULL on the same row (they are not
-# reported separately).
+# Variables that are set to NULL because they are derived from RH and are
+# therefore reported too whenever RH is set to NULL. Both `wvmr` and
+# `rh_resolution` are also checked by the QC on their own
+# (dep_vars=["relative_humidity"] in qc_pipeline.PLAUSIBILITY_RULES), so the
+# value is `None` here: their rejected mask already includes the RH-rejected
+# levels, and their own reasons are merged with the "derived from RH" one.
 QC_RH_DEPENDENT_REPORT_VARIABLES = {
-    'wvmr':             None,
-    'res_rh':           [('res_rh', 1.0), ('rh_res', 1.0)],
+    'wvmr':          None,
+    'rh_resolution': None,
 }
 
 # ── stage timer ───────────────────────────────────────────────────────────────
@@ -783,9 +797,10 @@ def write_implausibility_report(df_merged: pd.DataFrame, qc_df: pd.DataFrame,
 
     Must be called BEFORE the values are set to NULL in df_merged. The values
     come from qc_df (a separate copy) or are read from df_merged before any
-    change. observation_value is expressed in the units of
-    qc_pipeline.PLAUSIBILITY_REPORT_UNITS (the same used in the reason text),
-    not in the units of the NetCDF file; z_coordinate is the altitude in m.
+    change. observation_value is expressed in the units of the per-variable
+    `report_scale` / `report_unit` fields of qc_pipeline.PLAUSIBILITY_RULES
+    (the same used in the reason text), not in the units of the NetCDF file;
+    z_coordinate is the altitude in m.
     Levels whose value was already NULL are not reported.
     """
     no_reason = 'implausible (reason not available)'
@@ -837,9 +852,11 @@ def write_implausibility_report(df_merged: pd.DataFrame, qc_df: pd.DataFrame,
         }))
 
     no_own_mask = np.zeros(n_levels, dtype=bool)
-    # 1) variables checked by the QC (plus, for wvmr, the RH-derived nulling)
-    for var in qc_pipeline.PLAUSIBILITY_LIMITS:
-        scale = qc_pipeline.PLAUSIBILITY_REPORT_UNITS.get(var, (1.0, ''))[0]
+    # 1) variables checked by the QC (plus, for wvmr / rh_resolution, the
+    #    RH-derived nulling)
+    for var in qc_pipeline.PLAUSIBILITY_RULES:
+        rule = qc_pipeline.PLAUSIBILITY_RULES[var]
+        scale = rule.get('report_scale', 1.0)
         add_rows(_cdm_code_for_columns(QC_INPUT_COLUMNS[var]),
                  qc_df[var].to_numpy() * scale, level_mask(var), reasons[var],
                  derived_from_rh=var in QC_RH_DEPENDENT_REPORT_VARIABLES)
@@ -950,7 +967,7 @@ def apply_plausibility_qc(df_merged: pd.DataFrame,
 
     # 3) replace implausible values with NULL
     print(f"  Plausibility QC ({qc_df['profile_id'].nunique():,} profiles):")
-    for var in qc_pipeline.PLAUSIBILITY_LIMITS:
+    for var in qc_pipeline.PLAUSIBILITY_RULES:
         mask = implausible[var].to_numpy()
         n_valid = int(qc_df[var].notna().sum())
         n_rejected = int(mask.sum())
@@ -958,8 +975,9 @@ def apply_plausibility_qc(df_merged: pd.DataFrame,
         print(f"    {var:<18}: {n_rejected:>10,} / {n_valid:>12,} values set to NULL"
               f" ({100 * fraction:.3f}%)")
         if fraction > QC_REJECTION_WARN_FRACTION:
-            print(f"    WARNING: more than {100 * QC_REJECTION_WARN_FRACTION:.0f}% of "
-                  f"'{var}' rejected - check the units in QC_INPUT_COLUMNS.")
+            print(f"    WARNING: more than "
+                  f"{100 * QC_REJECTION_WARN_FRACTION:.0f}% of '{var}' rejected - "
+                  f"check the units in QC_INPUT_COLUMNS.")
         # Levels whose TOTAL uncertainty is outside the plausible range: value,
         # random, systematic and total uncertainty are all set to NULL.
         if var in implausible_uncertainty.columns:
@@ -972,12 +990,16 @@ def apply_plausibility_qc(df_merged: pd.DataFrame,
                   f"total uncertainty out of range")
         if n_rejected == 0 and n_uncertainty == 0:
             continue
+        # DB columns of the value and of all its uncertainties (random,
+        # systematic, total). `_uncertainty_columns` reads CDM_VARIABLES and
+        # returns every uncertainty column tied to the value column(s).
         value_columns = {c for c, _ in QC_INPUT_COLUMNS[var]}
         uncertainty_columns = _uncertainty_columns(value_columns)
         # Values rejected by any check.
         for column in value_columns:
             if column in df_merged.columns:
-                df_merged[column] = df_merged[column].mask(mask | uncertainty_mask)
+                df_merged[column] = df_merged[column].mask(
+                    mask | uncertainty_mask)
         # Uncertainties: always for the uncertainty-range rejections, for all
         # the rejections only if requested.
         uncertainty_columns_mask = (
@@ -988,16 +1010,6 @@ def apply_plausibility_qc(df_merged: pd.DataFrame,
                 if column in df_merged.columns:
                     df_merged[column] = df_merged[column].mask(
                         uncertainty_columns_mask)
-        # RH set to NULL -> the variables derived from RH are set to NULL too.
-        if var == 'relative_humidity':
-            rh_nulled_mask = mask | uncertainty_mask
-            n_dependent = int(rh_nulled_mask.sum())
-            for column in QC_RH_DEPENDENT_COLUMNS:
-                if column in df_merged.columns:
-                    df_merged[column] = df_merged[column].mask(rh_nulled_mask)
-            print(f"    {'':<18}  RH-dependent columns "
-                  f"({', '.join(QC_RH_DEPENDENT_COLUMNS)}) set to NULL on "
-                  f"{n_dependent:,} levels")
 
     print(f"  Plausibility QC time: {time.perf_counter() - start:.2f}s")
     return df_merged

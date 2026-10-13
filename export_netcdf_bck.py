@@ -149,7 +149,8 @@ QC_INPUT_COLUMNS = {
 
 # Columns that are set to NULL, on the same levels, whenever the RH value is set
 # to NULL by the plausibility checks (they are derived from RH): water vapour
-# mixing ratio (value, systematic and total uncertainty) and RH response time.
+# mixing ratio (value, systematic and total uncertainty) and RH effective
+# vertical resolution.
 QC_RH_DEPENDENT_COLUMNS = (
     'wvmr', 'wvmr_vol', 'wvmr_vol_uc_tcor', 'wvmr_vol_uc',
     'res_rh', 'rh_res',
@@ -170,6 +171,36 @@ QC_NULLIFY_UNCERTAINTIES = False
 # A warning is printed when more than this fraction of the values of a
 # variable is rejected in a month (usually a sign of a wrong unit).
 QC_REJECTION_WARN_FRACTION = 0.5
+
+# ── implausible-values report ─────────────────────────────────────────────────
+# Every value set to NULL by the plausibility QC is recorded, with the reason,
+# in a CSV. Each month writes its own part file (safe with --jobs > 1: workers
+# are separate processes) in <output_dir>/QC_REPORT_PARTS_DIRNAME/; at the end
+# of the run main() merges ALL the part files found there into
+# <output_dir>/QC_REPORT_FINAL_FILENAME. Months skipped because their NetCDF
+# already exists keep their part file from the earlier run, so the final CSV
+# always covers every month exported so far.
+QC_REPORT_PARTS_DIRNAME = 'implausible_values_by_month'
+QC_REPORT_FINAL_FILENAME = 'implausible_values.csv'
+QC_REPORT_COLUMNS = [
+    'primary_station_id', 'station_name', 'report_timestamp', 'sensor_id',
+    'observed_variable', 'observed_variable_name', 'z_coordinate',
+    'observation_value', 'implausibility_reason',
+]
+
+# Variables that are set to NULL because they are derived from RH (see
+# QC_RH_DEPENDENT_COLUMNS) and are therefore reported too, whenever RH is set
+# to NULL. identifier -> DB columns [(column, scale to report units)], first
+# not-NULL wins; None = the variable is also checked by the QC on its own
+# (identifier = name in QC_INPUT_COLUMNS), so its values come from the QC input
+# and its own reasons are merged with the "derived from RH" one in a single row.
+# The name written in 'observed_variable_name' is always ALL_CDM_LABELS[code].
+# Their uncertainty columns are set to NULL on the same row (they are not
+# reported separately).
+QC_RH_DEPENDENT_REPORT_VARIABLES = {
+    'wvmr':             None,
+    'res_rh':           [('res_rh', 1.0), ('rh_res', 1.0)],
+}
 
 # ── stage timer ───────────────────────────────────────────────────────────────
 # Lightweight wall-clock profiler. Usage:
@@ -713,15 +744,182 @@ def _uncertainty_columns(value_columns: set) -> list:
     return uc_columns
 
 
+def _implausibility_part_path(output_dir, year: int, month: int) -> Path:
+    return (Path(output_dir) / QC_REPORT_PARTS_DIRNAME
+            / f"implausible_values_{year:04d}_{month:02d}.csv")
+
+
+def _cdm_code_for_columns(columns) -> int:
+    """CDM code (observed_variable) of the CDM_VARIABLES entry that uses any of
+    the DB columns in `columns` [(column, scale), ...]."""
+    column_set = {c for c, _ in columns}
+    for entry in CDM_VARIABLES:
+        if entry[1] in column_set or entry[2] in column_set:
+            return int(entry[0])
+    raise KeyError(f"No CDM variable found for columns {sorted(column_set)}")
+
+
+def _string_column(df: pd.DataFrame, column_cf_1_4: str,
+                   column_cf_1_7: str) -> pd.Series:
+    """Same logic as the _str_col of build_cdm_long / build_cdm_dataframe."""
+    if column_cf_1_4 in df.columns and column_cf_1_7 in df.columns:
+        return df[column_cf_1_4].fillna(df[column_cf_1_7]).fillna('').astype(str)
+    return pd.Series('', index=df.index)
+
+
+def write_implausibility_report(df_merged: pd.DataFrame, qc_df: pd.DataFrame,
+                                implausible: pd.DataFrame,
+                                implausible_uncertainty: pd.DataFrame,
+                                reasons: dict, report_path: Path) -> int:
+    """
+    Write to `report_path` one CSV row for every value that the plausibility QC
+    sets to NULL (QC_REPORT_COLUMNS). Returns the number of rows written.
+
+    Two kinds of rows:
+      * values rejected by the plausibility checks (the reason says which);
+      * values derived from RH (QC_RH_DEPENDENT_REPORT_VARIABLES) that are set
+        to NULL because RH was rejected on the same level. If such a variable
+        (wvmr) is also rejected on its own, a single row holds both reasons.
+
+    Must be called BEFORE the values are set to NULL in df_merged. The values
+    come from qc_df (a separate copy) or are read from df_merged before any
+    change. observation_value is expressed in the units of
+    qc_pipeline.PLAUSIBILITY_REPORT_UNITS (the same used in the reason text),
+    not in the units of the NetCDF file; z_coordinate is the altitude in m.
+    Levels whose value was already NULL are not reported.
+    """
+    no_reason = 'implausible (reason not available)'
+    n_levels = len(qc_df)
+    z_coordinate = qc_df['height'].to_numpy()
+
+    def level_mask(var):
+        mask = implausible[var].to_numpy()
+        if var in implausible_uncertainty.columns:
+            mask = mask | implausible_uncertainty[var].to_numpy()
+        return mask
+
+    rh_mask = level_mask('relative_humidity')
+    rh_reasons = reasons['relative_humidity']
+    pieces = []
+
+    def add_rows(code, values, own_mask, own_reasons, derived_from_rh):
+        mask = own_mask | rh_mask if derived_from_rh else own_mask
+        rows = np.flatnonzero(mask & ~np.isnan(values))
+        if rows.size == 0:
+            return
+        texts = np.full(rows.size, '', dtype=object)
+        own_flag = own_mask[rows]
+        if own_flag.any():
+            if own_reasons is not None:
+                own_text = (own_reasons.reindex(rows).fillna(no_reason)
+                            .to_numpy(dtype=object))
+            else:
+                own_text = np.full(rows.size, no_reason, dtype=object)
+            texts[own_flag] = own_text[own_flag]
+        if derived_from_rh:
+            derived_flag = rh_mask[rows]
+            if derived_flag.any():
+                rh_text = (rh_reasons.reindex(rows[derived_flag])
+                           .fillna(no_reason).to_numpy(dtype=object))
+                derived_text = ('set to NULL because relative_humidity is '
+                                'implausible (' + rh_text + ')')
+                texts[derived_flag] = np.where(
+                    own_flag[derived_flag],
+                    texts[derived_flag] + '; ' + derived_text,
+                    derived_text)
+        pieces.append(pd.DataFrame({
+            'row': rows,                                  # position in df_merged
+            'observed_variable': code,
+            'observed_variable_name': ALL_CDM_LABELS[code],
+            'z_coordinate': z_coordinate[rows],
+            'observation_value': values[rows],
+            'implausibility_reason': texts,
+        }))
+
+    no_own_mask = np.zeros(n_levels, dtype=bool)
+    # 1) variables checked by the QC (plus, for wvmr, the RH-derived nulling)
+    for var in qc_pipeline.PLAUSIBILITY_LIMITS:
+        scale = qc_pipeline.PLAUSIBILITY_REPORT_UNITS.get(var, (1.0, ''))[0]
+        add_rows(_cdm_code_for_columns(QC_INPUT_COLUMNS[var]),
+                 qc_df[var].to_numpy() * scale, level_mask(var), reasons[var],
+                 derived_from_rh=var in QC_RH_DEPENDENT_REPORT_VARIABLES)
+    # 2) variables nulled only because they are derived from RH
+    for sources in QC_RH_DEPENDENT_REPORT_VARIABLES.values():
+        if sources is None:
+            continue
+        values = _qc_series(df_merged, sources).to_numpy(dtype=np.float64)
+        add_rows(_cdm_code_for_columns(sources), values,
+                 no_own_mask, None, derived_from_rh=True)
+
+    if pieces:
+        report = pd.concat(pieces, ignore_index=True)
+        subset = df_merged.iloc[report['row'].to_numpy()]    # reported levels only
+        report['primary_station_id'] = _string_column(
+            subset, 'g_general_sitecode', 'g_site_key').to_numpy()
+        report['station_name'] = _string_column(
+            subset, 'g_general_sitename', 'g_site_name').to_numpy()
+        report['sensor_id'] = _string_column(
+            subset, 'g_product_code', 'g_product_key').to_numpy()
+        report['report_timestamp'] = (
+            pd.to_datetime(subset['report_timestamp'], utc=True)
+            .dt.strftime('%Y-%m-%dT%H:%M:%SZ').to_numpy())
+        report = (report.sort_values(['report_timestamp', 'primary_station_id',
+                                      'observed_variable', 'row'])
+                  [QC_REPORT_COLUMNS])
+    else:
+        report = pd.DataFrame(columns=QC_REPORT_COLUMNS)
+
+    report_path = Path(report_path)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = report_path.with_name(report_path.name + '.tmp')
+    report.to_csv(tmp_path, index=False, float_format='%.9g', encoding='utf-8')
+    os.replace(tmp_path, report_path)                        # atomic
+    return len(report)
+
+
+def merge_implausibility_reports(output_dir):
+    """Concatenate the monthly part files into the final CSV. Returns
+    (path, n_rows), or None when there are no part files."""
+    parts = sorted((Path(output_dir) / QC_REPORT_PARTS_DIRNAME)
+                   .glob('implausible_values_*.csv'))
+    if not parts:
+        return None
+    final_path = Path(output_dir) / QC_REPORT_FINAL_FILENAME
+    tmp_path = final_path.with_name(final_path.name + '.tmp')
+    n_rows = 0
+    with open(tmp_path, 'w', encoding='utf-8', newline='') as out:
+        out.write(','.join(QC_REPORT_COLUMNS) + '\n')
+        for part in parts:                                   # YYYY_MM -> chronological
+            with open(part, 'r', encoding='utf-8', newline='') as fh:
+                header = fh.readline().rstrip('\r\n')
+                if header != ','.join(QC_REPORT_COLUMNS):
+                    out.close()
+                    tmp_path.unlink()
+                    raise RuntimeError(
+                        f"{part} has a different header ({header}) than the "
+                        f"current report columns: it was written by an older "
+                        f"version of the script. Delete it and re-export "
+                        f"that month.")
+                for line in fh:
+                    out.write(line)
+                    n_rows += 1
+    os.replace(tmp_path, final_path)
+    return final_path, n_rows
+
+
 def apply_plausibility_qc(df_merged: pd.DataFrame,
                           nullify_uncertainties: bool = QC_NULLIFY_UNCERTAINTIES,
-                          max_altitude_m=QC_MAX_ALTITUDE_M) -> pd.DataFrame:
+                          max_altitude_m=QC_MAX_ALTITUDE_M,
+                          report_path: Optional[Path] = None) -> pd.DataFrame:
     """
     Replace implausible values with NULL, level by level, using qc_pipeline.
 
     df_merged holds all the soundings of a month stacked together; each
     sounding is identified by g_product_id and is evaluated on its own by
     qc_pipeline.flag_implausible_levels. Must be called BEFORE UNIT_TRANSFORMS.
+
+    If report_path is given, every value set to NULL is also written, with the
+    reason, to that CSV (see write_implausibility_report).
     """
     start = time.perf_counter()
 
@@ -736,10 +934,19 @@ def apply_plausibility_qc(df_merged: pd.DataFrame,
 
     # 2) level-by-level flags, profile by profile
     with TIMER('plausibility_qc/flag_implausible_levels'):
-        implausible, implausible_uncertainty = (
-            qc_pipeline.flag_implausible_levels(
-                qc_df, profile_id_column='profile_id',
-                max_altitude_m=max_altitude_m))
+        flags = qc_pipeline.flag_implausible_levels(
+            qc_df, profile_id_column='profile_id',
+            max_altitude_m=max_altitude_m,
+            return_reasons=report_path is not None)
+        implausible, implausible_uncertainty = flags[:2]
+
+    # 2b) record what is about to be set to NULL, and why
+    if report_path is not None:
+        with TIMER('plausibility_qc/implausibility_report'):
+            n_reported = write_implausibility_report(
+                df_merged, qc_df, implausible, implausible_uncertainty,
+                flags[2], report_path)
+        print(f"  Implausible values report: {n_reported:,} rows -> {report_path}")
 
     # 3) replace implausible values with NULL
     print(f"  Plausibility QC ({qc_df['profile_id'].nunique():,} profiles):")
@@ -1579,7 +1786,9 @@ def export_month(conn_params, year, month, output_dir,
     # ── plausibility QC (must run BEFORE the unit transforms) ─────────────────
     if apply_qc:
         with TIMER('plausibility_qc'):
-            df_merged = apply_plausibility_qc(df_merged)
+            df_merged = apply_plausibility_qc(
+                df_merged,
+                report_path=_implausibility_part_path(output_dir, year, month))
 
     with TIMER('unit_transforms'):
         for col, (scale, offset) in UNIT_TRANSFORMS.items():
@@ -1972,6 +2181,12 @@ def main():
         raise
 
     net.stop()
+
+    if not args.skip_qc:
+        merged_report = merge_implausibility_reports(output_dir)
+        if merged_report:
+            emit(f"\nImplausible values report: {merged_report[0]} "
+                 f"({merged_report[1]:,} rows)")
 
     print('\nDone.')
     if net.summary():

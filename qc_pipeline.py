@@ -22,150 +22,231 @@ import xarray as xr
 COMPLETENESS_THR_HIGH = 0.10
 COMPLETENESS_THR_GOOD = 0.20
 CTH_TEMPERATURE_THR_K = 268.15
+
 # ==========================================
 # NETCDF PRODUCT-SPECIFIC NAMES AND UNITS
 # ==========================================
-# Global attributes that may contain the tropopause height, in order of
-# preference (depending on the product).
 TROPOPAUSE_ATTRIBUTE_CANDIDATES = (
     "g.Measurement.TropopauseGeopotHeight",
     "g.Ascent.TropopauseHeight",
 )
-# Recognised values (lower case) of the `units` attribute for WVMR. The
-# pipeline works in ppmv; a dimensionless mixing ratio (mol/mol) is
-# multiplied by 1e6.
 WVMR_PPMV_UNITS = {"ppmv"}
 WVMR_FRACTION_UNITS = {"1", "fraction"}
+
 # ==========================================
 # PLAUSIBILITY THRESHOLDS
-# (physical ranges and maximum accepted
-# uncertainties used by check_plausibility
-# for RH and pressure)
 # ==========================================
-# Relative humidity is stored in the NetCDF files either in percent (0-100)
-# or as a fraction (0-1), depending on the product. It is always converted to
-# a fraction (0.0-1.0) right after reading, according to the `units`
-# attribute (see load_netcdf_profile), consistently with the rest of the
-# pipeline (see e.g. check_cloud_base, which uses rh_threshold=0.99). The
-# thresholds below are therefore expressed as fractions (0% / 100% / 15% RH).
-# Physical validity range and maximum accepted total uncertainty for RH,
-# used by check_plausibility().
-# Values of the NetCDF `units` attribute recognised for RH (lower case).
+# RH is stored either in percent (0-100) or as a fraction (0-1), depending on
+# the product. It is always converted to a fraction right after reading,
+# according to the `units` attribute (see load_netcdf_profile). All thresholds
+# below are therefore expressed as fractions.
 RH_PERCENT_UNITS = {"percent", "%"}
 RH_FRACTION_UNITS = {"1", "fraction"}
-RH_MIN_FRACTION = 0.0  # 0 % RH
-RH_MAX_FRACTION = 1.0  # 100 % RH
-RH_UNCERTAINTY_MAX_FRACTION = 0.15  # 15 % RH
+RH_MIN_FRACTION = 0.0           # 0 % RH
+RH_MAX_FRACTION = 1.0           # 100 % RH
 
-# Pressure is expressed in hPa, as elsewhere in the pipeline.
-# Physical validity range and maximum accepted total uncertainty for
-# pressure, used by check_plausibility().
+# Pressure is expressed in hPa.
 PRESSURE_MIN_HPA = 1.0
 PRESSURE_MAX_HPA = 1080.0
-PRESSURE_UNCERTAINTY_MAX_HPA = 3.0
 
 # Plausibility checks are evaluated only on levels up to this altitude (m).
 # Use None to evaluate every level of the profile.
 PLAUSIBILITY_MAX_ALTITUDE_M = 47000.0
 
-# Physical validity range (lower, upper) of each checked variable.
-PLAUSIBILITY_LIMITS = {
-    "temperature": (178.15, 323.15),
-    "relative_humidity": (RH_MIN_FRACTION, RH_MAX_FRACTION),
-    "wind_speed": (0.0, 180.0),
-    "wind_direction": (0.0, 360.0),
-    "pressure": (PRESSURE_MIN_HPA, PRESSURE_MAX_HPA),
-    "wvmr": (0.0, 50000.0),
-    "frost_point": (150.0, 330.0),
-    "shortwave_radiation": (0.0, 1600.0),
-    "vertical_speed": (-10.0, 30.0),
+# ==========================================
+# PLAUSIBILITY RULES
+# ==========================================
+# For every variable:
+#   val_col         : column holding the value
+#   unc_total_col   : column holding the total uncertainty (or None)
+#   other_unc_cols  : additional uncertainty columns (random/systematic)
+#                     to be nulled together with the value
+#   unc_range       : (lo, hi) plausible range of the total uncertainty,
+#                     both bounds included; None to skip the check
+#   check_range     : (lo, hi) physical plausibility range of the value,
+#                     evaluated together with the total uncertainty as
+#                     [value - unc, value + unc]; None to skip the check
+#   dep_vars        : list of parent variables; if a parent is invalid the
+#                     variable becomes invalid too (dependencies are
+#                     propagated until stability)
+#   report_scale    : scale factor used when writing reason texts
+#   report_unit     : unit label used when writing reason texts
+PLAUSIBILITY_RULES = {
+    "temperature": {
+        "val_col": "temperature",
+        "unc_total_col": "temperature_uc_tot",
+        "other_unc_cols": ["temperature_uc_std", "temperature_uc_sys"],
+        "unc_range": (0.0, 10.0),
+        "check_range": (178.15, 323.15),
+        "dep_vars": [],
+        "report_scale": 1.0,
+        "report_unit": "K",
+    },
+    "relative_humidity": {
+        "val_col": "relative_humidity",
+        "unc_total_col": "relative_humidity_uc_tot",
+        "other_unc_cols": ["relative_humidity_uc_std",
+                           "relative_humidity_uc_sys"],
+        "unc_range": (0.0, 1.0),
+        "check_range": (RH_MIN_FRACTION, RH_MAX_FRACTION),
+        "dep_vars": [],
+        "report_scale": 100.0,
+        "report_unit": "%",
+    },
+    "wind_speed": {
+        "val_col": "wind_speed",
+        "unc_total_col": "wind_speed_uc_tot",
+        "other_unc_cols": [],
+        "unc_range": (0.0, 90.0),
+        "check_range": (0.0, 180.0),
+        "dep_vars": [],
+        "report_scale": 1.0,
+        "report_unit": "m s-1",
+    },
+    "wind_direction": {
+        "val_col": "wind_direction",
+        "unc_total_col": "wind_direction_uc_tot",
+        "other_unc_cols": [],
+        "unc_range": (0.0, 90.0),
+        "check_range": (0.0, 360.0),
+        "dep_vars": [],
+        "report_scale": 1.0,
+        "report_unit": "degree",
+    },
+    "u": {
+        "val_col": "u",
+        "unc_total_col": "u_uc_tot",
+        "other_unc_cols": [],
+        "unc_range": (0.0, 90.0),
+        "check_range": (0.0, 180.0),
+        "dep_vars": ["wind_speed"],
+        "report_scale": 1.0,
+        "report_unit": "m s-1",
+    },
+    "v": {
+        "val_col": "v",
+        "unc_total_col": "v_uc_tot",
+        "other_unc_cols": [],
+        "unc_range": (0.0, 90.0),
+        "check_range": (0.0, 180.0),
+        "dep_vars": ["wind_speed"],
+        "report_scale": 1.0,
+        "report_unit": "m s-1",
+    },
+    "pressure": {
+        "val_col": "pressure",
+        "unc_total_col": "pressure_uc_tot",
+        "other_unc_cols": [],
+        "unc_range": (0.0, 10.0),
+        "check_range": (PRESSURE_MIN_HPA, PRESSURE_MAX_HPA),
+        "dep_vars": [],
+        "report_scale": 1.0,
+        "report_unit": "hPa",
+    },
+    "geopot": {
+        "val_col": "geopot",
+        "unc_total_col": "geopot_uc_tot",
+        "other_unc_cols": ["geopot_uc_sys"],
+        "unc_range": None,
+        "check_range": None,
+        "dep_vars": ["pressure"],
+        "report_scale": 1.0,
+        "report_unit": "m",
+    },
+    "wvmr": {
+        "val_col": "wvmr",
+        "unc_total_col": "wvmr_uc_tot",
+        "other_unc_cols": ["wvmr_uc_sys"],
+        "unc_range": (0.0, 12500.0),
+        "check_range": (0.0, 50000.0),
+        "dep_vars": ["relative_humidity"],
+        "report_scale": 1.0,
+        "report_unit": "ppmv",
+    },
+    "frost_point": {
+        "val_col": "frost_point",
+        "unc_total_col": "frost_point_uc_tot",
+        "other_unc_cols": [],
+        "unc_range": (0.0, 10.0),
+        "check_range": (150.0, 330.0),
+        "dep_vars": [],
+        "report_scale": 1.0,
+        "report_unit": "K",
+    },
+    "shortwave_radiation": {
+        "val_col": "shortwave_radiation",
+        "unc_total_col": "shortwave_radiation_uc_tot",
+        "other_unc_cols": [],
+        "unc_range": (0.0, 400.0),
+        "check_range": (0.0, 1600.0),
+        "dep_vars": [],
+        "report_scale": 1.0,
+        "report_unit": "W m-2",
+    },
+    "vertical_speed": {
+        "val_col": "vertical_speed",
+        "unc_total_col": "vertical_speed_uc_tot",
+        "other_unc_cols": [],
+        "unc_range": (0.0, 10.0),
+        "check_range": (-10.0, 30.0),
+        "dep_vars": [],
+        "report_scale": 1.0,
+        "report_unit": "m s-1",
+    },
+    "height": {
+        "val_col": "height",
+        "unc_total_col": "height_uc_tot",
+        "other_unc_cols": [],
+        "unc_range": (0.0, 1000.0),
+        "check_range": (-10.0, 47000.0),
+        "dep_vars": [],
+        "report_scale": 1.0,
+        "report_unit": "m",
+    },
+    # "Air relative humidity effective vertical resolution": stored either
+    # in `res_rh` (CF-1.4 files) or in `rh_res` (CF-1.7 files). Only one of
+    # the two columns is present at a time; the loader picks the first
+    # available. It has no own check: it only follows RH through `dep_vars`.
+    "rh_resolution": {
+        "val_col": "rh_resolution",
+        "unc_total_col": None,
+        "other_unc_cols": [],
+        "unc_range": None,
+        "check_range": None,
+        "dep_vars": ["relative_humidity"],
+        "report_scale": 1.0,
+        "report_unit": "s",
+    },
 }
 
-# (scale, unit label) used when the plausibility reasons are written (see
-# evaluate_level_plausibility(return_reasons=True)) and when the rejected values
-# are reported: pipeline value * scale = value shown in the report. RH is
-# handled as a fraction inside the pipeline but is reported in percent.
-PLAUSIBILITY_REPORT_UNITS = {
-    "temperature": (1.0, "K"),
-    "relative_humidity": (100.0, "%"),
-    "wind_speed": (1.0, "m s-1"),
-    "wind_direction": (1.0, "degree"),
-    "pressure": (1.0, "hPa"),
-    "wvmr": (1.0, "ppmv"),
-    "frost_point": (1.0, "K"),
-    "shortwave_radiation": (1.0, "W m-2"),
-    "vertical_speed": (1.0, "m s-1"),
-}
-
-# Plausibility range (lower, upper), BOTH INCLUDED, of the TOTAL uncertainty of
-# each variable, in the units used by this pipeline.
-TEMPERATURE_UNCERTAINTY_RANGE_K = (0.0, 10.0)  # 0 K - 10 K
-RH_UNCERTAINTY_RANGE_FRACTION = (0.0, 1.0)  # 0 % - 100 % RH
-PRESSURE_UNCERTAINTY_RANGE_HPA = (0.0, 10.0)  # 0 Pa - 1000 Pa
-
-# variable -> (total uncertainty column, (lower, upper) plausible range).
-# If the total uncertainty of a level is outside the range, the level is
-# rejected for that variable (see evaluate_level_plausibility) and, when the
-# data is exported, the value and its random, systematic and total
-# uncertainties are set to NULL.
-# To extend the check to other variables, add an entry.
-PLAUSIBILITY_UNCERTAINTY_RANGES = {
-    "temperature": (
-        "temperature_uc_tot", TEMPERATURE_UNCERTAINTY_RANGE_K),
-    "relative_humidity": (
-        "relative_humidity_uc_tot", RH_UNCERTAINTY_RANGE_FRACTION),
-    "pressure": (
-        "pressure_uc_tot", PRESSURE_UNCERTAINTY_RANGE_HPA),
-}
-
-# variable -> (total uncertainty column, maximum accepted uncertainty).
-# To extend the uncertainty-based check to other variables, add an entry.
-PLAUSIBILITY_UNCERTAINTY_CHECKS = {
-    "relative_humidity": (
-        "relative_humidity_uc_tot", RH_UNCERTAINTY_MAX_FRACTION),
-    "pressure": ("pressure_uc_tot", PRESSURE_UNCERTAINTY_MAX_HPA),
-}
 # ==========================================
 # INPUT/OUTPUT CONFIGURATION
 # ==========================================
-# INPUT_DIRECTORY = "/Data/GRUAN/backup/gfa/archive/prodata/RS41-GDP_001/POT/POT-RS-02/2025"
-INPUT_DIRECTORY = "/Data/GRUAN_TEST/ema"
-# INPUT_DIRECTORY = "/Users/emanuele/Data/GRUAN/EUMETRAVES"
-JAR_FILE_PATTERN = "*.jar"  # Glob pattern used to select the compressed archives within INPUT_DIRECTORY
-OUTPUT_LOG_PATH = "qc_log.csv"  # Path of the resulting QC log CSV file
+INPUT_DIRECTORY = "/Data/GRUAN/backup/gfa/archive/prodata/RS41-GDP_001/POT/POT-RS-01/2025"
+JAR_FILE_PATTERN = "*.jar"
+OUTPUT_LOG_PATH = "qc_log.csv"
 logger = logging.getLogger(__name__)
 
 
-def find_consecutive_layers(
-        rh_array,
-        height_array,
-        pressure_array,
-        rh_threshold,
-        min_layers=3,
-        direction="upward",
-        temp_array=None,
-        temp_threshold=None,
-):
+# ==========================================
+# CLOUD DETECTION (CBH / CTH)
+# ==========================================
+def find_consecutive_layers(rh_array, height_array, pressure_array,
+                            rh_threshold, min_layers=3, direction="upward",
+                            temp_array=None, temp_threshold=None):
     n = len(rh_array)
     condition = rh_array >= rh_threshold
     if temp_array is not None and temp_threshold is not None:
         condition = condition & (temp_array <= temp_threshold)
-    if direction == "upward":
-        indices = range(n)
-    else:
-        indices = range(n - 1, -1, -1)
+    indices = range(n) if direction == "upward" else range(n - 1, -1, -1)
     consecutive_count = 0
     for i in indices:
         if condition[i]:
             consecutive_count += 1
             if consecutive_count >= min_layers:
                 target_idx = i - min_layers + 1 if direction == "upward" else i
-                return {
-                    "index": target_idx,
-                    "height": height_array[target_idx],
-                    "pressure": pressure_array[target_idx],
-                    "flag": True,
-                }
+                return {"index": target_idx, "height": height_array[target_idx],
+                        "pressure": pressure_array[target_idx], "flag": True}
         else:
             consecutive_count = 0
     return {"index": np.nan, "height": np.nan, "pressure": np.nan,
@@ -174,18 +255,12 @@ def find_consecutive_layers(
 
 def check_cloud_base(rh, height, pressure):
     """CBH: first level with RH >= 0.99 for 3 consecutive levels."""
-    return find_consecutive_layers(
-        rh, height, pressure, rh_threshold=0.99, min_layers=3,
-        direction="upward"
-    )
+    return find_consecutive_layers(rh, height, pressure, rh_threshold=0.99,
+                                   min_layers=3, direction="upward")
 
 
 def rh_over_ice(temp_k, rh_w):
-    """
-    Converts RH with respect to water into RH with respect to ice
-    for temperatures below 273.15 K.
-    RH is expressed as a fraction (0-1).
-    """
+    """Converts RH w.r.t. water into RH w.r.t. ice for T < 273.15 K (fraction)."""
     temp_c = temp_k - 273.15
     ew = 6.112 * np.exp((17.67 * temp_c) / (temp_c + 243.5))
     ei = 6.112 * np.exp((22.46 * temp_c) / (temp_c + 272.62))
@@ -194,77 +269,27 @@ def rh_over_ice(temp_k, rh_w):
 
 def zhang_cold_cloud_layers(rh, height, temperature,
                             temp_max_k=CTH_TEMPERATURE_THR_K):
-    """
-    Zhang cold-cloud detection.
-    Height is in metres MSL.
-    The algorithm is applied only above 2 km AGL
-    and only to cold clouds with T <= -5 degC.
-    Altitude bands:
-      2-6 km
-      6-12 km
-      >12 km
-    """
+    """Zhang cold-cloud detection (applied only above 2 km AGL)."""
     valid = ~np.isnan(height) & ~np.isnan(temperature) & ~np.isnan(rh)
     if np.sum(valid) < 3:
         return []
     alt_msl = height[valid]
     temp_k = temperature[valid]
     rh_w = rh[valid]
-    # AGL in metres
     alt_agl = alt_msl - alt_msl[0]
-    # km
     alt_km = alt_agl / 1000.0
-    # RH with respect to ice
     rh_calc = rh_over_ice(temp_k, rh_w)
-    # --------------------------------------------------
-    # Zhang thresholds
-    # --------------------------------------------------
-    #
-    # 0-2 km is deliberately excluded.
-    #
-    # 2-6 km:
-    #   min RH = 0.90
-    #   max RH = 0.93
-    #   intermediate RH = 0.80
-    #
-    # 6-12 km:
-    #   min RH = 0.88
-    #   max RH = 0.90
-    #   intermediate RH = 0.75
-    #
-    # >12 km:
-    #   min RH = 0.80
-    #   max RH = 0.70
-    #   intermediate RH = 0.70
-    #
-    # --------------------------------------------------
     min_rh = np.select(
         [(alt_km >= 2) & (alt_km < 6), (alt_km >= 6) & (alt_km <= 12),
-         alt_km > 12],
-        [0.90, 0.88, 0.80],
-        default=np.nan,
-    )
+         alt_km > 12], [0.90, 0.88, 0.80], default=np.nan)
     max_rh = np.select(
         [(alt_km >= 2) & (alt_km < 6), (alt_km >= 6) & (alt_km <= 12),
-         alt_km > 12],
-        [0.93, 0.90, 0.70],
-        default=np.nan,
-    )
+         alt_km > 12], [0.93, 0.90, 0.70], default=np.nan)
     inter_rh = np.select(
         [(alt_km >= 2) & (alt_km < 6), (alt_km >= 6) & (alt_km <= 12),
-         alt_km > 12],
-        [0.80, 0.75, 0.70],
-        default=np.nan,
-    )
-    # --------------------------------------------------
-    # Only cold clouds below -5 C
-    # --------------------------------------------------
-    is_moist = (
-            (alt_km >= 2.0)
-            & ~np.isnan(min_rh)
-            & (rh_calc >= min_rh)
-            & (temp_k <= temp_max_k)
-    )
+         alt_km > 12], [0.80, 0.75, 0.70], default=np.nan)
+    is_moist = ((alt_km >= 2.0) & ~np.isnan(min_rh)
+                & (rh_calc >= min_rh) & (temp_k <= temp_max_k))
     diffs = np.diff(is_moist.astype(int))
     starts = np.where(diffs == 1)[0] + 1
     ends = np.where(diffs == -1)[0]
@@ -279,35 +304,26 @@ def zhang_cold_cloud_layers(rh, height, temperature,
             continue
         base_agl = alt_agl[s]
         top_agl = alt_agl[e]
-        sub_rh = rh_calc[s: e + 1]
-        max_rh_layer = np.max(sub_rh)
+        max_rh_layer = np.max(rh_calc[s: e + 1])
         req_max_rh = np.nanmax(max_rh[s: e + 1])
         if max_rh_layer >= req_max_rh:
-            candidate_layers.append(
-                {
-                    "start_idx": s,
-                    "end_idx": e,
-                    "base_agl": base_agl,
-                    "top_agl": top_agl,
-                    "base_msl": alt_msl[s],
-                    "top_msl": alt_msl[e],
-                    "thickness": top_agl - base_agl,
-                    "mean_temp_c": mean_temp_k - 273.15,
-                    "max_rh_i": max_rh_layer,
-                }
-            )
+            candidate_layers.append({
+                "start_idx": s, "end_idx": e,
+                "base_agl": base_agl, "top_agl": top_agl,
+                "base_msl": alt_msl[s], "top_msl": alt_msl[e],
+                "thickness": top_agl - base_agl,
+                "mean_temp_c": mean_temp_k - 273.15,
+                "max_rh_i": max_rh_layer,
+            })
     if not candidate_layers:
         return []
-    # --------------------------------------------------
-    # Merge adjacent/inter-saturated layers
-    # --------------------------------------------------
     merged_layers = []
     curr = candidate_layers[0]
     for nxt in candidate_layers[1:]:
         gap_dist = nxt["base_agl"] - curr["top_agl"]
         gap_rh = rh_calc[curr["end_idx"]: nxt["start_idx"] + 1]
         gap_inter_rh = np.nanmean(
-            inter_rh[curr["end_idx"]: nxt["start_idx"] + 1])
+            inter_rh[curr["end_idx"]:nxt["start_idx"] + 1])
         min_rh_gap = np.nanmin(gap_rh) if len(gap_rh) > 0 else 0
         if gap_dist < 300 or min_rh_gap >= gap_inter_rh:
             curr["end_idx"] = nxt["end_idx"]
@@ -315,58 +331,48 @@ def zhang_cold_cloud_layers(rh, height, temperature,
             curr["top_msl"] = nxt["top_msl"]
             curr["thickness"] = curr["top_agl"] - curr["base_agl"]
             curr["max_rh_i"] = max(curr["max_rh_i"], nxt["max_rh_i"])
-            curr["mean_temp_c"] = (
-                    np.mean(temp_k[curr["start_idx"]: curr[
-                                                          "end_idx"] + 1]) - 273.15
-            )
+            curr["mean_temp_c"] = (np.mean(
+                temp_k[curr["start_idx"]:curr["end_idx"] + 1]) - 273.15)
         else:
             merged_layers.append(curr)
             curr = nxt
     merged_layers.append(curr)
-    # Minimum thickness 100 m
     return [layer for layer in merged_layers if layer["thickness"] >= 100]
 
 
 def check_cloud_top(rh, height, pressure, temperature):
-    layers = zhang_cold_cloud_layers(
-        rh, height, temperature, temp_max_k=CTH_TEMPERATURE_THR_K
-    )
+    layers = zhang_cold_cloud_layers(rh, height, temperature,
+                                     temp_max_k=CTH_TEMPERATURE_THR_K)
     if not layers:
         return {"index": np.nan, "height": np.nan, "pressure": np.nan,
                 "flag": False}
     top_layer = max(layers, key=lambda l: l["top_msl"])
     valid = ~np.isnan(height) & ~np.isnan(temperature) & ~np.isnan(rh)
     valid_pressure = pressure[valid]
-    top_pressure = (
-        valid_pressure[top_layer["end_idx"]]
-        if top_layer["end_idx"] < len(valid_pressure)
-        else np.nan
-    )
-    return {
-        "index": top_layer["end_idx"],
-        "height": top_layer["top_msl"],
-        "pressure": top_pressure,
-        "flag": True,
-    }
+    top_pressure = (valid_pressure[top_layer["end_idx"]]
+                    if top_layer["end_idx"] < len(valid_pressure) else np.nan)
+    return {"index": top_layer["end_idx"], "height": top_layer["top_msl"],
+            "pressure": top_pressure, "flag": True}
 
 
 def check_pressure_flags(pressure):
     pmin = np.nanmin(pressure) if not np.all(np.isnan(pressure)) else np.nan
     if np.isnan(pmin):
         return pmin, False, False
-    flag_p10 = bool(pmin <= 10.0)
-    flag_p5 = bool(pmin <= 5.0)
-    return pmin, flag_p10, flag_p5
+    return pmin, bool(pmin <= 10.0), bool(pmin <= 5.0)
 
 
+# ==========================================
+# PLAUSIBILITY
+# ==========================================
 def _compose_reasons(n_levels, evaluated_levels, parts):
     """
-    Builds the text of the reasons of one variable of one profile.
+    Builds the text of the reasons for one variable of one profile.
 
-    `parts` is a list of (boolean mask over the EVALUATED levels, text). The
-    result is an object array with one item per level of the profile ("" =
-    no reason, several reasons are joined with "; "), or None if no level has
-    any reason.
+    `parts` is a list of (boolean mask over the EVALUATED levels, text).
+    Returns an object array with one item per level of the profile
+    ("" = no reason; several reasons are joined with "; "), or None if no
+    level has any reason.
     """
     reason_array = None
     for mask, text in parts:
@@ -377,281 +383,300 @@ def _compose_reasons(n_levels, evaluated_levels, parts):
         full_length = np.zeros(n_levels, dtype=bool)
         full_length[evaluated_levels] = mask
         current = reason_array[full_length]
-        reason_array[full_length] = np.where(
-            current == "", text, current + "; " + text)
+        reason_array[full_length] = np.where(current == "", text,
+                                             current + "; " + text)
     return reason_array
 
 
 def evaluate_level_plausibility(profile_data,
                                 max_altitude_m=PLAUSIBILITY_MAX_ALTITUDE_M,
-                                return_reasons=False):
+                                return_reasons=False,
+                                rules=None):
     """
     Level-by-level plausibility evaluation of a SINGLE profile.
 
-    `profile_data` is a DataFrame holding the levels of one profile, with the
-    columns `height`, the variables listed in PLAUSIBILITY_LIMITS and the
-    uncertainty columns listed in PLAUSIBILITY_UNCERTAINTY_CHECKS and
-    PLAUSIBILITY_UNCERTAINTY_RANGES. Only levels up to `max_altitude_m` are
-    evaluated (None = all levels); levels with an unknown height are never
+    `profile_data` is a DataFrame holding the levels of one profile with the
+    columns `height`, the checked variables and their uncertainty columns
+    (see PLAUSIBILITY_RULES). Only levels up to `max_altitude_m` are
+    evaluated (None = all levels); levels with unknown height are never
     evaluated.
 
-    Returns a tuple (evaluated_levels, rejected, uncertainty_rejected):
-      - evaluated_levels: boolean array (one item per level of the profile),
-        True for the levels that were evaluated;
-      - rejected: dict {variable: boolean array | None}. The array has one
-        item per level of the profile and is True where the level is
-        rejected (never True for levels that were not evaluated). None means
-        that the variable could not be evaluated (missing column, error, or
-        no valid data at all);
-      - uncertainty_rejected: dict {variable: boolean array | None} with one
-        entry for each variable of PLAUSIBILITY_UNCERTAINTY_RANGES. The array
-        is True where the TOTAL UNCERTAINTY of the level is outside its
-        plausible range (see "Total uncertainty range check" below). These
-        levels are also True in `rejected` (unless the variable has no valid
-        data at all, in which case `rejected[variable]` is None). The caller
-        must set to NULL, for these levels, the value of the variable and its
-        random, systematic and total uncertainties. None means that the
-        check could not be performed (uncertainty column missing).
+    Returns (evaluated_levels, rejected, uncertainty_rejected):
+      - evaluated_levels    : boolean array, True for evaluated levels;
+      - rejected            : {variable: boolean array | None}; True where
+                              the level is rejected. None = variable could
+                              not be evaluated (missing column, error, no
+                              valid data);
+      - uncertainty_rejected: {variable: boolean array | None}; True where
+                              the TOTAL uncertainty is outside its plausible
+                              range. These levels are also True in `rejected`.
+    With return_reasons=True, a 4th item is returned:
+      - reasons             : {variable: object array | None} with the text
+                              explaining each rejection ("" for accepted
+                              levels). None if no level of the variable has
+                              a reason.
 
-    Variables WITHOUT an entry in PLAUSIBILITY_UNCERTAINTY_CHECKS: a level is
-    rejected as soon as its value falls outside the physical range [lo, hi].
-
-    Variables WITH an entry in PLAUSIBILITY_UNCERTAINTY_CHECKS (currently RH
-    and pressure): values outside the physical range are evaluated taking
-    their total uncertainty into account, level by level, with these steps:
-
-      Step 1 - Range check:
-          values inside [lo, hi] are plausible; no further check is needed.
-
-      Step 2 - Consistency within uncertainty (only for out-of-range
-      values):
-          the uncertainty interval is [value - uncertainty,
-          value + uncertainty]. If the whole interval lies outside the
-          valid range, i.e.
-              (value + uncertainty) <= lo   OR   (value - uncertainty) >= hi
-          the value is inconsistent.
-
-      Step 3 - Inconsistent values are rejected. Values whose interval
-          overlaps the valid range are consistent within their uncertainty
-          and move on to step 4.
-
-      Step 4 - Uncertainty magnitude check: a consistent value is accepted
-          only if its uncertainty is smaller than the maximum accepted
-          uncertainty for that variable; otherwise it is rejected.
-
-    An out-of-range value with a missing (NaN) uncertainty cannot be
-    evaluated and is therefore rejected.
-
-    Total uncertainty range check (variables in
-    PLAUSIBILITY_UNCERTAINTY_RANGES: temperature, RH and pressure), applied
-    IN ADDITION to the checks above and independently of the value:
-    a level is rejected if its total uncertainty is outside the plausible
-    range [unc_lo, unc_hi], both bounds included (e.g. for temperature an
-    uncertainty of 10 K is plausible, 10.1 K is not). A missing (NaN)
-    uncertainty is not considered implausible by this check. If the
-    uncertainty column is missing from `profile_data` the check is skipped
-    for that variable (a warning is logged).
-
-    With return_reasons=True a 4th item is returned: a dict
-    {variable: object array | None}. The array has one item per level of the
-    profile with the text explaining why the level is rejected ("" for the
-    levels that are not rejected; several reasons are joined with "; ").
-    Limits are written in the units of PLAUSIBILITY_REPORT_UNITS. None means
-    that no level of the variable has a reason (or that it could not be
-    evaluated).
+    Rules applied (per variable):
+      1. Total uncertainty range: if the total uncertainty is outside
+         `unc_range`, the level is rejected regardless of the value.
+      2. Value plausibility: for out-of-range values the interval
+         [value - unc, value + unc] is compared with `check_range`:
+             value - unc > hi   OR   value + unc < lo
+         If the whole interval falls outside the valid range, the value is
+         rejected. Otherwise it is accepted.
+      3. Dependency propagation: if any parent in `dep_vars` is invalid
+         (NaN or rejected), the variable itself is rejected. Dependencies
+         are propagated until stability, because the value check may have
+         invalidated more parents.
     """
+    if rules is None:
+        rules = PLAUSIBILITY_RULES
+
     n_levels = len(profile_data)
     height = profile_data["height"].to_numpy()
     if max_altitude_m is None:
         evaluated_levels = np.ones(n_levels, dtype=bool)
     else:
-        # NaN heights compare as False, i.e. they are not evaluated.
         evaluated_levels = height <= max_altitude_m
+
     if not evaluated_levels.any():
-        early = (
-            evaluated_levels,
-            {var: np.zeros(n_levels, dtype=bool)
-             for var in PLAUSIBILITY_LIMITS},
-            {var: np.zeros(n_levels, dtype=bool)
-             for var in PLAUSIBILITY_UNCERTAINTY_RANGES},
-        )
+        early_rejected = {var: np.zeros(n_levels, dtype=bool)
+                          for var in rules}
+        early_unc = {var: np.zeros(n_levels, dtype=bool)
+                     for var, info in rules.items()
+                     if info.get("unc_range") is not None}
         if return_reasons:
-            return early + ({var: None for var in PLAUSIBILITY_LIMITS},)
-        return early
+            return (evaluated_levels, early_rejected, early_unc,
+                    {var: None for var in rules})
+        return evaluated_levels, early_rejected, early_unc
+
     rejected = {}
     uncertainty_rejected = {}
     reasons = {}
-    for var, (lo, hi) in PLAUSIBILITY_LIMITS.items():
-        try:
-            scale, unit = PLAUSIBILITY_REPORT_UNITS.get(var, (1.0, ""))
-            value_parts = []        # (mask over the evaluated levels, text)
-            uncertainty_parts = []
-            # Total uncertainty range check. It is evaluated first because
-            # it does not depend on the values of the variable.
-            uncertainty_range_rejected = None
-            if var in PLAUSIBILITY_UNCERTAINTY_RANGES:
-                tot_column, (unc_lo, unc_hi) = (
-                    PLAUSIBILITY_UNCERTAINTY_RANGES[var])
-                if tot_column in profile_data.columns:
-                    tot_uncertainty = profile_data[tot_column].to_numpy()[
-                        evaluated_levels]
-                    # NaN never counts as out of range (comparisons with
-                    # NaN are False). Bounds are included in the range.
-                    uncertainty_range_rejected = (
-                        (tot_uncertainty < unc_lo)
-                        | (tot_uncertainty > unc_hi)
-                    )
-                    full_length = np.zeros(n_levels, dtype=bool)
-                    full_length[evaluated_levels] = uncertainty_range_rejected
-                    uncertainty_rejected[var] = full_length
-                    uncertainty_parts.append((
-                        uncertainty_range_rejected,
-                        f"total uncertainty outside plausible range "
-                        f"[{unc_lo * scale:g}, {unc_hi * scale:g}] {unit}"))
-                else:
-                    logging.warning(
-                        f"Missing column: '{tot_column}': total uncertainty "
-                        f"range check skipped for '{var}'")
-                    uncertainty_rejected[var] = None
-            var_data = profile_data[var].to_numpy()[evaluated_levels]
-            if np.all(np.isnan(var_data)):
-                rejected[var] = None
-                if return_reasons:
-                    reasons[var] = _compose_reasons(
-                        n_levels, evaluated_levels, uncertainty_parts)
-                continue
-            # Step 1: levels outside the physical range (NaN never counts
-            # as out of range: comparisons with NaN are False).
-            level_rejected = (var_data < lo) | (var_data > hi)
-            if return_reasons and var not in PLAUSIBILITY_UNCERTAINTY_CHECKS:
-                value_parts = [
-                    (var_data < lo,
-                     f"value below physical minimum ({lo * scale:g} {unit})"),
-                    (var_data > hi,
-                     f"value above physical maximum ({hi * scale:g} {unit})"),
-                ]
-            if var in PLAUSIBILITY_UNCERTAINTY_CHECKS:
-                uc_column, uc_max = PLAUSIBILITY_UNCERTAINTY_CHECKS[var]
-                uncertainty = profile_data[uc_column].to_numpy()[
-                    evaluated_levels]
-                # Steps 2-3: whole uncertainty interval outside the valid
-                # range.
-                inconsistent = level_rejected & (
-                    (var_data + uncertainty <= lo)
-                    | (var_data - uncertainty >= hi)
+
+    # -------------------------------------------------------------
+    # Phase 1: total uncertainty range + value plausibility
+    # -------------------------------------------------------------
+    for var, info in rules.items():
+        val_col = info["val_col"]
+        unc_col = info.get("unc_total_col")
+        unc_range = info.get("unc_range")
+        check_range = info.get("check_range")
+        scale = info.get("report_scale", 1.0)
+        unit = info.get("report_unit", "")
+
+        value_parts = []
+        uncertainty_parts = []
+        uncertainty_range_rejected = None
+
+        # --- Total uncertainty range ---
+        if unc_range is not None and unc_col is not None:
+            if unc_col in profile_data.columns:
+                tot = profile_data[unc_col].to_numpy()[evaluated_levels]
+                unc_lo, unc_hi = unc_range
+                rej = (tot < unc_lo) | (tot > unc_hi)
+                full = np.zeros(n_levels, dtype=bool)
+                full[evaluated_levels] = rej
+                uncertainty_rejected[var] = full
+                uncertainty_range_rejected = rej
+                uncertainty_parts.append((
+                    rej,
+                    f"total uncertainty outside plausible range "
+                    f"[{unc_lo * scale:g}, {unc_hi * scale:g}] {unit}"
+                ))
+            else:
+                logging.warning(
+                    f"Missing column: '{unc_col}': total uncertainty "
+                    f"range check skipped for '{var}'"
                 )
-                # Step 4: consistent values are accepted only if the
-                # uncertainty is small enough (a NaN uncertainty fails this
-                # comparison, so the value is rejected).
-                consistent = level_rejected & ~inconsistent
-                oversized_uncertainty = consistent & ~(uncertainty < uc_max)
-                level_rejected = inconsistent | oversized_uncertainty
-                if return_reasons:
-                    valid_range = f"[{lo * scale:g}, {hi * scale:g}] {unit}"
-                    missing_uncertainty = np.isnan(uncertainty)
-                    value_parts = [
-                        (inconsistent,
-                         f"value outside valid range {valid_range} and its "
-                         f"uncertainty interval does not overlap the valid "
-                         f"range"),
-                        (oversized_uncertainty & missing_uncertainty,
-                         f"value outside valid range {valid_range} and "
-                         f"total uncertainty missing"),
-                        (oversized_uncertainty & ~missing_uncertainty,
-                         f"value outside valid range {valid_range} and "
-                         f"total uncertainty not below the maximum accepted "
-                         f"({uc_max * scale:g} {unit})"),
-                    ]
-            # Levels whose total uncertainty is outside the plausible range
-            # are rejected whatever their value is.
-            if uncertainty_range_rejected is not None:
-                level_rejected = level_rejected | uncertainty_range_rejected
-            full_length = np.zeros(n_levels, dtype=bool)
-            full_length[evaluated_levels] = level_rejected
-            rejected[var] = full_length
+                uncertainty_rejected[var] = None
+        else:
+            uncertainty_rejected[var] = None
+
+        # --- Value ---
+        if val_col not in profile_data.columns:
+            logging.error(f"Missing column: '{val_col}'")
+            rejected[var] = None
+            if return_reasons:
+                reasons[var] = None
+            continue
+
+        var_data = profile_data[val_col].to_numpy()[evaluated_levels]
+
+        if np.all(np.isnan(var_data)):
+            rejected[var] = None
             if return_reasons:
                 reasons[var] = _compose_reasons(
-                    n_levels, evaluated_levels,
-                    value_parts + uncertainty_parts)
-        except KeyError:
-            logging.error(f"Missing column: '{var}'")
-            rejected[var] = None
-            reasons[var] = None
-        except Exception as e:
-            logging.error(f"Error checking '{var}': {e}")
-            rejected[var] = None
-            reasons[var] = None
-    # Variables whose uncertainty check could not be completed.
-    for var in PLAUSIBILITY_UNCERTAINTY_RANGES:
-        uncertainty_rejected.setdefault(var, None)
+                    n_levels, evaluated_levels, uncertainty_parts)
+            continue
+
+        level_rejected = np.zeros_like(var_data, dtype=bool)
+
+        if check_range is not None:
+            c_min, c_max = check_range
+            if unc_col is not None and unc_col in profile_data.columns:
+                unc = profile_data[unc_col].to_numpy()[evaluated_levels]
+                val_minus_unc = var_data - unc
+                val_plus_unc = var_data + unc
+                invalid = (val_minus_unc > c_max) | (val_plus_unc < c_min)
+                if return_reasons:
+                    value_parts.append((
+                        invalid,
+                        f"value ± uncertainty outside plausible range "
+                        f"[{c_min * scale:g}, {c_max * scale:g}] {unit}"
+                    ))
+            else:
+                invalid = (var_data < c_min) | (var_data > c_max)
+                if return_reasons:
+                    value_parts.append((
+                        invalid,
+                        f"value outside plausible range "
+                        f"[{c_min * scale:g}, {c_max * scale:g}] {unit}"
+                    ))
+            level_rejected |= invalid
+
+        if uncertainty_range_rejected is not None:
+            level_rejected |= uncertainty_range_rejected
+
+        full = np.zeros(n_levels, dtype=bool)
+        full[evaluated_levels] = level_rejected
+        rejected[var] = full
+
+        if return_reasons:
+            reasons[var] = _compose_reasons(
+                n_levels, evaluated_levels,
+                value_parts + uncertainty_parts)
+
+    # Ensure every variable with unc_range has an entry.
+    for var, info in rules.items():
+        if info.get("unc_range") is not None:
+            uncertainty_rejected.setdefault(var, None)
+
+    # -------------------------------------------------------------
+    # Phase 2: dependency propagation (until stability)
+    # -------------------------------------------------------------
+    changed = True
+    while changed:
+        changed = False
+        for var, info in rules.items():
+            dep_vars = info.get("dep_vars", [])
+            if not dep_vars:
+                continue
+            val_col = info["val_col"]
+            if val_col not in profile_data.columns:
+                continue
+
+            parent_null = np.zeros(n_levels, dtype=bool)
+            for parent in dep_vars:
+                parent_info = rules.get(parent)
+                if parent_info is None:
+                    continue
+                parent_col = parent_info["val_col"]
+                if parent_col not in profile_data.columns:
+                    continue
+                p_null = profile_data[parent_col].isna().to_numpy()
+                if rejected.get(parent) is not None:
+                    p_null = p_null | rejected[parent]
+                parent_null |= p_null
+
+            parent_null &= evaluated_levels
+            if not parent_null.any():
+                continue
+
+            if rejected.get(var) is None:
+                rejected[var] = np.zeros(n_levels, dtype=bool)
+
+            new_rej = rejected[var] | parent_null
+            if not np.array_equal(new_rej, rejected[var]):
+                rejected[var] = new_rej
+                changed = True
+                if return_reasons:
+                    reason_array = reasons.get(var)
+                    if reason_array is None:
+                        reason_array = np.full(n_levels, "", dtype=object)
+                    current = reason_array[parent_null]
+                    text = f"parent variable '{parent}' is not valid"
+                    reason_array[parent_null] = np.where(
+                        current == "", text, current + "; " + text)
+                    reasons[var] = reason_array
+
     if return_reasons:
+        for var in rules:
+            reasons.setdefault(var, None)
         return evaluated_levels, rejected, uncertainty_rejected, reasons
+
     return evaluated_levels, rejected, uncertainty_rejected
 
 
-def check_plausibility(profile_data, max_altitude_m=PLAUSIBILITY_MAX_ALTITUDE_M):
+def check_plausibility(profile_data,
+                       max_altitude_m=PLAUSIBILITY_MAX_ALTITUDE_M):
     """
-    Checks whether each variable of the profile is plausible (True) or not
-    (False), considering only levels up to `max_altitude_m`.
-
-    Returns a dict {variable: True | False | np.nan}; np.nan means the
-    variable has no valid data at all. A variable is plausible only if NO
-    level is rejected (see evaluate_level_plausibility for the rules applied
-    to each level).
+    Returns {variable: True | False | np.nan} for the whole profile. A
+    variable is plausible (True) only if NO level is rejected; np.nan means
+    the variable has no valid data at all.
     """
     evaluated_levels, rejected, _ = evaluate_level_plausibility(
         profile_data, max_altitude_m)
     if not evaluated_levels.any():
-        return {var: False for var in PLAUSIBILITY_LIMITS}
+        return {var: False for var in PLAUSIBILITY_RULES}
     return {
         var: (np.nan if level_mask is None else not np.any(level_mask))
         for var, level_mask in rejected.items()
     }
 
 
+def apply_plausibility_nulling(df_profile, rejected, uncertainty_rejected):
+    """
+    Sets to NULL the value, the total uncertainty and any other uncertainty
+    column of every level rejected by the plausibility checks.
+
+    `rejected` and `uncertainty_rejected` are the outputs of
+    evaluate_level_plausibility.
+    """
+    df = df_profile.copy()
+    for var, info in PLAUSIBILITY_RULES.items():
+        mask = rejected.get(var)
+        if mask is None:
+            continue
+        cols = [info["val_col"]]
+        if info.get("unc_total_col"):
+            cols.append(info["unc_total_col"])
+        cols.extend(info.get("other_unc_cols", []))
+        for col in cols:
+            if col in df.columns:
+                df.loc[mask, col] = np.nan
+    return df
+
+
 def flag_implausible_levels(data, profile_id_column="profile_id",
                             max_altitude_m=PLAUSIBILITY_MAX_ALTITUDE_M,
                             return_reasons=False):
     """
-    Level-by-level plausibility flags for a DataFrame that contains MANY
-    profiles stacked together (e.g. a whole month of soundings).
+    Level-by-level plausibility flags for a DataFrame stacking MANY profiles.
 
-    Each profile is identified by the value of `profile_id_column` and is
-    evaluated on its own with evaluate_level_plausibility, exactly as
-    process_gruan_profiles does for a single sounding. `data` needs the same
-    columns as evaluate_level_plausibility (`height`, the checked variables
-    and their uncertainties, in the units used by this pipeline: K, fraction,
-    m s-1, degrees, hPa, ppmv).
-
-    Returns a tuple (implausible, implausible_uncertainty) of boolean
-    DataFrames with the same index and row order as `data`:
-      - implausible: one column per checked variable (PLAUSIBILITY_LIMITS),
-        True where the level is NOT plausible;
-      - implausible_uncertainty: one column per variable of
-        PLAUSIBILITY_UNCERTAINTY_RANGES, True where the TOTAL UNCERTAINTY of
-        the level is outside its plausible range. For these levels the value
-        of the variable and its random, systematic and total uncertainties
-        must be set to NULL.
-    Levels that could not be evaluated (unknown height, above
-    `max_altitude_m`, variable without valid data in the profile, uncertainty
-    column missing) are False, i.e. never reported as implausible.
-
-    With return_reasons=True a third item is returned: a dict
-    {variable: pandas Series} with the text explaining why each level is
-    rejected (see evaluate_level_plausibility). Only the rejected levels are
-    stored: the index of each Series holds the POSITIONAL row numbers of
-    `data` (sorted), so the memory used is proportional to the number of
-    rejections, not to the number of levels.
+    Returns (implausible, implausible_uncertainty):
+      - implausible            : one column per checked variable, True where
+                                 the level is NOT plausible;
+      - implausible_uncertainty: one column per variable with unc_range,
+                                 True where the total uncertainty is outside
+                                 its plausible range.
+    Levels that could not be evaluated are False.
+    With return_reasons=True, a dict {variable: Series} is returned as 3rd
+    item with the text of the reason for the rejected levels only (indexed
+    by positional row numbers of `data`).
     """
     n_rows = len(data)
     implausible = {var: np.zeros(n_rows, dtype=bool)
-                   for var in PLAUSIBILITY_LIMITS}
-    implausible_uncertainty = {var: np.zeros(n_rows, dtype=bool)
-                               for var in PLAUSIBILITY_UNCERTAINTY_RANGES}
-    # Positional row indices of each profile (works with any index type).
+                   for var in PLAUSIBILITY_RULES}
+    implausible_uncertainty = {
+        var: np.zeros(n_rows, dtype=bool)
+        for var, info in PLAUSIBILITY_RULES.items()
+        if info.get("unc_range") is not None
+    }
     rows_by_profile = data.groupby(profile_id_column, sort=False).indices
-    reason_rows = {var: [] for var in PLAUSIBILITY_LIMITS}
-    reason_texts = {var: [] for var in PLAUSIBILITY_LIMITS}
+    reason_rows = {var: [] for var in PLAUSIBILITY_RULES}
+    reason_texts = {var: [] for var in PLAUSIBILITY_RULES}
+
     for rows in rows_by_profile.values():
         result = evaluate_level_plausibility(
             data.iloc[rows], max_altitude_m, return_reasons=return_reasons)
@@ -669,12 +694,13 @@ def flag_implausible_levels(data, profile_id_column="profile_id",
         for var, level_mask in uncertainty_rejected.items():
             if level_mask is not None:
                 implausible_uncertainty[var][rows] = level_mask
+
     flags = (pd.DataFrame(implausible, index=data.index),
              pd.DataFrame(implausible_uncertainty, index=data.index))
     if not return_reasons:
         return flags
     reasons = {}
-    for var in PLAUSIBILITY_LIMITS:
+    for var in PLAUSIBILITY_RULES:
         if reason_rows[var]:
             positions = np.concatenate(reason_rows[var])
             texts = np.concatenate(reason_texts[var])
@@ -687,14 +713,12 @@ def flag_implausible_levels(data, profile_id_column="profile_id",
     return flags + (reasons,)
 
 
-def check_variable_completeness(
-        var_array,
-        height,
-        zmin=None,
-        zmax=None,
-        thr_high=COMPLETENESS_THR_HIGH,
-        thr_good=COMPLETENESS_THR_GOOD,
-):
+# ==========================================
+# COMPLETENESS
+# ==========================================
+def check_variable_completeness(var_array, height, zmin=None, zmax=None,
+                                thr_high=COMPLETENESS_THR_HIGH,
+                                thr_good=COMPLETENESS_THR_GOOD):
     if zmin is None and zmax is None:
         n_total = len(var_array)
         if n_total == 0:
@@ -703,8 +727,8 @@ def check_variable_completeness(
     else:
         layer_lo = zmin if zmin is not None else -np.inf
         layer_hi = zmax if zmax is not None else np.inf
-        layer_mask = ~np.isnan(height) & (height >= layer_lo) & (
-                    height <= layer_hi)
+        layer_mask = (~np.isnan(height) & (height >= layer_lo)
+                      & (height <= layer_hi))
         n_total = int(np.sum(layer_mask))
         if n_total == 0:
             return 0, 0, np.nan, "FAIL"
@@ -716,7 +740,7 @@ def check_variable_completeness(
         flag_complete = "GOOD"
     else:
         flag_complete = "FAIL"
-    return (n_total, n_missing, completeness, flag_complete)
+    return n_total, n_missing, completeness, flag_complete
 
 
 def as_binary_flag(flag_value):
@@ -737,107 +761,93 @@ def parse_numeric_attribute(attr_value):
     return float(match.group()) if match else np.nan
 
 
+# ==========================================
+# README
+# ==========================================
 def generate_readme():
     readme_content = """# GRUAN Quality Control Pipeline
+
 ## Input
-The pipeline processes a single GRUAN NetCDF radiosonde profile.
+The pipeline processes GRUAN NetCDF radiosonde profiles packaged inside
+.jar archives.
+
 ## CBH
 Cloud Base Height is identified as the first level belonging to at least
 three consecutive levels with RH >= 0.99.
-The altitude variable `alt` is expressed in metres.
+
 ## CTH - Zhang cold cloud detection
-Cold-cloud detection is applied only above 2 km AGL.
-Altitude bands:
-- 2-6 km
-- 6-12 km
-- >12 km
-Only clouds with temperature <= -5 degC are considered.
-Relative humidity is stored in the NetCDF files either in percent (0-100)
-or as a fraction (0-1), depending on the product. According to the `units`
-attribute of each variable it is converted, when the data is loaded, to a
-fraction in the range 0-1 (the same applies to its uncertainties). Files
-with unrecognised RH units are rejected with an error.
-Relative humidity is converted from RH with respect to water to RH with
-respect to ice for temperatures below 0 degC.
-## Product-specific names and units
-Variable names and units differ between GRUAN products (e.g. CF-1.7 and
-CF-1.4 files): for each quantity the first available variable name is used
-(e.g. `rh_uc` or `u_rh` for the RH uncertainty, `press_uc` or `u_press`
-for the pressure uncertainty, `wvmr_vol` or `WVMR` for the water vapour
-mixing ratio). The tropopause height is read from the first available
-global attribute (`g.Measurement.TropopauseGeopotHeight` or
-`g.Ascent.TropopauseHeight`). WVMR is converted to ppmv when it is stored
-as a dimensionless ratio.
-## Pressure
-Pmin is the minimum pressure recorded in the profile.
+Cold-cloud detection is applied only above 2 km AGL. Altitude bands:
+2-6 km, 6-12 km, >12 km. Only clouds with temperature <= -5 degC are
+considered. RH is converted from w.r.t. water to w.r.t. ice for
+temperatures below 0 degC.
+
 ## Completeness
 Completeness is the fraction of missing data records.
 HIGH: < 0.10
 GOOD: 0.10 <= C < 0.20
 FAIL: >= 0.20
-## Plausibility (FLAG_PLAUSIBILITY_*)
-A variable is plausible (1) if no level up to 40 km is rejected, not
-plausible (0) otherwise.
-For most variables a level is rejected when it falls outside the physical
-range.
-For RH (0-100%) and pressure (1-1080 hPa) the total uncertainty is also
-taken into account, level by level:
-Step 1: a value inside the physical range is accepted.
-Step 2: an out-of-range value is inconsistent if its uncertainty interval
-[value - uncertainty, value + uncertainty] does not overlap the valid range.
-Step 3: inconsistent values are rejected; the others are consistent within
-their uncertainty and move to step 4.
-Step 4: a consistent value is accepted only if its uncertainty is below the
-maximum accepted uncertainty (RH: 15%; pressure: 3 hPa), otherwise it is
-rejected.
-In addition, for temperature, RH and pressure a level is rejected when its
-TOTAL uncertainty is outside the plausible range (bounds included):
-temperature 0-10 K, RH 0-100%, pressure 0-1000 Pa (0-10 hPa). Missing
-uncertainties are not rejected by this check. When the data is exported
-(export_netcdf.py), the value, random, systematic and total uncertainty of
-these levels are set to NULL.
+
+## Plausibility
+A variable is plausible (1) if no level up to 47 km is rejected, not
+plausible (0) otherwise. For each variable the following rules are
+applied level by level:
+
+1. Total uncertainty range: if the total uncertainty is outside the
+   plausible range of the variable, the level is rejected regardless of
+   the value.
+2. Value plausibility: for out-of-range values the interval
+   [value - unc, value + unc] is compared with the physical range. The
+   level is rejected only if the whole interval is outside the range:
+       value - unc > hi   OR   value + unc < lo
+   Otherwise the value is accepted (consistent within its uncertainty).
+3. Dependencies: if a parent variable is invalid, the variable itself is
+   invalid too. Dependencies:
+   - u             -> wind_speed
+   - v             -> wind_speed
+   - geopot        -> pressure
+   - wvmr          -> relative_humidity
+   - rh_resolution -> relative_humidity
+
+When the data is exported, the value, its random, systematic and total
+uncertainties are set to NULL for the rejected levels.
 """
     readme_path = os.path.join(os.path.dirname(OUTPUT_LOG_PATH), "README.md")
     with open(readme_path, "w", encoding="utf-8") as f:
         f.write(readme_content)
     print(f"[INFO] README.md written to: {readme_path}")
 
+
+# ==========================================
+# NETCDF LOADING
+# ==========================================
 def extract_netcdf_bytes_from_jar(jar_path):
     """
-    Opens a .jar archive (a standard zip container) and reads the single embedded
-    NetCDF (.nc) file entirely into memory, without ever writing to disk.
-    The .nc entry may be located at the archive root or inside a subfolder.
-
-    Returns a tuple (nc_bytes, internal_nc_name).
-    Raises FileNotFoundError if no .nc entry is found inside the archive.
+    Reads the single embedded NetCDF (.nc) file from a .jar archive fully
+    in memory, without writing to disk.
+    Returns (nc_bytes, internal_nc_name).
     """
-    with zipfile.ZipFile(jar_path, 'r') as zf:
+    with zipfile.ZipFile(jar_path, "r") as zf:
         nc_entries = [info for info in zf.infolist()
-                      if info.filename.lower().endswith('.nc')]
-
+                      if info.filename.lower().endswith(".nc")]
         if not nc_entries:
             raise FileNotFoundError(
                 f"No .nc file found inside jar archive: {jar_path}")
-
         if len(nc_entries) > 1:
             logging.warning(
-                f"Multiple .nc files found inside '{jar_path}'; "
-                f"using the first one found: {nc_entries[0].filename}")
-
+                f"Multiple .nc files found inside '{jar_path}'; using the "
+                f"first one found: {nc_entries[0].filename}")
         nc_entry = nc_entries[0]
         nc_bytes = zf.read(nc_entry.filename)
-
     return nc_bytes, nc_entry.filename
+
 
 def load_netcdf_profile(jar_file_path):
     print(f"[INFO] Opening jar archive: {os.path.basename(jar_file_path)}")
-
     try:
         nc_bytes, internal_nc_name = extract_netcdf_bytes_from_jar(jar_file_path)
-
         nc4_dataset = nc4.Dataset(internal_nc_name, memory=nc_bytes)
-
         ds = xr.open_dataset(xr.backends.NetCDF4DataStore(nc4_dataset))
+
         station = ds.attrs.get("g.Site.Key", "UNKNOWN")
         if station == "UNKNOWN":
             station = ds.attrs.get("g.General.SiteCode", "UNKNOWN")
@@ -847,46 +857,62 @@ def load_netcdf_profile(jar_file_path):
         try:
             dt = datetime.strptime(dt_str.split(".")[0],
                                    "%Y-%m-%dT%H:%M:%S").strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+                "%Y-%m-%d %H:%M:%S")
         except Exception:
             dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # ------------------------------------------
-        # Tropopause
-        # ------------------------------------------
-        # The global attribute name depends on the product (e.g. CF-1.7 vs
-        # CF-1.4 files): the first one found is used.
+
         tropopause_attr = None
         for attr_name in TROPOPAUSE_ATTRIBUTE_CANDIDATES:
             if attr_name in ds.attrs:
                 tropopause_attr = ds.attrs[attr_name]
                 break
         tropopause_altitude = parse_numeric_attribute(tropopause_attr)
-        # ------------------------------------------
-        # Variable mapping
-        # ------------------------------------------
+
+        # Variable mapping: internal name -> candidate NetCDF names.
+        # The first candidate found wins (CF-1.4 first, then CF-1.7).
         mapping = {
-            "height": ["alt"],
-            "height_uc_tot": ["alt_uc"],
-            "pressure": ["press"],
-            "pressure_uc_tot": ["press_uc", "u_press"],
-            "temperature": ["temp"],
-            "temperature_uc_sys": ["temp_uc_tcor"],
-            "temperature_uc_tot": ["temp_uc", "u_temp"],
-            "relative_humidity": ["rh"],
-            "relative_humidity_uc_sys": ["rh_uc_tcor"],
-            "relative_humidity_uc_tot": ["rh_uc", "u_rh"],
-            "wind_speed": ["wspeed"],
-            "wind_speed_uc_tot": ["wspeed_uc"],
-            "wind_direction": ["wdir"],
-            "wind_direction_uc_tot": ["wdir_uc"],
-            "wvmr": ["wvmr_vol", "WVMR", "wvmr"],
-            "wvmr_uc_sys": ["wvmr_vol_uc_tcor"],
-            "wvmr_uc_tot": ["wvmr_vol_uc"],
-            "frost_point": ["fp"],
-            "shortwave_radiation": ["swrad"],
-            "vertical_speed": ["vspeed", "asc"],
+            # Core profile
+            "height":                      ["alt"],
+            "height_uc_tot":               ["alt_uc"],
+            "pressure":                    ["press"],
+            "pressure_uc_tot":             ["press_uc", "u_press"],
+            "temperature":                 ["temp"],
+            "temperature_uc_std":          ["u_std_temp"],
+            "temperature_uc_sys":          ["temp_uc_tcor", "u_cor_temp"],
+            "temperature_uc_tot":          ["temp_uc", "u_temp"],
+            "relative_humidity":           ["rh"],
+            "relative_humidity_uc_std":    ["u_std_rh"],
+            "relative_humidity_uc_sys":    ["rh_uc_tcor", "u_cor_rh"],
+            "relative_humidity_uc_tot":    ["rh_uc", "u_rh"],
+            # Wind
+            "wind_speed":                  ["wspeed"],
+            "wind_speed_uc_tot":           ["wspeed_uc", "u_wspeed"],
+            "wind_direction":              ["wdir"],
+            "wind_direction_uc_tot":       ["wdir_uc", "u_wdir"],
+            "u":                           ["u", "wzon"],
+            "u_uc_tot":                    ["wzon_uc"],
+            "v":                           ["v", "wmeri"],
+            "v_uc_tot":                    ["wmeri_uc"],
+            # WVMR
+            "wvmr":                        ["wvmr_vol", "WVMR", "wvmr"],
+            "wvmr_uc_sys":                 ["wvmr_vol_uc_tcor"],
+            "wvmr_uc_tot":                 ["wvmr_vol_uc"],
+            # Geopotential
+            "geopot":                      ["geopot", "alt_gph"],
+            "geopot_uc_sys":               ["alt_gph_uc_tcor"],
+            "geopot_uc_tot":               ["alt_gph_uc"],
+            # Other
+            "frost_point":                 ["fp"],
+            "frost_point_uc_tot":          ["fp_uc"],
+            "shortwave_radiation":         ["swrad"],
+            "shortwave_radiation_uc_tot":  ["u_swrad"],
+            "vertical_speed":              ["vspeed", "asc"],
+            "vertical_speed_uc_tot":       ["vspeed_uc"],
+            # "Air relative humidity effective vertical resolution":
+            # CF-1.4 files store it in `res_rh`, CF-1.7 in `rh_res`.
+            "rh_resolution":               ["res_rh", "rh_res"],
         }
+
         extracted_data = {}
         extracted_units = {}
         for internal_key, nc_candidates in mapping.items():
@@ -900,39 +926,27 @@ def load_netcdf_profile(jar_file_path):
                 extracted_units[internal_key] = ds[found_var].attrs.get("units")
             else:
                 extracted_data[internal_key] = None
-        # ------------------------------------------
-        # Reference length
-        # ------------------------------------------
+
         ref_len = 0
         for k in ["pressure", "height", "temperature"]:
-            if k in extracted_data and isinstance(extracted_data[k],
-                                                  np.ndarray):
+            if isinstance(extracted_data.get(k), np.ndarray):
                 ref_len = len(extracted_data[k])
                 break
         if ref_len == 0:
             raise ValueError(
-                "No core profile data " "(pressure/height) could be extracted."
-            )
-        # ------------------------------------------
-        # Fill missing variables
-        # ------------------------------------------
+                "No core profile data (pressure/height) could be extracted.")
+
         for k, v in extracted_data.items():
             if v is None:
                 extracted_data[k] = np.full(ref_len, np.nan)
-        # ------------------------------------------
-        # RH unit conversion
-        # ------------------------------------------
-        # Depending on the file (e.g. CF-1.7 vs CF-1.4 GRUAN products), RH
-        # and its uncertainties are stored either in percent (0-100) or as
-        # a fraction (0-1). The whole pipeline (cloud detection, RH over
-        # ice, QC thresholds) works with fractions, so each variable is
-        # converted according to the `units` attribute declared in the file.
+
+        # RH unit conversion (percent -> fraction).
         for rh_key in ("relative_humidity",
+                       "relative_humidity_uc_std",
                        "relative_humidity_uc_sys",
                        "relative_humidity_uc_tot"):
             rh_units = extracted_units.get(rh_key)
             if rh_units is None:
-                # Variable not present in the file (already filled with NaN).
                 continue
             rh_units_norm = str(rh_units).strip().lower()
             if rh_units_norm in RH_PERCENT_UNITS:
@@ -941,20 +955,12 @@ def load_netcdf_profile(jar_file_path):
                 raise ValueError(
                     f"Unrecognised units '{rh_units}' for '{rh_key}': "
                     f"cannot determine whether RH is a percentage or a "
-                    f"fraction."
-                )
-        # ------------------------------------------
-        # WVMR unit conversion
-        # ------------------------------------------
-        # Some products store the water vapour volume mixing ratio in ppmv
-        # (e.g. `wvmr_vol`), others as a dimensionless ratio (mol/mol,
-        # units '1', e.g. `WVMR`). The pipeline works in ppmv (see the
-        # plausibility limits), so the values are converted according to
-        # the `units` attribute declared in the file.
+                    f"fraction.")
+
+        # WVMR unit conversion (fraction -> ppmv).
         for wv_key in ("wvmr", "wvmr_uc_sys", "wvmr_uc_tot"):
             wv_units = extracted_units.get(wv_key)
             if wv_units is None:
-                # Variable not present in the file (already filled with NaN).
                 continue
             wv_units_norm = str(wv_units).strip().lower()
             if wv_units_norm in WVMR_FRACTION_UNITS:
@@ -962,13 +968,14 @@ def load_netcdf_profile(jar_file_path):
             elif wv_units_norm not in WVMR_PPMV_UNITS:
                 raise ValueError(
                     f"Unrecognised units '{wv_units}' for '{wv_key}': "
-                    f"cannot convert to ppmv."
-                )
+                    f"cannot convert to ppmv.")
+
         df_profile = pd.DataFrame(extracted_data)
         df_profile["datetime"] = dt
         df_profile["station"] = station
         df_profile["source_file"] = os.path.basename(jar_file_path)
         df_profile["tropopause_altitude"] = tropopause_altitude
+
         ds.close()
         try:
             nc4_dataset.close()
@@ -976,26 +983,38 @@ def load_netcdf_profile(jar_file_path):
             pass
         return df_profile
     except Exception as e:
-        print(f"[ERROR] Failed to process NetCDF " f"{jar_file_path}: {e}")
+        print(f"[ERROR] Failed to process NetCDF {jar_file_path}: {e}")
         return pd.DataFrame()
 
 
+# ==========================================
+# MAIN PROCESSING
+# ==========================================
 def process_gruan_profiles(data_source, output_log_path=OUTPUT_LOG_PATH):
     log_records = []
     group_keys = ["datetime", "station"]
     if "source_file" in data_source.columns:
         group_keys.append("source_file")
     grouped = data_source.groupby(group_keys)
+
     for group_key, profile in grouped:
         if "source_file" in group_keys:
             dt, station, source_file = group_key
         else:
             dt, station = group_key
             source_file = np.nan
-        # ------------------------------------------
-        # Sort profile from bottom to top
-        # ------------------------------------------
+
         profile = profile.sort_values(by="height").reset_index(drop=True)
+
+        # -------------------------------------------------------------
+        # Plausibility: level-by-level evaluation and NULLing
+        # -------------------------------------------------------------
+        evaluated_levels, rejected, uncertainty_rejected = (
+            evaluate_level_plausibility(profile))
+        profile = apply_plausibility_nulling(profile, rejected,
+                                             uncertainty_rejected)
+
+        # Re-read arrays after NULLing for downstream checks.
         p_arr = profile["pressure"].to_numpy()
         z_arr = profile["height"].to_numpy()
         rh_arr = profile["relative_humidity"].to_numpy()
@@ -1003,139 +1022,90 @@ def process_gruan_profiles(data_source, output_log_path=OUTPUT_LOG_PATH):
         ws_arr = profile["wind_speed"].to_numpy()
         wd_arr = profile["wind_direction"].to_numpy()
         wvmr_arr = profile["wvmr"].to_numpy()
-        # ------------------------------------------
-        # CBH
-        # ------------------------------------------
+
+        # -------------------------------------------------------------
+        # CBH / CTH / Pmin
+        # -------------------------------------------------------------
         cbh_res = check_cloud_base(rh_arr, z_arr, p_arr)
-        # ------------------------------------------
-        # CTH / Zhang
-        # ------------------------------------------
         cth_res = check_cloud_top(rh_arr, z_arr, p_arr, t_arr)
-        # ------------------------------------------
-        # Pressure
-        # ------------------------------------------
         pmin, f_p10, f_p5 = check_pressure_flags(p_arr)
-        # ------------------------------------------
-        # Plausibility
-        # ------------------------------------------
-        plaus_flags = check_plausibility(profile)
+
+        # -------------------------------------------------------------
+        # Per-variable plausibility flags
+        # -------------------------------------------------------------
+        plaus_flags = {
+            var: (np.nan if level_mask is None
+                  else not np.any(level_mask))
+            for var, level_mask in rejected.items()
+        }
         tropopause_altitude = profile["tropopause_altitude"].iloc[0]
-        # ------------------------------------------
-        # CBH / CTH T and RH
-        # Vector index starts from the bottom:
-        # 0 = lowest altitude level
-        # ------------------------------------------
-        cbh_index = int(cbh_res["index"]) if not np.isnan(
-            cbh_res["index"]) else np.nan
-        cth_index = int(cth_res["index"]) if not np.isnan(
-            cth_res["index"]) else np.nan
-        # ------------------------------------------
-        # RH with respect to ice for the full profile
-        # ------------------------------------------
+
+        cbh_index = (int(cbh_res["index"])
+                     if not np.isnan(cbh_res["index"]) else np.nan)
+        cth_index = (int(cth_res["index"])
+                     if not np.isnan(cth_res["index"]) else np.nan)
+
         rh_ice_arr = rh_over_ice(t_arr, rh_arr)
-        # ------------------------------------------
-        # CBH values
-        # ------------------------------------------
+
         if not np.isnan(cbh_index):
             cbh_temperature = t_arr[cbh_index]
-            # Original RH from NetCDF
             cbh_rh = rh_arr[cbh_index]
-            # Calculated RH with respect to ice
             cbh_rh_ice = rh_ice_arr[cbh_index]
         else:
-            cbh_temperature = np.nan
-            cbh_rh = np.nan
-            cbh_rh_ice = np.nan
-        # ------------------------------------------
-        # CTH values
-        # ------------------------------------------
+            cbh_temperature = cbh_rh = cbh_rh_ice = np.nan
+
         if not np.isnan(cth_index):
             cth_temperature = t_arr[cth_index]
-            # Original RH from NetCDF
             cth_rh = rh_arr[cth_index]
-            # Calculated RH with respect to ice
             cth_rh_ice = rh_ice_arr[cth_index]
         else:
-            cth_temperature = np.nan
-            cth_rh = np.nan
-            cth_rh_ice = np.nan
-        # ------------------------------------------
+            cth_temperature = cth_rh = cth_rh_ice = np.nan
+
+        # -------------------------------------------------------------
         # Completeness
-        # ------------------------------------------
+        # -------------------------------------------------------------
         completeness_vars = {
-            "Press": p_arr,
-            "Temp": t_arr,
-            "RH": rh_arr,
-            "Wspeed": ws_arr,
-            "Wdir": wd_arr,
-            "WVMR": wvmr_arr,
+            "Press": p_arr, "Temp": t_arr, "RH": rh_arr,
+            "Wspeed": ws_arr, "Wdir": wd_arr, "WVMR": wvmr_arr,
         }
         completeness_record = {}
         for label, var_arr in completeness_vars.items():
-            # Whole profile
-            (
-                n_tot_full,
-                n_miss_full,
-                compl_full,
-                f_compl_full,
-            ) = check_variable_completeness(var_arr, z_arr)
+            (n_tot_full, n_miss_full, compl_full, f_compl_full) = (
+                check_variable_completeness(var_arr, z_arr))
             completeness_record[f"Ntotal_{label}"] = n_tot_full
             completeness_record[f"Completeness_{label}"] = (
-                round(compl_full, 4) if not np.isnan(compl_full) else np.nan
-            )
+                round(compl_full, 4) if not np.isnan(compl_full) else np.nan)
             completeness_record[f"FLAG_COMPLETENESS_{label}"] = f_compl_full
-            # Troposphere
+
             if not np.isnan(tropopause_altitude):
-                (
-                    n_tot_tropo,
-                    n_miss_tropo,
-                    compl_tropo,
-                    f_compl_tropo,
-                ) = check_variable_completeness(
-                    var_arr, z_arr, zmax=tropopause_altitude
-                )
+                (n_tot_tropo, _, compl_tropo, f_compl_tropo) = (
+                    check_variable_completeness(
+                        var_arr, z_arr, zmax=tropopause_altitude))
             else:
-                (n_tot_tropo, n_miss_tropo, compl_tropo, f_compl_tropo) = (
-                    0,
-                    0,
-                    np.nan,
-                    "N/A",
-                )
+                n_tot_tropo, compl_tropo, f_compl_tropo = 0, np.nan, "N/A"
             completeness_record[f"Ntotal_{label}_troposphere"] = n_tot_tropo
             completeness_record[f"Completeness_{label}_troposphere"] = (
-                round(compl_tropo, 4) if not np.isnan(compl_tropo) else np.nan
-            )
+                round(compl_tropo, 4)
+                if not np.isnan(compl_tropo) else np.nan)
             completeness_record[
-                f"FLAG_COMPLETENESS_{label}_troposphere"
-            ] = f_compl_tropo
-            # Stratosphere
+                f"FLAG_COMPLETENESS_{label}_troposphere"] = f_compl_tropo
+
             if not np.isnan(tropopause_altitude):
-                (
-                    n_tot_strato,
-                    n_miss_strato,
-                    compl_strato,
-                    f_compl_strato,
-                ) = check_variable_completeness(
-                    var_arr, z_arr, zmin=tropopause_altitude
-                )
+                (n_tot_strato, _, compl_strato, f_compl_strato) = (
+                    check_variable_completeness(
+                        var_arr, z_arr, zmin=tropopause_altitude))
             else:
-                (n_tot_strato, n_miss_strato, compl_strato, f_compl_strato) = (
-                    0,
-                    0,
-                    np.nan,
-                    "N/A",
-                )
+                n_tot_strato, compl_strato, f_compl_strato = 0, np.nan, "N/A"
             completeness_record[f"Ntotal_{label}_stratosphere"] = n_tot_strato
             completeness_record[f"Completeness_{label}_stratosphere"] = (
-                round(compl_strato, 4) if not np.isnan(
-                    compl_strato) else np.nan
-            )
+                round(compl_strato, 4)
+                if not np.isnan(compl_strato) else np.nan)
             completeness_record[
-                f"FLAG_COMPLETENESS_{label}_stratosphere"
-            ] = f_compl_strato
-        # ------------------------------------------
+                f"FLAG_COMPLETENESS_{label}_stratosphere"] = f_compl_strato
+
+        # -------------------------------------------------------------
         # Final record
-        # ------------------------------------------
+        # -------------------------------------------------------------
         record = {
             "Date": dt,
             "Station": station,
@@ -1155,53 +1125,28 @@ def process_gruan_profiles(data_source, output_log_path=OUTPUT_LOG_PATH):
             "Pmin (hPa)": pmin,
             "FLAG_P10": as_binary_flag(f_p10),
             "FLAG_P5": as_binary_flag(f_p5),
-            "FLAG_PLAUSIBILITY_TEMPERATURE": as_binary_flag(
-                plaus_flags["temperature"]),
-            "FLAG_PLAUSIBILITY_RH": as_binary_flag(
-                plaus_flags["relative_humidity"]),
-            "FLAG_PLAUSIBILITY_WIND_SPEED": as_binary_flag(
-                plaus_flags["wind_speed"]),
-            "FLAG_PLAUSIBILITY_WIND_DIRECTION": as_binary_flag(
-                plaus_flags["wind_direction"]
-            ),
-            "FLAG_PLAUSIBILITY_PRESSURE": as_binary_flag(
-                plaus_flags["pressure"]),
-            "FLAG_PLAUSIBILITY_WVMR": as_binary_flag(plaus_flags["wvmr"]),
             "Tropopause_Altitude (m)": tropopause_altitude,
         }
+        # One plausibility flag per variable in PLAUSIBILITY_RULES.
+        for var in PLAUSIBILITY_RULES:
+            key = f"FLAG_PLAUSIBILITY_{var.upper()}"
+            record[key] = as_binary_flag(plaus_flags.get(var))
+
         record.update(completeness_record)
         log_records.append(record)
+
     df_log = pd.DataFrame(log_records)
     df_log.to_csv(output_log_path, index=False, na_rep="NaN")
-    print(f"[SUCCESS] QC complete. " f"Log written to: {output_log_path}")
+    print(f"[SUCCESS] QC complete. Log written to: {output_log_path}")
     generate_readme()
 
 
 # ==========================================
-# MAIN
+# BATCH LOADING
 # ==========================================
-# if __name__ == "__main__":
-#     print("[INFO] Starting GRUAN Quality Control Pipeline...")
-#     if not os.path.isfile(INPUT_NC_FILE):
-#         print(f"[ERROR] NetCDF file not found: " f"{INPUT_NC_FILE}")
-#     else:
-#         profile_df = load_netcdf_profile(INPUT_NC_FILE)
-#         if profile_df is not None and not profile_df.empty:
-#             process_gruan_profiles(
-#                 data_source=profile_df, output_log_path=OUTPUT_LOG_PATH
-#             )
-#         else:
-#             print("[ERROR] No valid NetCDF profile " "was successfully loaded.")
-#             print("[INFO] Generating documentation file anyway...")
-#             generate_readme()
-
 def load_all_profiles_from_directory(input_directory,
                                      file_pattern=JAR_FILE_PATTERN):
-    """
-    Scans input_directory for compressed .jar archives matching file_pattern,
-    loads the embedded NetCDF profile from each one (fully in memory) via
-    load_netcdf_profile, and concatenates the results into a single DataFrame.
-    """
+    """Loads every .jar archive matching `file_pattern` into one DataFrame."""
     search_path = os.path.join(input_directory, file_pattern)
     jar_files = sorted(glob.glob(search_path))
 
@@ -1210,8 +1155,8 @@ def load_all_profiles_from_directory(input_directory,
               f"matching pattern '{file_pattern}'.")
         return pd.DataFrame()
 
-    print(
-        f"[INFO] Found {len(jar_files)} jar archive(s) in '{input_directory}'.")
+    print(f"[INFO] Found {len(jar_files)} jar archive(s) in "
+          f"'{input_directory}'.")
 
     profile_frames = []
     for jar_file_path in jar_files:
@@ -1227,6 +1172,9 @@ def load_all_profiles_from_directory(input_directory,
     return pd.concat(profile_frames, ignore_index=True)
 
 
+# ==========================================
+# MAIN
+# ==========================================
 if __name__ == "__main__":
     print("[INFO] Starting GRUAN Quality Control Pipeline...")
 
@@ -1237,7 +1185,7 @@ if __name__ == "__main__":
         process_gruan_profiles(data_source=all_profiles_df,
                                output_log_path=OUTPUT_LOG_PATH)
     else:
-        print(
-            "[ERROR] No valid jar archives were successfully loaded. Execution aborted.")
+        print("[ERROR] No valid jar archives were successfully loaded. "
+              "Execution aborted.")
         print("[INFO] Generating documentation file anyway...")
         generate_readme()
