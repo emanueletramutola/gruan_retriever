@@ -87,7 +87,7 @@ PLAUSIBILITY_RULES = {
         "unc_total_col": "relative_humidity_uc_tot",
         "other_unc_cols": ["relative_humidity_uc_std",
                            "relative_humidity_uc_sys"],
-        "unc_range": (0.0, 1.0),
+        "unc_range": (0.0, 0.25),
         "check_range": (RH_MIN_FRACTION, RH_MAX_FRACTION),
         "dep_vars": [],
         "report_scale": 100.0,
@@ -148,7 +148,7 @@ PLAUSIBILITY_RULES = {
         "unc_total_col": "geopot_uc_tot",
         "other_unc_cols": ["geopot_uc_sys"],
         "unc_range": None,
-        "check_range": None,
+        "check_range": (-10.0, 47000.0),
         "dep_vars": ["pressure"],
         "report_scale": 1.0,
         "report_unit": "m",
@@ -391,7 +391,8 @@ def _compose_reasons(n_levels, evaluated_levels, parts):
 def evaluate_level_plausibility(profile_data,
                                 max_altitude_m=PLAUSIBILITY_MAX_ALTITUDE_M,
                                 return_reasons=False,
-                                rules=None):
+                                rules=None,
+                                expected_uncertainties=None):
     """
     Level-by-level plausibility evaluation of a SINGLE profile.
 
@@ -400,6 +401,14 @@ def evaluate_level_plausibility(profile_data,
     (see PLAUSIBILITY_RULES). Only levels up to `max_altitude_m` are
     evaluated (None = all levels); levels with unknown height are never
     evaluated.
+
+    `expected_uncertainties` is an optional dict {qc_unc_key: bool} telling
+    the evaluator which uncertainty columns the source file format of this
+    profile is expected to provide. The missing-uncertainty rule is applied
+    only to the columns marked True. A column the format does not provide
+    is not flagged as missing, and only the value-range check applies to
+    it. When None, every declared uncertainty column is checked
+    (backwards-compatible behaviour).
 
     Returns (evaluated_levels, rejected, uncertainty_rejected):
       - evaluated_levels    : boolean array, True for evaluated levels;
@@ -421,19 +430,22 @@ def evaluate_level_plausibility(profile_data,
                               a reason.
 
     Rules applied (per variable):
-      1. Uncertainty range: EVERY available uncertainty column (total,
-         random, systematic, see `unc_total_col` + `other_unc_cols`) is
-         compared with `unc_range`; the level is rejected if at least one of
-         them is outside the range, regardless of the value.
-      2. Value plausibility: for out-of-range values the interval
+      1. Missing uncertainty: every uncertainty column the file format is
+         expected to provide (see `expected_uncertainties`) must be
+         non-NaN at the level; otherwise the level is rejected.
+      2. Uncertainty range: every available uncertainty column (total,
+         random, systematic) is compared with `unc_range`; the level is
+         rejected if at least one of them is outside the range.
+      3. Value plausibility: for out-of-range values the interval
          [value - unc, value + unc] is compared with `check_range`:
              value - unc > hi   OR   value + unc < lo
          If the whole interval falls outside the valid range, the value is
-         rejected. Otherwise it is accepted.
-      3. Dependency propagation: if any parent in `dep_vars` is invalid
+         rejected. When the total uncertainty is NaN at a level (e.g. the
+         source file format does not provide it) the interval is undefined
+         and the level is checked directly with `value vs [lo, hi]`.
+      4. Dependency propagation: if any parent in `dep_vars` is invalid
          (NaN or rejected), the variable itself is rejected. Dependencies
-         are propagated until stability, because the value check may have
-         invalidated more parents.
+         are propagated until stability.
     """
     if rules is None:
         rules = PLAUSIBILITY_RULES
@@ -462,7 +474,7 @@ def evaluate_level_plausibility(profile_data,
     reasons = {}
 
     # -------------------------------------------------------------
-    # Phase 1: uncertainty range + value plausibility
+    # Phase 1: missing-uncertainty + uncertainty range + value check
     # -------------------------------------------------------------
     for var, info in rules.items():
         val_col = info["val_col"]
@@ -474,21 +486,62 @@ def evaluate_level_plausibility(profile_data,
 
         value_parts = []
         uncertainty_parts = []
+        missing_unc_parts = []
         uncertainty_range_rejected = None
+        missing_unc_rejected = None
+
+        unc_cols_declared = []
+        if unc_col is not None:
+            unc_cols_declared.append(unc_col)
+        unc_cols_declared.extend(info.get("other_unc_cols", []))
+
+        # --- Missing-uncertainty check ---
+        # A measurement value is invalid whenever any of its declared
+        # uncertainties is missing (NaN). Which uncertainties are
+        # "declared" depends on the file format (CF-1.4 / CF-1.7): the
+        # caller passes expected_uncertainties to restrict the rule to
+        # the columns the current profile's format is supposed to
+        # provide. A column the format does not provide is not flagged
+        # as missing; a column the format does provide and that carries
+        # NaN at an individual level is.
+        if unc_cols_declared:
+            if expected_uncertainties is not None:
+                checked_cols = [c for c in unc_cols_declared
+                                if expected_uncertainties.get(c, True)]
+            else:
+                checked_cols = list(unc_cols_declared)
+
+            if checked_cols:
+                missing_cols = [c for c in checked_cols
+                                if c not in profile_data.columns]
+                if missing_cols:
+                    missing_unc_rejected = np.ones(n_evaluated, dtype=bool)
+                    if return_reasons:
+                        missing_unc_parts.append((
+                            missing_unc_rejected,
+                            "no uncertainty column available (expected: "
+                            + ", ".join(f"'{c}'" for c in missing_cols)
+                            + ")"
+                        ))
+                else:
+                    rej_missing = np.zeros(n_evaluated, dtype=bool)
+                    for col in checked_cols:
+                        vals = profile_data[col].to_numpy()[evaluated_levels]
+                        rej_missing |= np.isnan(vals)
+                    missing_unc_rejected = rej_missing
+                    if return_reasons:
+                        missing_unc_parts.append((
+                            rej_missing,
+                            "missing uncertainty (NaN) in one or more of: "
+                            + ", ".join(f"'{c}'" for c in checked_cols)
+                        ))
 
         # --- Uncertainty range check on EVERY available uncertainty ---
         if unc_range is not None:
             unc_lo, unc_hi = unc_range
-            # Total uncertainty first, then the extra ones (random,
-            # systematic) declared in `other_unc_cols`.
-            unc_cols_to_check = []
-            if unc_col is not None:
-                unc_cols_to_check.append(unc_col)
-            unc_cols_to_check.extend(info.get("other_unc_cols", []))
-
-            present = [c for c in unc_cols_to_check
+            present = [c for c in unc_cols_declared
                        if c in profile_data.columns]
-            missing = [c for c in unc_cols_to_check
+            missing = [c for c in unc_cols_declared
                        if c not in profile_data.columns]
             if missing:
                 logging.warning(
@@ -531,10 +584,16 @@ def evaluate_level_plausibility(profile_data,
             rejected[var] = None
             if return_reasons:
                 reasons[var] = _compose_reasons(
-                    n_levels, evaluated_levels, uncertainty_parts)
+                    n_levels, evaluated_levels,
+                    missing_unc_parts + uncertainty_parts)
             continue
 
         level_rejected = np.zeros_like(var_data, dtype=bool)
+
+        # Missing-uncertainty rejections come first: a level whose
+        # uncertainty budget is incomplete is not evaluated further.
+        if missing_unc_rejected is not None:
+            level_rejected |= missing_unc_rejected
 
         if check_range is not None:
             c_min, c_max = check_range
@@ -543,11 +602,35 @@ def evaluate_level_plausibility(profile_data,
                 val_minus_unc = var_data - unc
                 val_plus_unc = var_data + unc
                 invalid = (val_minus_unc > c_max) | (val_plus_unc < c_min)
+                # Where the total uncertainty is NaN the interval
+                # [value - unc, value + unc] is undefined and the
+                # comparisons above silently return False (any
+                # comparison with NaN is False). Those levels would
+                # escape the check. This happens when the source file
+                # format does not provide the total uncertainty (e.g.
+                # CF-1.4 files for vertical_speed, where 'vspeed_uc'
+                # exists only in CF-1.7), or when the format does
+                # provide it but the level already failed the
+                # missing-uncertainty rule above. In both cases fall
+                # back to a plain value check, so out-of-range values
+                # are still caught.
+                missing_unc = np.isnan(unc)
+                if missing_unc.any():
+                    invalid = np.where(
+                        missing_unc,
+                        (var_data < c_min) | (var_data > c_max),
+                        invalid)
                 if return_reasons:
                     value_parts.append((
-                        invalid,
-                        f"value ± uncertainty outside plausible range "
+                        invalid & ~missing_unc,
+                        f"value \u00b1 uncertainty outside plausible range "
                         f"[{c_min * scale:g}, {c_max * scale:g}] {unit}"
+                    ))
+                    value_parts.append((
+                        invalid & missing_unc,
+                        f"value outside plausible range "
+                        f"[{c_min * scale:g}, {c_max * scale:g}] {unit} (no total "
+                        f"uncertainty available)"
                     ))
             else:
                 invalid = (var_data < c_min) | (var_data > c_max)
@@ -569,7 +652,7 @@ def evaluate_level_plausibility(profile_data,
         if return_reasons:
             reasons[var] = _compose_reasons(
                 n_levels, evaluated_levels,
-                value_parts + uncertainty_parts)
+                missing_unc_parts + value_parts + uncertainty_parts)
 
     # Ensure every variable with unc_range has an entry.
     for var, info in rules.items():
@@ -674,7 +757,8 @@ def apply_plausibility_nulling(df_profile, rejected, uncertainty_rejected):
 
 def flag_implausible_levels(data, profile_id_column="profile_id",
                             max_altitude_m=PLAUSIBILITY_MAX_ALTITUDE_M,
-                            return_reasons=False):
+                            return_reasons=False,
+                            expected_uncertainties_by_profile=None):
     """
     Level-by-level plausibility flags for a DataFrame stacking MANY profiles.
 
@@ -688,6 +772,15 @@ def flag_implausible_levels(data, profile_id_column="profile_id",
     With return_reasons=True, a dict {variable: Series} is returned as 3rd
     item with the text of the reason for the rejected levels only (indexed
     by positional row numbers of `data`).
+
+    expected_uncertainties_by_profile:
+        Optional dict {profile_id: {qc_unc_key: bool} | None}. It tells the
+        evaluator, for every profile, which uncertainty columns the file
+        format of that profile is expected to provide. The missing-
+        uncertainty rule is applied only to the columns marked True; a
+        column that the format does not provide is not flagged as missing.
+        A per-profile value of None (or a profile_id absent from the dict)
+        means "expect all" (backwards-compatible behaviour).
     """
     n_rows = len(data)
     implausible = {var: np.zeros(n_rows, dtype=bool)
@@ -701,9 +794,15 @@ def flag_implausible_levels(data, profile_id_column="profile_id",
     reason_rows = {var: [] for var in PLAUSIBILITY_RULES}
     reason_texts = {var: [] for var in PLAUSIBILITY_RULES}
 
-    for rows in rows_by_profile.values():
+    for profile_id, rows in rows_by_profile.items():
+        expected_unc = None
+        if expected_uncertainties_by_profile is not None:
+            expected_unc = expected_uncertainties_by_profile.get(profile_id)
+
         result = evaluate_level_plausibility(
-            data.iloc[rows], max_altitude_m, return_reasons=return_reasons)
+            data.iloc[rows], max_altitude_m,
+            return_reasons=return_reasons,
+            expected_uncertainties=expected_unc)
         _, rejected, uncertainty_rejected = result[:3]
         if return_reasons:
             for var, reason_array in result[3].items():

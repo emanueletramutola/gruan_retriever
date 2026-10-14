@@ -69,6 +69,8 @@ def _process_netcdf_file(file):
         # Create in-memory NetCDF dataset from file bytes
         # Uses 'inmemoryfile' as dummy filename since we're reading from memory
         with Dataset('inmemoryfile', mode='r', memory=file.read()) as nc:
+            nc.set_auto_mask(False)
+
             data = _extract_variables(nc)
             metadata = _extract_global_attributes(nc)
 

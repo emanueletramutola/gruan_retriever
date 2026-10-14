@@ -109,7 +109,11 @@ UNIT_TRANSFORMS: dict[str, tuple[float, float]] = {
     'wvmr_vol_uc_tcor': (1e-6, 0.0),  # Systematic uncertainty CF 1.7
     'press':            (100.0, 0.0),
     'u_press':          (100.0, 0.0),
-    'press_uc':         (100.0, 0.0)
+    'press_uc':         (100.0, 0.0),
+    'rh':               (100.0, 0.0),
+    'u_std_rh':         (100.0, 0.0),
+    'u_cor_rh':         (100.0, 0.0),
+    'u_rh':             (100.0, 0.0),
 }
 
 # ── plausibility QC configuration ─────────────────────────────────────────────
@@ -135,9 +139,9 @@ UNIT_TRANSFORMS: dict[str, tuple[float, float]] = {
 # If the units of your DB differ, change the scale factors here.
 QC_INPUT_COLUMNS = {
     # --- Values ---
-    'height':                     [('alt', 1.0)],
+    'height':                     [('u_alt', 1.0), ('alt', 1.0)],
     'temperature':                [('temp', 1.0)],
-    'relative_humidity':          [('rh', 0.01)],
+    'relative_humidity':          [('rh', 1.0)],
     'wind_speed':                 [('wspeed', 1.0)],
     'wind_direction':             [('wdir', 1.0)],
     'u':                          [('u', 1.0), ('wzon', 1.0)],
@@ -152,7 +156,7 @@ QC_INPUT_COLUMNS = {
     # --- Total uncertainties ---
     'height_uc_tot':              [('alt_uc', 1.0)],
     'temperature_uc_tot':         [('u_temp', 1.0), ('temp_uc', 1.0)],
-    'relative_humidity_uc_tot':   [('u_rh', 0.01), ('rh_uc', 0.01)],
+    'relative_humidity_uc_tot':   [('u_rh', 1.0), ('rh_uc', 1.0)],
     'wind_speed_uc_tot':          [('u_wspeed', 1.0), ('wspeed_uc', 1.0)],
     'wind_direction_uc_tot':      [('u_wdir', 1.0), ('wdir_uc', 1.0)],
     'u_uc_tot':                   [('wzon_uc', 1.0)],
@@ -167,11 +171,94 @@ QC_INPUT_COLUMNS = {
     'temperature_uc_std':         [('u_std_temp', 1.0)],
     'relative_humidity_uc_std':   [('u_std_rh', 0.01)],
     # --- Systematic (correlated) uncertainties ---
-    'temperature_uc_sys':         [('temp_uc_tcor', 1.0)],
-    'relative_humidity_uc_sys':   [('rh_uc_tcor', 0.01)],
+    'temperature_uc_sys':         [('temp_uc_tcor', 1.0), ('u_cor_temp', 1.0)],
+    'relative_humidity_uc_sys':   [('rh_uc_tcor', 0.01), ('u_cor_rh', 0.01)],
     'wvmr_uc_sys':                [('wvmr_vol_uc_tcor', 1.0)],
     'geopot_uc_sys':              [('alt_gph_uc_tcor', 1.0)],
 }
+
+# ── file-format detection and per-format uncertainty expectations ────────────
+# GRUAN products are distributed in two flavours (CF-1.4 and CF-1.7). The
+# same physical quantity can be stored under different column names in the
+# two formats, and some uncertainties exist in only one of them (e.g. the
+# frost-point uncertainty 'fp_uc' is CF-1.7 only, the random temperature
+# uncertainty 'u_std_temp' is CF-1.4 only).
+#
+# The plausibility QC must know, for each profile, which uncertainty
+# columns its file format is expected to provide:
+#   * a format-specific column that is missing entirely (not provided by
+#     the format) must NOT trigger the missing-uncertainty rule;
+#   * a column that is provided but carries a NaN at individual levels
+#     MUST trigger it.
+# The information is derived from CDM_VARIABLES, which is the single
+# source of truth for the CF-1.4 / CF-1.7 column names.
+
+_CF14_UNC_DB_COLUMNS = frozenset(
+    c for entry in CDM_VARIABLES
+    for c in (entry[5], entry[6], entry[8]) if c
+)
+_CF17_UNC_DB_COLUMNS = frozenset(
+    c for entry in CDM_VARIABLES
+    for c in (entry[7], entry[9]) if c
+)
+
+def _build_qc_uncertainties_by_format():
+    """For each QC uncertainty key (the *_uc_tot / *_uc_std / *_uc_sys
+    keys of QC_INPUT_COLUMNS) determine whether CF-1.4 and CF-1.7 are
+    expected to provide it, by cross-referencing its source DB columns
+    with the format-specific uncertainty columns of CDM_VARIABLES."""
+    out = {'CF-1.4': {}, 'CF-1.7': {}}
+    for qc_key, sources in QC_INPUT_COLUMNS.items():
+        if not qc_key.endswith(('_uc_tot', '_uc_std', '_uc_sys')):
+            continue
+        db_cols = {c for c, _ in sources}
+        out['CF-1.4'][qc_key] = bool(db_cols & _CF14_UNC_DB_COLUMNS)
+        out['CF-1.7'][qc_key] = bool(db_cols & _CF17_UNC_DB_COLUMNS)
+    return out
+
+
+QC_UNCERTAINTIES_BY_FORMAT = _build_qc_uncertainties_by_format()
+
+
+def _detect_profile_formats(df_merged: pd.DataFrame,
+                            profile_id_column: str = 'g_product_id') -> pd.Series:
+    """Return, per profile_id, 'CF-1.4' / 'CF-1.7' / None, based on
+    which format-specific columns carry data. All levels of a profile
+    come from the same source file, so they share the same format."""
+    cf14_any = pd.Series(False, index=df_merged.index)
+    for c in _CF14_UNC_DB_COLUMNS:
+        if c in df_merged.columns:
+            cf14_any |= df_merged[c].notna()
+    cf17_any = pd.Series(False, index=df_merged.index)
+    for c in _CF17_UNC_DB_COLUMNS:
+        if c in df_merged.columns:
+            cf17_any |= df_merged[c].notna()
+
+    fmt_by_row = pd.Series(
+        np.where(cf17_any, 'CF-1.7',
+                 np.where(cf14_any, 'CF-1.4', None)),
+        index=df_merged.index, dtype=object)
+
+    # Collapse per-row to per-profile (all rows of a profile agree).
+    return (df_merged[[profile_id_column]]
+            .assign(_fmt=fmt_by_row)
+            .groupby(profile_id_column, sort=False)['_fmt']
+            .agg(lambda s: next((v for v in s if v is not None), None)))
+
+
+def _expected_uncertainties_by_profile(df_merged: pd.DataFrame) -> dict:
+    """Return {profile_id: {qc_unc_key: bool} | None}, to pass to
+    qc_pipeline.flag_implausible_levels. True marks the QC uncertainty
+    columns that this profile's file format is expected to provide.
+    None (per profile) means 'format undetermined: expect all'."""
+    formats = _detect_profile_formats(df_merged)
+    out = {}
+    for profile_id, fmt in formats.items():
+        if fmt not in QC_UNCERTAINTIES_BY_FORMAT:
+            out[profile_id] = None
+            continue
+        out[profile_id] = dict(QC_UNCERTAINTIES_BY_FORMAT[fmt])
+    return out
 
 # Levels above this altitude (m) are not checked (same default as qc_pipeline).
 # Use None to check every level.
@@ -949,12 +1036,16 @@ def apply_plausibility_qc(df_merged: pd.DataFrame,
         )
         qc_df['profile_id'] = df_merged['g_product_id'].to_numpy()
 
+    with TIMER('plausibility_qc/detect_format'):
+        expected_unc_by_profile = _expected_uncertainties_by_profile(df_merged)
+
     # 2) level-by-level flags, profile by profile
     with TIMER('plausibility_qc/flag_implausible_levels'):
         flags = qc_pipeline.flag_implausible_levels(
             qc_df, profile_id_column='profile_id',
             max_altitude_m=max_altitude_m,
-            return_reasons=report_path is not None)
+            return_reasons=report_path is not None,
+            expected_uncertainties_by_profile=expected_unc_by_profile)
         implausible, implausible_uncertainty = flags[:2]
 
     # 2b) record what is about to be set to NULL, and why
