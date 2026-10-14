@@ -1815,7 +1815,8 @@ def export_month(conn_params, year, month, output_dir,
                  data_table='data', header_table='header',
                  station_lookup: dict = None, apply_qc: bool = True,
                  threads: int = None, read_method: str = 'adbc',
-                 legacy_cdm: bool = False):
+                 legacy_cdm: bool = False,
+                 implausibility_report: bool = True):
     start_date = datetime(year, month, 1, tzinfo=timezone.utc)
     end_date   = (
         datetime(year + 1, 1, 1, tzinfo=timezone.utc) if month == 12
@@ -1892,7 +1893,8 @@ def export_month(conn_params, year, month, output_dir,
         with TIMER('plausibility_qc'):
             df_merged = apply_plausibility_qc(
                 df_merged,
-                report_path=_implausibility_part_path(output_dir, year, month))
+                report_path=(_implausibility_part_path(output_dir, year, month)
+                             if implausibility_report else None))
 
     with TIMER('unit_transforms'):
         for col, (scale, offset) in UNIT_TRANSFORMS.items():
@@ -2050,7 +2052,8 @@ def _worker_init(log_path, threads, pg_settings):
 
 
 def _worker_run(conn_params, year, month, output_dir, data_table, header_table,
-                station_lookup, apply_qc, threads, read_method, legacy_cdm):
+                station_lookup, apply_qc, threads, read_method, legacy_cdm,
+                implausibility_report):
     """Runs in a worker process: exports ONE month, returns its timings."""
     TIMER.reset()
     RUN_TIMER.reset()
@@ -2059,7 +2062,8 @@ def _worker_run(conn_params, year, month, output_dir, data_table, header_table,
         with contextlib.redirect_stdout(io.StringIO()):  # the per-month report goes to the log
             export_month(conn_params, year, month, output_dir, data_table, header_table,
                          station_lookup=station_lookup, apply_qc=apply_qc, threads=threads,
-                         read_method=read_method, legacy_cdm=legacy_cdm)
+                         read_method=read_method, legacy_cdm=legacy_cdm,
+                         implausibility_report=implausibility_report)
     except Exception as exc:
         # Return the error as plain DATA, never raise it across the process boundary:
         # some exceptions (e.g. ADBC's) pickle fine but cannot be unpickled, which makes
@@ -2102,7 +2106,7 @@ def run_months_parallel(conn_params, months, output_dir, args, station_lookup, j
                 fut = pool.submit(_worker_run, conn_params, ym[0], ym[1], output_dir,
                                   args.data_table, args.header_table, station_lookup,
                                   not args.skip_qc, per_worker_threads, args.read_method,
-                                  args.legacy_cdm)
+                                  args.legacy_cdm, not args.no_implausibility_report)
                 running[fut] = (ym, est)
                 reserved += est
             finished, _ = wait(list(running), return_when=FIRST_COMPLETED)
@@ -2181,6 +2185,13 @@ def main():
                          help='Do not write the timing log file.')
     parser.add_argument('--skip-qc', action='store_true',
                         help='Do not replace implausible values with NULL.')
+    parser.add_argument('--no-implausibility-report', action='store_true',
+                        help='Run the plausibility QC as usual (values are still set '
+                             'to NULL) but do not write the CSV report of the '
+                             'implausible values: neither the monthly part files under '
+                             '<output_dir>/implausible_values_by_month/ nor the merged '
+                             'implausible_values.csv. Existing part files from earlier '
+                             'runs are left untouched.')
     args = parser.parse_args()
     PG_SESSION_SETTINGS[:] = _parse_pg_settings(args.pg_set)      # in place: read by every connection helper
 
@@ -2271,7 +2282,8 @@ def main():
                 export_month(conn_params, y, m, output_dir, args.data_table, args.header_table,
                              station_lookup=station_lookup, apply_qc=not args.skip_qc,
                              threads=args.threads, read_method=args.read_method,
-                             legacy_cdm=args.legacy_cdm)
+                             legacy_cdm=args.legacy_cdm,
+                             implausibility_report=not args.no_implausibility_report)
     except BaseException as exc:
         # keep what was measured so far, and record why the run stopped
         log(f"\n!! RUN INTERRUPTED after {time.perf_counter() - start_time:.2f}s: "
@@ -2286,7 +2298,7 @@ def main():
 
     net.stop()
 
-    if not args.skip_qc:
+    if not args.skip_qc and not args.no_implausibility_report:
         merged_report = merge_implausibility_reports(output_dir)
         if merged_report:
             emit(f"\nImplausible values report: {merged_report[0]} "
