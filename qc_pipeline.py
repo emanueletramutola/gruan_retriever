@@ -147,7 +147,7 @@ PLAUSIBILITY_RULES = {
         "val_col": "geopot",
         "unc_total_col": "geopot_uc_tot",
         "other_unc_cols": ["geopot_uc_sys"],
-        "unc_range": None,
+        "unc_range": (0.0, 1000.0),
         "check_range": (-10.0, 47000.0),
         "dep_vars": ["pressure"],
         "report_scale": 1.0,
