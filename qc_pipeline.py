@@ -26,7 +26,10 @@ CTH_TEMPERATURE_THR_K = 268.15
 # ==========================================
 # NETCDF PRODUCT-SPECIFIC NAMES AND UNITS
 # ==========================================
+# Geometric altitude first (the same quantity as the `height` levels it is
+# compared with); the older attributes are only fallbacks.
 TROPOPAUSE_ATTRIBUTE_CANDIDATES = (
+    "g.Measurement.TropopauseAltitude",
     "g.Measurement.TropopauseGeopotHeight",
     "g.Ascent.TropopauseHeight",
 )
@@ -279,17 +282,34 @@ def zhang_cold_cloud_layers(rh, height, temperature,
     alt_agl = alt_msl - alt_msl[0]
     alt_km = alt_agl / 1000.0
     rh_calc = rh_over_ice(temp_k, rh_w)
+
+    # OLD - START
+    # min_rh = np.select(
+    #     [(alt_km >= 2) & (alt_km < 6), (alt_km >= 6) & (alt_km <= 12),
+    #      alt_km > 12], [0.90, 0.88, 0.80], default=np.nan)
+    # max_rh = np.select(
+    #     [(alt_km >= 2) & (alt_km < 6), (alt_km >= 6) & (alt_km <= 12),
+    #      alt_km > 12], [0.93, 0.90, 0.70], default=np.nan)
+    # inter_rh = np.select(
+    #     [(alt_km >= 2) & (alt_km < 6), (alt_km >= 6) & (alt_km <= 12),
+    #      alt_km > 12], [0.80, 0.75, 0.70], default=np.nan)
+    # is_moist = ((alt_km >= 2.0) & ~np.isnan(min_rh)
+    #             & (rh_calc >= min_rh) & (temp_k <= temp_max_k))
+    # OLD - END
+
+    # NEW - START
     min_rh = np.select(
-        [(alt_km >= 2) & (alt_km < 6), (alt_km >= 6) & (alt_km <= 12),
-         alt_km > 12], [0.90, 0.88, 0.80], default=np.nan)
+        [alt_km < 6, (alt_km >= 6) & (alt_km <= 12), alt_km > 12],
+        [0.90, 0.88, 0.80], default=np.nan)
     max_rh = np.select(
-        [(alt_km >= 2) & (alt_km < 6), (alt_km >= 6) & (alt_km <= 12),
-         alt_km > 12], [0.93, 0.90, 0.70], default=np.nan)
+        [alt_km < 6, (alt_km >= 6) & (alt_km <= 12), alt_km > 12],
+        [0.93, 0.90, 0.70], default=np.nan)
     inter_rh = np.select(
-        [(alt_km >= 2) & (alt_km < 6), (alt_km >= 6) & (alt_km <= 12),
-         alt_km > 12], [0.80, 0.75, 0.70], default=np.nan)
-    is_moist = ((alt_km >= 2.0) & ~np.isnan(min_rh)
-                & (rh_calc >= min_rh) & (temp_k <= temp_max_k))
+        [alt_km < 6, (alt_km >= 6) & (alt_km <= 12), alt_km > 12],
+        [0.80, 0.75, 0.70], default=np.nan)
+    is_moist = ((~np.isnan(min_rh)) & (rh_calc >= min_rh) & (temp_k <= temp_max_k))
+    # NEW - END
+
     diffs = np.diff(is_moist.astype(int))
     starts = np.where(diffs == 1)[0] + 1
     ends = np.where(diffs == -1)[0]
@@ -351,7 +371,10 @@ def check_cloud_top(rh, height, pressure, temperature):
     valid_pressure = pressure[valid]
     top_pressure = (valid_pressure[top_layer["end_idx"]]
                     if top_layer["end_idx"] < len(valid_pressure) else np.nan)
-    return {"index": top_layer["end_idx"], "height": top_layer["top_msl"],
+    # `end_idx` refers to the compacted (valid-only) arrays used by the
+    # Zhang algorithm: map it back to the index of the original profile.
+    original_index = int(np.flatnonzero(valid)[top_layer["end_idx"]])
+    return {"index": original_index, "height": top_layer["top_msl"],
             "pressure": top_pressure, "flag": True}
 
 
@@ -884,6 +907,37 @@ def parse_numeric_attribute(attr_value):
     return float(match.group()) if match else np.nan
 
 
+def parse_altitude_attribute_m(attr_value):
+    """
+    Parses an altitude attribute such as '8995.3 gpm', '9042.2 m' or
+    '9.0 km' and returns it in metres. Missing values, unknown units,
+    sentinels (e.g. -999) and values outside (0, PLAUSIBILITY_MAX_ALTITUDE_M)
+    return NaN.
+    """
+    if attr_value is None:
+        return np.nan
+    match = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?\s*([A-Za-z]*)",
+                      str(attr_value))
+    if not match:
+        return np.nan
+    value = parse_numeric_attribute(attr_value)
+    unit = match.group(1).strip().lower()
+    if unit in ("", "m", "gpm"):
+        scale = 1.0
+    elif unit == "km":
+        scale = 1000.0
+    else:
+        print(f"[WARNING] Unrecognised unit '{unit}' in the tropopause "
+              f"attribute '{attr_value}': tropopause set to NaN.")
+        return np.nan
+    value *= scale
+    if not (0.0 < value < PLAUSIBILITY_MAX_ALTITUDE_M):
+        print(f"[WARNING] Tropopause attribute '{attr_value}' is outside "
+              f"the valid range: tropopause set to NaN.")
+        return np.nan
+    return value
+
+
 # ==========================================
 # README
 # ==========================================
@@ -905,16 +959,43 @@ considered. RH is converted from w.r.t. water to w.r.t. ice for
 temperatures below 0 degC.
 
 ## Completeness
-Completeness is the fraction of missing data records.
+Despite its name, `Completeness_*` is the FRACTION OF MISSING data
+records: 0 means a fully complete variable, 1 means that every record
+is missing. Lower values are therefore better.
 HIGH: < 0.10
 GOOD: 0.10 <= C < 0.20
 FAIL: >= 0.20
 
+Notes:
+- It is computed after the plausibility check, so levels rejected by
+  the plausibility rules (set to NULL) count as missing.
+- `Ntotal_<var>` is the number of levels of the whole profile.
+  `Ntotal_<var>_troposphere` / `_stratosphere` count only the levels
+  with a known height, split at the tropopause altitude, so their sum
+  can be lower than `Ntotal_<var>`. If the tropopause is unknown the
+  two layers are reported as N/A with Ntotal = 0.
+- For the whole profile a level is missing if the variable or its
+  height is missing; for the two layers only the variable is checked.
+- The tropopause altitude (metres) is read from the file attributes:
+  the geometric altitude of the tropopause
+  (g.Measurement.TropopauseAltitude), which is the same quantity as the
+  profile heights it is compared with. Only if it is missing, the
+  geopotential height or the older g.Ascent.TropopauseHeight attribute
+  is used instead.
+
 ## Plausibility
 A variable is plausible (1) if no level up to 47 km is rejected, not
-plausible (0) otherwise. For each variable the following rules are
+plausible (0) otherwise. If no level can be evaluated (e.g. all heights
+are unknown) the flag is NaN. For each variable the following rules are
 applied level by level:
 
+0. Missing uncertainty: a level is rejected if any uncertainty that the
+   file format (CF-1.4 or CF-1.7) is expected to provide is NaN at that
+   level. Uncertainties that exist in the other format only (e.g. the
+   *_std temperature and RH columns, CF-1.4 only) are not treated as
+   missing. The expectations per format are the same used by
+   gruan_exporter.py. If the format cannot be determined, all
+   uncertainties are expected.
 1. Uncertainty range: every available uncertainty column of the variable
    (total, random, systematic) is compared with the plausible range of
    the variable. The level is rejected if at least one of them is outside
@@ -965,6 +1046,69 @@ def extract_netcdf_bytes_from_jar(jar_path):
     return nc_bytes, nc_entry.filename
 
 
+# ------------------------------------------------------------------
+# Uncertainty columns expected from each file format (CF-1.4 / CF-1.7).
+# This mirrors the logic of gruan_exporter.py (QC_UNCERTAINTIES_BY_FORMAT,
+# _detect_profile_formats), so that the log and the exported data apply
+# the missing-uncertainty rule in the same way. Keep it in sync with the
+# exporter: CDM_VARIABLES / QC_INPUT_COLUMNS are the source of truth.
+# ------------------------------------------------------------------
+# NetCDF/DB columns holding uncertainties that exist in one format only.
+CF14_UNC_FILE_COLUMNS = frozenset({
+    "u_alt", "u_cor_rh", "u_cor_temp", "u_press", "u_rh", "u_std_rh",
+    "u_std_temp", "u_swrad", "u_temp", "u_wdir", "u_wspeed",
+})
+CF17_UNC_FILE_COLUMNS = frozenset({
+    "alt_gph_uc", "alt_gph_uc_tcor", "alt_uc", "fp_uc", "press_uc",
+    "rh_uc", "rh_uc_tcor", "temp_uc", "temp_uc_tcor", "vspeed_uc",
+    "wdir_uc", "wmeri_uc", "wspeed_uc", "wvmr_vol_uc", "wvmr_vol_uc_tcor",
+    "wzon_uc",
+})
+# QC uncertainty key -> file columns it can be read from.
+QC_UNCERTAINTY_SOURCES = {
+    "height_uc_tot":              ("alt_uc",),
+    "temperature_uc_tot":         ("u_temp", "temp_uc"),
+    "relative_humidity_uc_tot":   ("u_rh", "rh_uc"),
+    "wind_speed_uc_tot":          ("u_wspeed", "wspeed_uc"),
+    "wind_direction_uc_tot":      ("u_wdir", "wdir_uc"),
+    "u_uc_tot":                   ("wzon_uc",),
+    "v_uc_tot":                   ("wmeri_uc",),
+    "pressure_uc_tot":            ("u_press", "press_uc"),
+    "geopot_uc_tot":              ("alt_gph_uc",),
+    "wvmr_uc_tot":                ("wvmr_vol_uc",),
+    "frost_point_uc_tot":         ("fp_uc",),
+    "shortwave_radiation_uc_tot": ("u_swrad",),
+    "vertical_speed_uc_tot":      ("vspeed_uc",),
+    "temperature_uc_std":         ("u_std_temp",),
+    "relative_humidity_uc_std":   ("u_std_rh",),
+    "temperature_uc_sys":         ("temp_uc_tcor", "u_cor_temp"),
+    "relative_humidity_uc_sys":   ("rh_uc_tcor", "u_cor_rh"),
+    "wvmr_uc_sys":                ("wvmr_vol_uc_tcor",),
+    "geopot_uc_sys":              ("alt_gph_uc_tcor",),
+}
+QC_UNCERTAINTIES_BY_FORMAT = {
+    "CF-1.4": {k: bool(set(v) & CF14_UNC_FILE_COLUMNS)
+               for k, v in QC_UNCERTAINTY_SOURCES.items()},
+    "CF-1.7": {k: bool(set(v) & CF17_UNC_FILE_COLUMNS)
+               for k, v in QC_UNCERTAINTY_SOURCES.items()},
+}
+UNC_FORMAT_COLUMN = "uncertainty_format"
+
+
+def detect_uncertainty_format(columns_with_data):
+    """
+    'CF-1.7' if any CF-1.7-only uncertainty column carries data, else
+    'CF-1.4' if any CF-1.4-only one does, else None (undetermined).
+    Same precedence as the exporter.
+    """
+    cols = set(columns_with_data)
+    if cols & CF17_UNC_FILE_COLUMNS:
+        return "CF-1.7"
+    if cols & CF14_UNC_FILE_COLUMNS:
+        return "CF-1.4"
+    return None
+
+
 def load_netcdf_profile(jar_file_path):
     print(f"[INFO] Opening jar archive: {os.path.basename(jar_file_path)}")
     try:
@@ -979,18 +1123,23 @@ def load_netcdf_profile(jar_file_path):
         if dt_str == "UNKNOWN":
             dt_str = ds.attrs.get("g.Ascent.StandardTime", "UNKNOWN")
         try:
-            dt = datetime.strptime(dt_str.split(".")[0],
-                                   "%Y-%m-%dT%H:%M:%S").strftime(
-                "%Y-%m-%d %H:%M:%S")
+            dt = datetime.strptime(
+                str(dt_str).split(".")[0].rstrip("Zz"),
+                "%Y-%m-%dT%H:%M:%S").strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
-            dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # Never substitute the processing time for the measurement
+            # time: flag the profile as having an unknown date instead.
+            print(f"[WARNING] Cannot parse the profile date "
+                  f"'{dt_str}' in {os.path.basename(jar_file_path)}: "
+                  f"Date set to UNKNOWN.")
+            dt = "UNKNOWN"
 
         tropopause_attr = None
         for attr_name in TROPOPAUSE_ATTRIBUTE_CANDIDATES:
             if attr_name in ds.attrs:
                 tropopause_attr = ds.attrs[attr_name]
                 break
-        tropopause_altitude = parse_numeric_attribute(tropopause_attr)
+        tropopause_altitude = parse_altitude_attribute_m(tropopause_attr)
 
         # Variable mapping: internal name -> candidate NetCDF names.
         # The first candidate found wins (CF-1.4 first, then CF-1.7).
@@ -1026,10 +1175,10 @@ def load_netcdf_profile(jar_file_path):
             "geopot_uc_sys":               ["alt_gph_uc_tcor"],
             "geopot_uc_tot":               ["alt_gph_uc"],
             # Other
-            "frost_point":                 ["fp"],
+            "frost_point":                 ["fp", "FP"],
             "frost_point_uc_tot":          ["fp_uc"],
-            "shortwave_radiation":         ["swrad"],
-            "shortwave_radiation_uc_tot":  ["u_swrad"],
+            "shortwave_radiation":         ["swrad", "SWrad"],
+            "shortwave_radiation_uc_tot":  ["u_swrad", "u_SWrad"],
             "vertical_speed":              ["vspeed", "asc"],
             "vertical_speed_uc_tot":       ["vspeed_uc"],
             # "Air relative humidity effective vertical resolution":
@@ -1051,6 +1200,21 @@ def load_netcdf_profile(jar_file_path):
             else:
                 extracted_data[internal_key] = None
 
+        # File format (CF-1.4 / CF-1.7), from the format-specific
+        # uncertainty columns that carry data. It drives the
+        # `expected_uncertainties` argument of the plausibility check.
+        cols_with_data = set()
+        lower_to_real = {name.lower(): name for name in ds.variables}
+        for _col in CF14_UNC_FILE_COLUMNS | CF17_UNC_FILE_COLUMNS:
+            _real = lower_to_real.get(_col)
+            if _real is not None:
+                try:
+                    if np.isfinite(ds[_real].values.astype(float)).any():
+                        cols_with_data.add(_col)
+                except (TypeError, ValueError):
+                    pass
+        uncertainty_format = detect_uncertainty_format(cols_with_data)
+
         ref_len = 0
         for k in ["pressure", "height", "temperature"]:
             if isinstance(extracted_data.get(k), np.ndarray):
@@ -1069,9 +1233,13 @@ def load_netcdf_profile(jar_file_path):
                        "relative_humidity_uc_std",
                        "relative_humidity_uc_sys",
                        "relative_humidity_uc_tot"):
-            rh_units = extracted_units.get(rh_key)
+            if rh_key not in extracted_units:
+                continue  # variable absent from the file
+            rh_units = extracted_units[rh_key]
             if rh_units is None:
-                continue
+                raise ValueError(
+                    f"Missing 'units' attribute for '{rh_key}': cannot "
+                    f"determine whether RH is a percentage or a fraction.")
             rh_units_norm = str(rh_units).strip().lower()
             if rh_units_norm in RH_PERCENT_UNITS:
                 extracted_data[rh_key] = extracted_data[rh_key] / 100.0
@@ -1083,9 +1251,13 @@ def load_netcdf_profile(jar_file_path):
 
         # WVMR unit conversion (fraction -> ppmv).
         for wv_key in ("wvmr", "wvmr_uc_sys", "wvmr_uc_tot"):
-            wv_units = extracted_units.get(wv_key)
+            if wv_key not in extracted_units:
+                continue  # variable absent from the file
+            wv_units = extracted_units[wv_key]
             if wv_units is None:
-                continue
+                raise ValueError(
+                    f"Missing 'units' attribute for '{wv_key}': cannot "
+                    f"convert to ppmv.")
             wv_units_norm = str(wv_units).strip().lower()
             if wv_units_norm in WVMR_FRACTION_UNITS:
                 extracted_data[wv_key] = extracted_data[wv_key] * 1.0e6
@@ -1099,6 +1271,8 @@ def load_netcdf_profile(jar_file_path):
         df_profile["station"] = station
         df_profile["source_file"] = os.path.basename(jar_file_path)
         df_profile["tropopause_altitude"] = tropopause_altitude
+        df_profile[UNC_FORMAT_COLUMN] = (uncertainty_format
+                                         if uncertainty_format else "")
 
         ds.close()
         try:
@@ -1114,6 +1288,22 @@ def load_netcdf_profile(jar_file_path):
 # ==========================================
 # MAIN PROCESSING
 # ==========================================
+def expected_uncertainties_from_profile(profile):
+    """
+    Builds the `expected_uncertainties` dict {uncertainty key: bool} for one
+    profile, from the file format of the profile (see
+    QC_UNCERTAINTIES_BY_FORMAT, same rule as gruan_exporter.py). Returns
+    None ("expect all", the evaluator's default) when the format is
+    undetermined or not available.
+    """
+    if UNC_FORMAT_COLUMN not in profile.columns:
+        return None
+    fmt = profile[UNC_FORMAT_COLUMN].iloc[0]
+    if not isinstance(fmt, str) or fmt not in QC_UNCERTAINTIES_BY_FORMAT:
+        return None
+    return dict(QC_UNCERTAINTIES_BY_FORMAT[fmt])
+
+
 def process_gruan_profiles(data_source, output_log_path=OUTPUT_LOG_PATH):
     log_records = []
     group_keys = ["datetime", "station"]
@@ -1134,7 +1324,10 @@ def process_gruan_profiles(data_source, output_log_path=OUTPUT_LOG_PATH):
         # Plausibility: level-by-level evaluation and NULLing
         # -------------------------------------------------------------
         evaluated_levels, rejected, uncertainty_rejected = (
-            evaluate_level_plausibility(profile))
+            evaluate_level_plausibility(
+                profile,
+                expected_uncertainties=expected_uncertainties_from_profile(
+                    profile)))
         profile = apply_plausibility_nulling(profile, rejected,
                                              uncertainty_rejected)
 
@@ -1157,8 +1350,11 @@ def process_gruan_profiles(data_source, output_log_path=OUTPUT_LOG_PATH):
         # -------------------------------------------------------------
         # Per-variable plausibility flags
         # -------------------------------------------------------------
+        # With no evaluable level (e.g. all heights unknown) nothing was
+        # checked: the flags are NaN ("not evaluated"), not 1 ("plausible").
+        any_level_evaluated = bool(np.any(evaluated_levels))
         plaus_flags = {
-            var: (np.nan if level_mask is None
+            var: (np.nan if (level_mask is None or not any_level_evaluated)
                   else not np.any(level_mask))
             for var, level_mask in rejected.items()
         }
