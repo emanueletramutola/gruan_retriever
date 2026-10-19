@@ -79,3 +79,5 @@ Thumbs.db
 
 # Config (uncomment if contains sensitive data)
 # config.yaml
+
+qc_log.csv
