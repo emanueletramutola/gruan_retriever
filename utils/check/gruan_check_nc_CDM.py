@@ -16,12 +16,15 @@ Numeric codes are decoded with the official CDM lookup tables
 (https://github.com/ecmwf-projects/cdm-obs), downloaded at start-up.
 Use --units-table / --variable-table to point to local copies (offline use).
 
-For the observation it also counts, level by level, the valid values below /
-above the plausible range of the variable (PLAUSIBLE_RANGES_BY_CODE) and writes
-the bounds used, so that the report script can quantify the number and fraction
-of out-of-bounds levels (not only the file minimum / maximum).
+For the observation it also writes the plausible range of the variable
+(observation_value_range_lo / _hi), so that the report script can compare it
+with the file minimum / maximum. The ranges are NOT defined here: they
+are read from PLAUSIBILITY_RULES[...]["check_range"] in qc_pipeline.py and
+converted to the units of the CDM files (see CDM_CODE_TO_RULE).
 
-Output: one CSV file with one row per (file, observed_variable).
+Output: two CSV files with the same columns (the total one without "file"):
+    - OUTPUT_CSV       : one row per (file, observed_variable), i.e. per month
+    - OUTPUT_CSV_TOTAL : one row per observed_variable, over all the files
 
 Usage examples
 --------------
@@ -39,6 +42,7 @@ Requirements: numpy, pandas, netCDF4  (pip install numpy pandas netCDF4)
 """
 
 import argparse
+import importlib.util
 import logging
 import os
 import sys
@@ -59,6 +63,14 @@ INPUT_DIR = "/Data/GRUAN_TEST/output"         # directory containing the NetCDF 
 OUTPUT_CSV = "/Data/GRUAN_TEST/output/gruan_check_nc_CDM.csv"  # output CSV: full path + file name
 # OUTPUT_CSV = "/storage/baron-data/GRUAN_CDS/gruan_check_nc_CDM.csv"  # output CSV: full path + file name
 
+# Total summary over all the files (same columns as OUTPUT_CSV)
+OUTPUT_CSV_TOTAL = "/Data/GRUAN_TEST/output/gruan_check_nc_CDM_total.csv"
+# OUTPUT_CSV_TOTAL = "/storage/baron-data/GRUAN_CDS/gruan_check_nc_CDM_total.csv"
+
+# qc_pipeline.py, from which the plausibility ranges (check_range) are read.
+# Relative to the directory of this script (two levels up).
+QC_PIPELINE_PATH = str(Path(__file__).resolve().parent / "../../qc_pipeline.py")
+
 N_WORKERS = 23                             # parallel worker processes (1 = serial)
 
 # --------------------------------------------------------------------------- #
@@ -67,40 +79,86 @@ N_WORKERS = 23                             # parallel worker processes (1 = seri
 GROUP_VAR = "observed_variable"
 UNITS_VAR = "units"  # numeric code of the units of observation_value
 
-# NetCDF variable -> (label used in the CSV, matching "uncertainty_unitsN" var)
+# NetCDF variable -> label used in the CSV
 VALUE_VARS = {
-    "observation_value": ("observation_value", None),
-    "uncertainty_value1": ("uncertainty_random", "uncertainty_units1"),
-    "uncertainty_value2": ("uncertainty_systematic", "uncertainty_units2"),
-    "uncertainty_value5": ("uncertainty_total", "uncertainty_units5"),
+    "observation_value": "observation_value",
+    "uncertainty_value1": "uncertainty_random",
+    "uncertainty_value2": "uncertainty_systematic",
+    "uncertainty_value5": "uncertainty_total",
 }
 
-# Plausible range of observation_value for each CDM observed_variable code,
-# as a closed interval (lower, upper) in the units written to the NetCDF files.
-# They are generous screening limits meant to catch gross errors only, NOT
-# GRUAN acceptance limits. The check counts, level by level, how many valid
-# observation values fall below / above them. The bounds themselves are written
-# to the CSV (observation_value_range_lo / _hi), so that the report script uses
-# exactly the same limits. Codes not listed here are not range-checked.
-PLAUSIBLE_RANGES_BY_CODE = {
-    126: (178.15, 323.15),    # air temperature                [K]
-    138: (0.0, 100.0),        # relative humidity              [%]
-    106: (0.0, 360.0),        # wind from direction            [deg]
-    107: (0.0, 180.0),        # wind speed                     [m s-1]
-    104: (-150.0, 150.0),     # eastward wind speed            [m s-1]
-    105: (-150.0, 150.0),     # northward wind speed           [m s-1]
-    123: (0.0, 0.05),         # water vapour mixing ratio      [mol mol-1]
-    122: (-10.0, 30.0),       # vertical speed of radiosonde   [m s-1]
-    117: (-10.0, 47000.0),   # geopotential height            [m]
-    116: (150.0, 330.0),      # frost point temperature        [K]
-    124: (0.0, 1000.0),       # RH effective vertical resolution [s]
-    73:  (0.0, 1600.0),       # shortwave radiation            [W m-2]
-    125: (-10.0, 47000.0),   # altitude                       [m]
-    142: (100.0, 108000.0),     # pressure                       [Pa]
-    143: (0.0, 21600.0),      # time since launch              [s]
+# CDM observed_variable code -> (key in PLAUSIBILITY_RULES of qc_pipeline.py,
+#                                factor: units of the pipeline -> units of the CDM files)
+# The ranges in qc_pipeline.py are expressed in the units used inside that
+# pipeline, which for some variables differ from the units written to the CDM
+# NetCDF files, hence the factor:
+#   relative humidity : fraction (0-1) -> per cent (x 100)
+#   pressure          : hPa            -> Pa       (x 100)
+#   water vapour m.r. : ppmv           -> mol/mol  (x 1e-6)
+# A code whose rule has check_range = None, or that has no rule at all, is NOT
+# range-checked (its counters and bounds are left empty in the CSV).
+CDM_CODE_TO_RULE = {
+    126: ("temperature", 1.0),            # air temperature                  [K]
+    138: ("relative_humidity", 100.0),    # relative humidity                [%]
+    106: ("wind_direction", 1.0),         # wind from direction              [deg]
+    107: ("wind_speed", 1.0),             # wind speed                       [m s-1]
+    104: ("u", 1.0),                      # eastward wind speed              [m s-1]
+    105: ("v", 1.0),                      # northward wind speed             [m s-1]
+    123: ("wvmr", 1e-6),                  # water vapour mixing ratio        [mol mol-1]
+    122: ("vertical_speed", 1.0),         # vertical speed of radiosonde     [m s-1]
+    117: ("geopot", 1.0),                 # geopotential height              [m]
+    116: ("frost_point", 1.0),            # frost point temperature          [K]
+    124: ("rh_resolution", 1.0),          # RH effective vertical resolution [s]
+    73:  ("shortwave_radiation", 1.0),    # shortwave radiation              [W m-2]
+    125: ("height", 1.0),                 # altitude                         [m]
+    142: ("pressure", 100.0),             # pressure                         [Pa]
+    # 143 (time since launch) has no counterpart in PLAUSIBILITY_RULES
 }
+
+
+def load_ranges_from_qc_pipeline(path: str):
+    """
+    Import qc_pipeline.py and return two dicts {CDM code: (lo, hi)}, converted
+    to the units of the CDM files:
+        obs_ranges -> PLAUSIBILITY_RULES[rule]["check_range"]  (observation)
+        unc_ranges -> PLAUSIBILITY_RULES[rule]["unc_range"]    (uncertainties)
+    The uncertainties of a variable have the same units as its observation, so
+    the same conversion factor applies. Codes whose range is None (or that have
+    no rule) are left out (= not checked).
+    """
+    if not Path(path).is_file():
+        raise FileNotFoundError(f"qc_pipeline.py not found: {path} (set QC_PIPELINE_PATH)")
+    spec = importlib.util.spec_from_file_location("qc_pipeline", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # safe: the pipeline main is under __main__
+    rules = module.PLAUSIBILITY_RULES
+
+    obs_ranges, unc_ranges = {}, {}
+    for code, (rule, factor) in CDM_CODE_TO_RULE.items():
+        if rule not in rules:
+            raise KeyError(f"'{rule}' (CDM code {code}) not found in PLAUSIBILITY_RULES")
+        for key, target in (("check_range", obs_ranges), ("unc_range", unc_ranges)):
+            rng = rules[rule].get(key)
+            if rng is None:
+                continue
+            lo, hi = rng
+            # round() removes floating-point noise (e.g. 50000 * 1e-6)
+            target[code] = (round(lo * factor, 12), round(hi * factor, 12))
+    return obs_ranges, unc_ranges
+
+
+# Plausible range of observation_value for each CDM observed_variable code, as
+# a closed interval (lower, upper) in the units written to the NetCDF files.
+# The bounds are written to the CSV (observation_value_range_lo / _hi).
+# Codes not listed are not range-checked. The same is done for the plausible
+# range of the uncertainties (unc_range), written as uncertainty_value_range_lo
+# / _hi.
+PLAUSIBLE_RANGES_BY_CODE, PLAUSIBLE_UNC_RANGES_BY_CODE = load_ranges_from_qc_pipeline(
+    QC_PIPELINE_PATH)
 RANGE_LO = {c: lo for c, (lo, hi) in PLAUSIBLE_RANGES_BY_CODE.items()}
 RANGE_HI = {c: hi for c, (lo, hi) in PLAUSIBLE_RANGES_BY_CODE.items()}
+UNC_RANGE_LO = {c: lo for c, (lo, hi) in PLAUSIBLE_UNC_RANGES_BY_CODE.items()}
+UNC_RANGE_HI = {c: hi for c, (lo, hi) in PLAUSIBLE_UNC_RANGES_BY_CODE.items()}
 
 CDM_BASE = "https://raw.githubusercontent.com/ecmwf-projects/cdm-obs/refs/heads/main/tables/"
 UNITS_TABLE_URL = CDM_BASE + "units.csv"
@@ -150,7 +208,8 @@ def load_lookups(units_src: str, variable_src: str):
 def analyse_file(path: Path, chunk_size: int) -> pd.DataFrame:
     """
     Analyse a single NetCDF file. Returns one row per observed_variable with
-    raw codes and, for every variable in VALUE_VARS: n_valid, min, max.
+    raw codes, n_records, n_records_missing (rows where observation_value is
+    NaN / NULL) and, for every variable in VALUE_VARS: n_valid, min, max.
     NaN / masked / infinite values are ignored.
     """
     with netCDF4.Dataset(path, "r") as ds:
@@ -172,7 +231,6 @@ def analyse_file(path: Path, chunk_size: int) -> pd.DataFrame:
 
         partial = []           # per-chunk aggregated DataFrames
         units_seen = {}        # observed_variable code -> set of units codes
-        unc_mismatch = set()   # observed_variable codes with uncertainty units != obs units
 
         for start in range(0, n_total, chunk_size):
             stop = min(start + chunk_size, n_total)
@@ -183,10 +241,6 @@ def analyse_file(path: Path, chunk_size: int) -> pd.DataFrame:
                 data[v] = arr
             if has_units:
                 data[UNITS_VAR] = ds.variables[UNITS_VAR][start:stop]
-                # Uncertainty units, needed only to verify they match the obs units
-                for v, (_, uvar) in VALUE_VARS.items():
-                    if uvar and uvar in ds.variables:
-                        data[uvar] = ds.variables[uvar][start:stop]
 
             df = pd.DataFrame(data)
             if group_fill is not None:
@@ -195,23 +249,14 @@ def analyse_file(path: Path, chunk_size: int) -> pd.DataFrame:
             if has_units:
                 for code, u in df.groupby(GROUP_VAR)[UNITS_VAR].unique().items():
                     units_seen.setdefault(int(code), set()).update(int(x) for x in u)
-                for v, (_, uvar) in VALUE_VARS.items():
-                    if uvar and uvar in df.columns:
-                        bad = df[df[v].notna() & (df[uvar] != df[UNITS_VAR])]
-                        unc_mismatch.update(int(c) for c in bad[GROUP_VAR].unique())
 
-            # Level-by-level range check of the observation (NaN never counts:
-            # comparisons with NaN are False; codes without bounds give NaN limits)
-            obs = df["observation_value"]
-            df["_below"] = (obs < df[GROUP_VAR].map(RANGE_LO)).astype("int64")
-            df["_above"] = (obs > df[GROUP_VAR].map(RANGE_HI)).astype("int64")
+            df["_missing"] = df["observation_value"].isna().astype("int64")  # NaN / NULL / inf
 
             grouped = df.groupby(GROUP_VAR)
             agg = grouped[list(VALUE_VARS)].agg(["min", "max", "count"])
             agg.columns = [f"{v}_{s}" for v, s in agg.columns]
             agg["n_records"] = grouped.size()
-            agg["n_below"] = grouped["_below"].sum()
-            agg["n_above"] = grouped["_above"].sum()
+            agg["n_missing"] = grouped["_missing"].sum()
             partial.append(agg)
 
     if not partial:
@@ -221,28 +266,22 @@ def analyse_file(path: Path, chunk_size: int) -> pd.DataFrame:
     by_code = pd.concat(partial).groupby(level=0)
     result = pd.DataFrame(index=by_code.size().index)
     result["n_records"] = by_code["n_records"].sum()
-    for v, (label, _) in VALUE_VARS.items():
+    result["n_records_missing"] = by_code["n_missing"].sum()
+    for v, label in VALUE_VARS.items():
         result[f"{label}_n_valid"] = by_code[f"{v}_count"].sum()
         result[f"{label}_min"] = by_code[f"{v}_min"].min()
         result[f"{label}_max"] = by_code[f"{v}_max"].max()
 
-    result["observation_value_n_below_range"] = by_code["n_below"].sum()
-    result["observation_value_n_above_range"] = by_code["n_above"].sum()
-
     result.index.name = "observed_variable_code"
     result = result.reset_index()
-    # Bounds used (NaN counters for codes that are not range-checked)
+    # Bounds used (NaN for codes that are not range-checked)
     codes = result["observed_variable_code"].astype(int)
     result["observation_value_range_lo"] = codes.map(RANGE_LO)
     result["observation_value_range_hi"] = codes.map(RANGE_HI)
-    unchecked = result["observation_value_range_lo"].isna()
-    for c in ("observation_value_n_below_range", "observation_value_n_above_range"):
-        result[c] = result[c].astype("float64").where(~unchecked)
+    result["uncertainty_value_range_lo"] = codes.map(UNC_RANGE_LO)
+    result["uncertainty_value_range_hi"] = codes.map(UNC_RANGE_HI)
     result["units_code"] = result["observed_variable_code"].map(
         lambda c: ";".join(str(u) for u in sorted(units_seen.get(int(c), [])))
-    )
-    result["uncertainty_units_match"] = result["observed_variable_code"].map(
-        lambda c: "NO" if int(c) in unc_mismatch else "yes"
     )
     result.insert(0, "file", path.name)
     return result.sort_values("observed_variable_code").reset_index(drop=True)
@@ -262,18 +301,46 @@ def decorate(summary: pd.DataFrame, units_lookup: dict, variable_lookup: dict) -
     summary["units_name"] = summary["units_code"].map(lambda s: unit_field(s, 0))
     summary["units_abbreviation"] = summary["units_code"].map(lambda s: unit_field(s, 1))
 
-    ordered = [
-        "file", "observed_variable_code", "observed_variable_name",
-        "units_code", "units_name", "units_abbreviation", "n_records",
-    ]
-    for label, _ in VALUE_VARS.values():
-        ordered += [f"{label}_min", f"{label}_max", f"{label}_n_valid"]
+    # The "file" column exists only in the per-file (monthly) table
+    ordered = ["file"] if "file" in summary.columns else []
     ordered += [
-        "observation_value_n_below_range", "observation_value_n_above_range",
+        "observed_variable_code", "observed_variable_name",
+        "units_code", "units_name", "units_abbreviation",
+        "n_records", "observation_value_n_valid", "n_records_missing",
+        "observation_value_min", "observation_value_max",
         "observation_value_range_lo", "observation_value_range_hi",
+        "uncertainty_value_range_lo", "uncertainty_value_range_hi",
     ]
-    ordered.append("uncertainty_units_match")
+    for label in list(VALUE_VARS.values())[1:]:
+        ordered += [f"{label}_min", f"{label}_max", f"{label}_n_valid"]
     return summary[ordered]
+
+
+def summarise_total(monthly: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate the per-file rows (before decorate()) into one row per
+    observed_variable over ALL the files: counts are summed, min / max are the
+    overall min / max. Same columns as the monthly table, except "file".
+    """
+    g = monthly.groupby("observed_variable_code")
+    total = pd.DataFrame(index=g.size().index)
+    total["n_records"] = g["n_records"].sum()
+    total["n_records_missing"] = g["n_records_missing"].sum()
+    for label in VALUE_VARS.values():
+        total[f"{label}_min"] = g[f"{label}_min"].min()
+        total[f"{label}_max"] = g[f"{label}_max"].max()
+        total[f"{label}_n_valid"] = g[f"{label}_n_valid"].sum()
+    total["observation_value_range_lo"] = g["observation_value_range_lo"].first()
+    total["observation_value_range_hi"] = g["observation_value_range_hi"].first()
+    total["uncertainty_value_range_lo"] = g["uncertainty_value_range_lo"].first()
+    total["uncertainty_value_range_hi"] = g["uncertainty_value_range_hi"].first()
+    # Union of the units codes found in the different files (normally just one)
+    total["units_code"] = g["units_code"].agg(
+        lambda s: ";".join(sorted({u for x in s for u in str(x).split(";") if u},
+                                  key=int))
+    )
+    total = total.reset_index()
+    return total.sort_values("observed_variable_code").reset_index(drop=True)
 
 
 def _worker(path_str: str, chunk_size: int):
@@ -307,9 +374,6 @@ def run_all(files, chunk_size: int, workers: int):
             return
         log.info("[%d/%d] %s done in %.1f s (%d observed variables)",
                  counter, n, name, elapsed, len(df))
-        if (df["uncertainty_units_match"] == "NO").any():
-            log.warning("  %s: uncertainty units differ from observation units for some "
-                        "variables (see column 'uncertainty_units_match')", name)
         done[path_str] = df
 
     if workers <= 1:
@@ -346,6 +410,10 @@ def main() -> int:
     parser.add_argument(
         "-o", "--output", type=Path, default=Path(OUTPUT_CSV),
         help=f"Output CSV path (default: {OUTPUT_CSV})",
+    )
+    parser.add_argument(
+        "--output-total", type=Path, default=Path(OUTPUT_CSV_TOTAL),
+        help=f"Output CSV of the summary over all files (default: {OUTPUT_CSV_TOTAL})",
     )
     parser.add_argument("-p", "--pattern", default="*.nc", help='File name pattern (default: "*.nc")')
     parser.add_argument("-r", "--recursive", action="store_true", help="Search sub-directories too")
@@ -386,11 +454,16 @@ def main() -> int:
     log.info("Analysis finished in %.1f s", time.time() - t_start)
 
     if results:
-        summary = decorate(pd.concat(results, ignore_index=True), units_lookup, variable_lookup)
+        monthly = pd.concat(results, ignore_index=True)
+        summary = decorate(monthly, units_lookup, variable_lookup)
+        total = decorate(summarise_total(monthly), units_lookup, variable_lookup)
+        # 'utf-8-sig' lets Excel open the files directly with correct encoding
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        # 'utf-8-sig' lets Excel open the file directly with correct encoding
         summary.to_csv(args.output, index=False, encoding="utf-8-sig")
         log.info("Summary written to %s (%d rows)", args.output, len(summary))
+        args.output_total.parent.mkdir(parents=True, exist_ok=True)
+        total.to_csv(args.output_total, index=False, encoding="utf-8-sig")
+        log.info("Total summary written to %s (%d rows)", args.output_total, len(total))
     else:
         log.error("No file could be analysed successfully")
 

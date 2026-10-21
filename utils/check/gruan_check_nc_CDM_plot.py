@@ -10,20 +10,28 @@ number of valid values for the observation and for its random, systematic and
 total uncertainty) and writes a multi-page PDF of diagnostic plots that show
 the strengths and the weaknesses of the dataset.
 
+The plausible ranges used to flag suspicious minima / maxima are NOT defined
+here: they are read from PLAUSIBILITY_RULES[...]["check_range"] in
+qc_pipeline.py (see CDM_CODE_TO_RULE and QC_PIPELINE_PATH below).
+
 Dependencies: numpy, pandas, matplotlib
 """
 
+from pathlib import Path
+
 # --------------------------------------------------------------------------
-# USER SETTINGS  (edit these two variables)
+# USER SETTINGS  (edit these variables)
 # --------------------------------------------------------------------------
 # INPUT_CSV_PATH = "/home/emanuele/logs/gruan_check_nc_CDM.csv"      # input CSV file
 INPUT_CSV_PATH = "/Data/GRUAN_TEST/output/gruan_check_nc_CDM.csv"      # input CSV file
 # OUTPUT_PDF_PATH = "/home/emanuele/logs/gruan_quality_report.pdf"   # output PDF file
 OUTPUT_PDF_PATH = "/Data/GRUAN_TEST/output/gruan_quality_report.pdf"   # output PDF file
-# Table of every file/variable row with at least one out-of-bounds level (QA/QC follow-up)
-OUTPUT_FLAGGED_CSV_PATH = "/Data/GRUAN_TEST/output/gruan_out_of_bounds_levels.csv"
+# qc_pipeline.py, from which the plausible ranges (check_range) are read.
+# Relative to the directory of this script (two levels up).
+QC_PIPELINE_PATH = str(Path(__file__).resolve().parent / "../../qc_pipeline.py")
 # --------------------------------------------------------------------------
 
+import importlib.util
 import textwrap
 
 import matplotlib
@@ -34,29 +42,68 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
-from matplotlib.colors import LogNorm
 
-# Physically plausible ranges used to flag suspicious min / max values.
-# These are ASSUMPTIONS made for a quick screening (generous, so that only
-# clearly unphysical values are flagged); adapt them to your needs.
-PLAUSIBLE_RANGES = {
-    "air temperature": (178.15, 323.15),                                    # K
-    "relative humidity": (0.0, 100.0),                                      # %
-    "wind speed": (0.0, 180.0),                                             # m/s
-    "wind from direction": (0.0, 360.0),                                    # deg
-    "pressure": (1.0, 108000.0),                                            # Pa
-    "water vapour mixing ratio": (0.0, 0.05),                               # mol/mol
-    "frost point temperature": (150.0, 330.0),                              # K
-    "shortwave radiation": (0.0, 1600.0),                                   # W m-2
-    "vertical speed of radiosonde": (-10.0, 30.0),                          # m/s
-    "geopotential height": (-100.0, 47000.0),                               # m
-    "altitude": (-100.0, 47000.0),                                          # m
-
-    "eastward wind speed": (-150.0, 150.0),                                 # m/s
-    "northward wind speed": (-150.0, 150.0),                                # m/s
-    "air relative humidity effective vertical resolution": (0.0, 1000.0),   # s
-    "time since launch": (0.0, 21600.0),                                    # s (6 h)
+# --------------------------------------------------------------------------
+# Plausible ranges of the observation (read from qc_pipeline.py)
+# --------------------------------------------------------------------------
+# CDM observed_variable code -> (key in PLAUSIBILITY_RULES of qc_pipeline.py,
+#                                factor: units of the pipeline -> units of the CDM files)
+# The ranges in qc_pipeline.py are expressed in the units used inside that
+# pipeline, which for some variables differ from the units of the CDM files
+# summarised in the input table, hence the factor:
+#   relative humidity : fraction (0-1) -> per cent (x 100)
+#   pressure          : hPa            -> Pa       (x 100)
+#   water vapour m.r. : ppmv           -> mol/mol  (x 1e-6)
+# This is the same table used by gruan_check_nc_CDM.py: keep the two in sync.
+# A code whose rule has check_range = None, or that has no rule at all, has no
+# plausible range: it is not assessed (shown as "n/a" / "no range defined").
+CDM_CODE_TO_RULE = {
+    126: ("temperature", 1.0),            # air temperature                  [K]
+    138: ("relative_humidity", 100.0),    # relative humidity                [%]
+    106: ("wind_direction", 1.0),         # wind from direction              [deg]
+    107: ("wind_speed", 1.0),             # wind speed                       [m s-1]
+    104: ("u", 1.0),                      # eastward wind speed              [m s-1]
+    105: ("v", 1.0),                      # northward wind speed             [m s-1]
+    123: ("wvmr", 1e-6),                  # water vapour mixing ratio        [mol mol-1]
+    122: ("vertical_speed", 1.0),         # vertical speed of radiosonde     [m s-1]
+    117: ("geopot", 1.0),                 # geopotential height              [m]
+    116: ("frost_point", 1.0),            # frost point temperature          [K]
+    124: ("rh_resolution", 1.0),          # RH effective vertical resolution [s]
+    73:  ("shortwave_radiation", 1.0),    # shortwave radiation              [W m-2]
+    125: ("height", 1.0),                 # altitude                         [m]
+    142: ("pressure", 100.0),             # pressure                         [Pa]
+    # 143 (time since launch) has no counterpart in PLAUSIBILITY_RULES
 }
+
+
+def load_ranges_from_qc_pipeline(path):
+    """
+    Import qc_pipeline.py and return {CDM code: (lo, hi)} built from
+    PLAUSIBILITY_RULES[rule]["check_range"], converted to the units of the CDM
+    files. Codes without a check_range are left out (= no range).
+    """
+    if not Path(path).is_file():
+        raise FileNotFoundError(f"qc_pipeline.py not found: {path} (set QC_PIPELINE_PATH)")
+    spec = importlib.util.spec_from_file_location("qc_pipeline", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # safe: the pipeline main is under __main__
+    rules = module.PLAUSIBILITY_RULES
+
+    ranges = {}
+    for code, (rule, factor) in CDM_CODE_TO_RULE.items():
+        if rule not in rules:
+            raise KeyError(f"'{rule}' (CDM code {code}) not found in PLAUSIBILITY_RULES")
+        check_range = rules[rule].get("check_range")
+        if check_range is None:
+            continue
+        lo, hi = check_range
+        # round() removes floating-point noise (e.g. 50000 * 1e-6)
+        ranges[code] = (round(lo * factor, 12), round(hi * factor, 12))
+    return ranges
+
+
+RANGES_BY_CODE = load_ranges_from_qc_pipeline(QC_PIPELINE_PATH)
+RANGES_BY_NAME = {}   # observed_variable_name -> (lo, hi); filled by load_data()
 
 # Relative tolerance used in the uncertainty-consistency test
 CONSISTENCY_TOL = 1e-3
@@ -71,29 +118,6 @@ WIND_UNC_CAP = 50.0                           # m/s (eastward / northward compon
 DIRECTION_UNC_CAPS = (180.0, 360.0)           # deg (wind from direction)
 # Upper axis limit of the pressure-uncertainty time series (larger maxima are flagged off scale)
 PRESSURE_UNC_YMAX = 1e6                       # Pa
-
-# --------------------------------------------------------------------------
-# Level-resolved out-of-bounds statistics
-# --------------------------------------------------------------------------
-# Columns written by gruan_check_nc_CDM.py for every file x variable: the number of
-# VALID levels of the observation lying below / above the plausible range, and the
-# range itself (closed interval). When the range columns are present they REPLACE
-# PLAUSIBLE_RANGES above, so that report and check always use the same bounds.
-# If the counters are missing (CSV from an older version of the check), the report
-# falls back to a rigorous LOWER BOUND derived from the file minimum / maximum
-# (see add_level_bounds) and says so on the pages.
-COL_N_BELOW = "observation_value_n_below_range"
-COL_N_ABOVE = "observation_value_n_above_range"
-COL_RANGE_LO = "observation_value_range_lo"
-COL_RANGE_HI = "observation_value_range_hi"
-
-# Severity classes of a file/variable row, from the fraction of valid levels
-# that are out of bounds:  clean (none) | isolated (< e0) | moderate (< e1) | severe (>= e1)
-SEVERITY_EDGES = (1e-4, 1e-2)                       # 0.01 % and 1 %
-SEVERITY_COLORS = ["#a6d96a", "#fee08b", "#fdae61", "#d73027"]
-
-# Lower colour limit (fraction) of the out-of-bounds heatmap
-HEATMAP_FLOOR = 1e-6
 
 # Page sizes (inches)
 LANDSCAPE = (11.69, 8.27)
@@ -115,7 +139,6 @@ plt.rcParams.update({
 def load_data(path):
     """Read the CSV and add derived columns (date, labels, flags, fractions)."""
     df = pd.read_csv(path, encoding="utf-8-sig")
-    adopt_ranges_from_csv(df)
 
     # Month of each file, parsed from the file name (..._GRUAN_YYYY_MM.nc)
     df["date"] = pd.to_datetime(
@@ -136,14 +159,19 @@ def load_data(path):
     for c in ("random", "systematic", "total"):
         df[f"unc_{c}_frac"] = df[f"uncertainty_{c}_n_valid"] / df["n_records"]
 
-    # Plausibility flags on the observation min / max
-    lo = df["observed_variable_name"].map(lambda n: PLAUSIBLE_RANGES.get(n, (np.nan, np.nan))[0])
-    hi = df["observed_variable_name"].map(lambda n: PLAUSIBLE_RANGES.get(n, (np.nan, np.nan))[1])
+    # Plausibility flags on the observation min / max, with the ranges of
+    # qc_pipeline.py (NaN where a variable has no range: comparisons are False)
+    codes = df["observed_variable_code"].astype(int)
+    lo = codes.map(lambda c: RANGES_BY_CODE.get(c, (np.nan, np.nan))[0])
+    hi = codes.map(lambda c: RANGES_BY_CODE.get(c, (np.nan, np.nan))[1])
     df["range_lo"], df["range_hi"] = lo, hi
+    RANGES_BY_NAME.clear()
+    for name, l, h in zip(df["observed_variable_name"], lo, hi):
+        if pd.notna(l) and pd.notna(h):
+            RANGES_BY_NAME[name] = (float(l), float(h))
     df["min_below"] = df["observation_value_min"] < lo
     df["max_above"] = df["observation_value_max"] > hi
     df["out_of_range"] = df["min_below"] | df["max_above"]
-    add_level_bounds(df)
     return df.sort_values(["observed_variable_code", "date"]).reset_index(drop=True)
 
 
@@ -157,106 +185,21 @@ def variable_order(df):
     )
 
 
-def adopt_ranges_from_csv(df):
-    """Take the plausible ranges from the input table (written by the NetCDF check)."""
-    if COL_RANGE_LO not in df.columns or COL_RANGE_HI not in df.columns:
-        return
-    r = df.dropna(subset=[COL_RANGE_LO, COL_RANGE_HI]).drop_duplicates("observed_variable_name")
-    for name, lo, hi in zip(r["observed_variable_name"], r[COL_RANGE_LO], r[COL_RANGE_HI]):
-        PLAUSIBLE_RANGES[name] = (float(lo), float(hi))
-
-
-def level_counts_exact(df):
-    """True if the input table carries per-level out-of-bounds counters."""
-    return COL_N_BELOW in df.columns and COL_N_ABOVE in df.columns
-
-
-def severity_labels():
-    """Human-readable names of the severity classes (see SEVERITY_EDGES)."""
-    e0, e1 = (100 * e for e in SEVERITY_EDGES)
-    return ["Clean (none)", f"Isolated (<{e0:g} %)", f"Moderate ({e0:g}-{e1:g} %)", f"Severe (>={e1:g} %)"]
-
-
-def add_level_bounds(df):
-    """
-    Add the level-resolved out-of-bounds columns (in place):
-
-    n_below, n_above, n_out : number of valid levels below / above / outside the bounds
-    out_frac                : n_out / number of valid levels (NaN if undefined)
-    severity                : 0 clean, 1 isolated, 2 moderate, 3 severe (NaN if undefined)
-
-    With per-level counters in the input table the counts are exact. Otherwise
-    they are the rigorous LOWER BOUND implied by the file minimum / maximum:
-    a minimum below the range proves at least one level below it, and a maximum
-    above the range proves at least one (different) level above it.
-    """
-    has_range = df["range_lo"].notna() & df["range_hi"].notna()
-    if level_counts_exact(df):
-        n_below = pd.to_numeric(df[COL_N_BELOW], errors="coerce")
-        n_above = pd.to_numeric(df[COL_N_ABOVE], errors="coerce")
-    else:
-        n_below = df["min_below"].astype(float)
-        n_above = df["max_above"].astype(float)
-    df["n_below"] = n_below.where(has_range)
-    df["n_above"] = n_above.where(has_range)
-    df["n_out"] = df["n_below"] + df["n_above"]
-
-    n_valid = df["observation_value_n_valid"].where(df["observation_value_n_valid"] > 0)
-    df["out_frac"] = df["n_out"] / n_valid
-
-    lo, hi = SEVERITY_EDGES
-    f = df["out_frac"]
-    sev = pd.Series(np.select([df["n_out"] == 0, f < lo, f < hi], [0, 1, 2], default=3),
-                    index=df.index, dtype=float)
-    sev[f.isna()] = np.nan
-    df["severity"] = sev
-
-
 def input_checks(df):
     """Consistency checks of the input table; returns a list of messages."""
-    msgs = []
-    if level_counts_exact(df):
-        msgs.append("Per-level counters found in the input table: out-of-bounds counts are exact.")
-        a = int(((df["n_out"] > 0) & ~df["out_of_range"]).sum())
-        b = int(((df["n_out"] == 0) & df["out_of_range"]).sum())
-        c = int((df["n_out"] > df["observation_value_n_valid"]).sum())
-        msgs.append(f"Rows with counters > 0 but file min/max inside the bounds: {a} "
-                    "(non-zero means the bounds used for the counters differ from the bounds now in use).")
-        msgs.append(f"Rows with counters = 0 but file min/max outside the bounds: {b} "
-                    "(non-zero means the bounds used for the counters differ from the bounds now in use).")
-        msgs.append(f"Rows where out-of-bounds levels exceed the number of valid levels: {c} "
-                    "(must be zero).")
-    else:
-        msgs.append(f"Per-level counters ({COL_N_BELOW}, {COL_N_ABOVE}) NOT found in the input table: "
-                    "all level counts are LOWER BOUNDS derived from the file minimum / maximum.")
-    if COL_RANGE_LO in df.columns and COL_RANGE_HI in df.columns:
-        msgs.append("Plausible ranges read from the input table (written by the NetCDF check): "
-                    "report and check use identical bounds.")
-    else:
-        msgs.append("Plausible ranges taken from PLAUSIBLE_RANGES of this script (the input table has no "
-                    "range columns): make sure they match the bounds of the NetCDF check.")
+    msgs = [f"Plausible ranges read from PLAUSIBILITY_RULES (check_range) of {QC_PIPELINE_PATH}, "
+            "converted to the units of the CDM files."]
+    # Compare with the ranges written by the NetCDF check into the table (if any)
+    if "observation_value_range_lo" in df.columns and "observation_value_range_hi" in df.columns:
+        diff = df["range_lo"].notna() & (
+            ~np.isclose(df["range_lo"], df["observation_value_range_lo"], rtol=1e-9, atol=0, equal_nan=False)
+            | ~np.isclose(df["range_hi"], df["observation_value_range_hi"], rtol=1e-9, atol=0, equal_nan=False))
+        msgs.append(f"Rows whose range in the input table differs from the range in use: {int(diff.sum())} "
+                    "(non-zero means the table was produced with different ranges: re-run the NetCDF check).")
     no_rng = sorted(df.loc[df["range_lo"].isna(), "observed_variable_name"].unique())
     if no_rng:
         msgs.append("No plausible range defined (not assessed): " + ", ".join(no_rng) + ".")
     return msgs
-
-
-def level_summary_sentence(df):
-    """One sentence on the level-resolved out-of-bounds statistics (summary page)."""
-    ok = df["n_out"].notna()
-    n_out = int(df.loc[ok, "n_out"].sum())
-    n_valid = int(df.loc[ok, "observation_value_n_valid"].sum())
-    frac = n_out / n_valid if n_valid else np.nan
-    affected = df["n_out"] > 0
-    n_aff = int(affected.sum())
-    iso = int((df["severity"] == 1).sum())
-    sev = int((df["severity"] == 3).sum())
-    e0, e1 = (100 * e for e in SEVERITY_EDGES)
-    prefix = "At level resolution" if level_counts_exact(df) else "At level resolution (LOWER BOUND, no per-level counters)"
-    share_iso = 100 * iso / n_aff if n_aff else 0.0
-    return (f"{prefix}: {n_out:,} of {n_valid:,} valid levels are out of bounds (fraction {frac:.2e}); "
-            f"{n_aff} rows are affected, of which {share_iso:.0f}% are isolated outliers (<{e0:g}% of the levels) "
-            f"and {sev} are severe (>={e1:g}%).")
 
 
 def pivot_months(df, value_col, var_names):
@@ -302,9 +245,7 @@ def per_variable_summary(df, var_names):
     for v in var_names:
         d = df[df["observed_variable_name"] == v]
         rec = d["n_records"].sum()
-        defined = d["out_frac"].notna()
-        n_valid_def = d.loc[d["n_out"].notna(), "observation_value_n_valid"].sum()
-        n_out = d["n_out"].sum(min_count=1)
+        has_range = d["range_lo"].notna().any()
         rows.append({
             "Variable": d["label"].iloc[0].replace("\n", " "),
             "name": v,
@@ -312,17 +253,9 @@ def per_variable_summary(df, var_names):
             "Random unc. (%)": 100 * d["uncertainty_random_n_valid"].sum() / rec,
             "Syst. unc. (%)": 100 * d["uncertainty_systematic_n_valid"].sum() / rec,
             "Total unc. (%)": 100 * d["uncertainty_total_n_valid"].sum() / rec,
-            "Files out of range (%)": 100 * d["out_of_range"].mean(),
+            "Files out of range (%)": 100 * d["out_of_range"].mean() if has_range else np.nan,
             "Lowest min": d["observation_value_min"].min(),
             "Highest max": d["observation_value_max"].max(),
-            # level-resolved out-of-bounds statistics (pooled over all files)
-            "Valid levels": n_valid_def,
-            "Levels below": d["n_below"].sum(min_count=1),
-            "Levels above": d["n_above"].sum(min_count=1),
-            "Levels out": n_out,
-            "Levels out (%)": 100 * n_out / n_valid_def if n_valid_def > 0 else np.nan,
-            "Files affected (%)": 100 * (d.loc[defined, "n_out"] > 0).mean() if defined.any() else np.nan,
-            "Files severe (%)": 100 * (d.loc[defined, "severity"] == 3).mean() if defined.any() else np.nan,
         })
     return pd.DataFrame(rows)
 
@@ -364,7 +297,7 @@ def page_summary_old(pdf, df, var_names, summ):
     n_tot_unc = int((summ["Total unc. (%)"] > 50).sum())
     n_no_unc = int(((summ[["Random unc. (%)", "Syst. unc. (%)", "Total unc. (%)"]].max(axis=1)) == 0).sum())
     both = int(((summ["Random unc. (%)"] > 0) & (summ["Syst. unc. (%)"] > 0)).sum())
-    oor_rows = 100 * df["out_of_range"].mean()
+    oor_rows = 100 * df.loc[df["range_lo"].notna(), "out_of_range"].mean()
     worst = summ.sort_values("Files out of range (%)", ascending=False).head(3)
     worst_txt = "; ".join(f"{r['name']} ({r['Files out of range (%)']:.0f}% of files)" for _, r in worst.iterrows())
 
@@ -431,8 +364,9 @@ def page_summary_old(pdf, df, var_names, summ):
     y -= 0.015
     block("Weaknesses", weaknesses, y, "#b42318")
 
-    fig.text(0.05, 0.03, "Plausible ranges are screening assumptions defined in PLAUSIBLE_RANGES at the top of the "
-             "script; consistency bounds assume total = sqrt(random^2 + systematic^2) at each point.",
+    fig.text(0.05, 0.03, "Plausible ranges are the check_range values of PLAUSIBILITY_RULES in qc_pipeline.py "
+             "(converted to the units of the CDM files); consistency bounds assume total = sqrt(random^2 + "
+             "systematic^2) at each point.",
              fontsize=7.5, color="gray")
     pdf.savefig(fig)
     plt.close(fig)
@@ -455,7 +389,7 @@ def page_summary(pdf, df, var_names, summ):
     n_tot_unc = int((summ["Total unc. (%)"] > 50).sum())
     n_no_unc = int(((summ[["Random unc. (%)", "Syst. unc. (%)", "Total unc. (%)"]].max(axis=1)) == 0).sum())
     both = int(((summ["Random unc. (%)"] > 0) & (summ["Syst. unc. (%)"] > 0)).sum())
-    oor_rows = 100 * df["out_of_range"].mean()
+    oor_rows = 100 * df.loc[df["range_lo"].notna(), "out_of_range"].mean()
     worst = summ.sort_values("Files out of range (%)", ascending=False).head(3)
     worst_txt = "; ".join(f"{r['name']} ({r['Files out of range (%)']:.0f}% of files)" for _, r in worst.iterrows())
 
@@ -487,15 +421,8 @@ def page_summary(pdf, df, var_names, summ):
     w_cap = sum(v["n_at_cap"] for v in st_w.values())
     w_tot = sum(v["n_with_unc"] for v in st_w.values())
 
-    lvl_txt = level_summary_sentence(df)
-    if level_counts_exact(df):
-        last_txt = ("Per-level counters make the outlier frequency quantifiable, but the table still stores no "
-                    "vertical or distributional information: out-of-bounds levels cannot be attributed to altitude "
-                    "layers or to the launch phase.")
-    else:
-        last_txt = ("The table only stores min / max / counts per file: the number of out-of-bounds levels cannot "
-                    "be determined (only a lower bound is shown), so one single bad value flags a whole month. "
-                    "Add per-level counters to the NetCDF check to quantify it.")
+    last_txt = ("The table only stores min / max / counts per file: outlier frequency, distributions and "
+                "vertical structure cannot be assessed, and one single bad value flags a whole month.")
 
     strengths = [
         f"Long and nearly continuous record: {n_files} monthly files from {df['date'].min():%Y-%m} to "
@@ -510,7 +437,7 @@ def page_summary(pdf, df, var_names, summ):
     ]
     weaknesses = [
         f"Unphysical extremes: {oor_rows:.1f}% of the file/variable rows have a minimum or maximum outside "
-        f"the assumed plausible range. Worst variables: {worst_txt}. {lvl_txt}",
+        f"the plausible range of qc_pipeline.py. Worst variables: {worst_txt}.",
         f"Shortwave radiation collapses in time: {sw_peak / 1e6:.0f} M valid values in {sw_peak_year} vs "
         f"{sw_last_full / 1e6:.2f} M in the last complete year; {int((df.loc[df['observed_variable_name'] == 'shortwave radiation', 'observation_value_n_valid'] == 0).sum())} "
         f"files have no valid value at all.",
@@ -549,8 +476,9 @@ def page_summary(pdf, df, var_names, summ):
     y -= 0.015
     block("Weaknesses", weaknesses, y, "#b42318")
 
-    fig.text(0.05, 0.03, "Plausible ranges are screening assumptions defined in PLAUSIBLE_RANGES at the top of the "
-             "script; consistency bounds assume total = sqrt(random^2 + systematic^2) at each point.",
+    fig.text(0.05, 0.03, "Plausible ranges are the check_range values of PLAUSIBILITY_RULES in qc_pipeline.py "
+             "(converted to the units of the CDM files); consistency bounds assume total = sqrt(random^2 + "
+             "systematic^2) at each point.",
              fontsize=7.5, color="gray")
     pdf.savefig(fig)
     plt.close(fig)
@@ -630,9 +558,12 @@ def page_plausibility(pdf, df, var_names):
     fig, axes = plt.subplots(1, 2, figsize=LANDSCAPE, gridspec_kw={"width_ratios": [1.3, 1]})
 
     ax = axes[0]
-    below = [100 * df.loc[df["observed_variable_name"] == v, "min_below"].mean() for v in var_names]
-    above = [100 * df.loc[df["observed_variable_name"] == v, "max_above"].mean() for v in var_names]
-    labels = [f"{v}  [{PLAUSIBLE_RANGES[v][0]:g}, {PLAUSIBLE_RANGES[v][1]:g}]" for v in var_names]
+    below = [100 * df.loc[df["observed_variable_name"] == v, "min_below"].mean() if v in RANGES_BY_NAME
+             else np.nan for v in var_names]
+    above = [100 * df.loc[df["observed_variable_name"] == v, "max_above"].mean() if v in RANGES_BY_NAME
+             else np.nan for v in var_names]
+    labels = [f"{v}  [{RANGES_BY_NAME[v][0]:g}, {RANGES_BY_NAME[v][1]:g}]" if v in RANGES_BY_NAME
+              else f"{v}  [no range defined]" for v in var_names]
     labels = ["\n".join(textwrap.wrap(s, 34)) for s in labels]
     y = np.arange(len(var_names))
     ax.barh(y - 0.2, below, height=0.4, color="#0072b2", label="minimum below range")
@@ -641,15 +572,15 @@ def page_plausibility(pdf, df, var_names):
     ax.set_yticklabels(labels, fontsize=7)
     ax.invert_yaxis()
     ax.set_xlabel("% of monthly files")
-    ax.set_title("(a) Files with min/max outside the plausible range\n(assumed range in brackets)")
+    ax.set_title("(a) Files with min/max outside the plausible range\n(range of qc_pipeline.py in brackets)")
     ax.legend(fontsize=8, loc="lower right")
 
     ax = axes[1]
-    by_year = df.groupby("year")["out_of_range"].mean() * 100
+    by_year = df[df["range_lo"].notna()].groupby("year")["out_of_range"].mean() * 100
     ax.bar(by_year.index, by_year.values, color="#cc79a7")
     ax.set_xlabel("Year")
     ax.set_ylabel("% of file/variable rows flagged")
-    ax.set_title("(b) Flagged rows per year (all variables)")
+    ax.set_title("(b) Flagged rows per year (variables with a range)")
 
     fig.suptitle("Physical plausibility screening", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.95))
@@ -666,24 +597,29 @@ def page_envelopes(pdf, df, var_names):
 
     for ax, v in zip(axes, var_names):
         d = df[df["observed_variable_name"] == v]
-        lo, hi = PLAUSIBLE_RANGES[v]
-        span = hi - lo
-        ylim = (lo - 0.25 * span, hi + 0.25 * span)
+        has_rng = v in RANGES_BY_NAME
+        if has_rng:
+            lo, hi = RANGES_BY_NAME[v]
+            span = hi - lo
+            ylim = (lo - 0.25 * span, hi + 0.25 * span)
         n_out = 0
         for col, colr in (("observation_value_min", "#0072b2"), ("observation_value_max", "#e69f00")):
             x = d["date"].values
             yv = d[col].values
             ok = ~np.isnan(yv)
             x, yv = x[ok], yv[ok]
-            out = (yv < lo) | (yv > hi)
+            out = ((yv < lo) | (yv > hi)) if has_rng else np.zeros(len(yv), dtype=bool)
             n_out += int(out.sum())
             ax.plot(x[~out], yv[~out], ".", ms=2.2, color=colr)
-            ax.plot(x[out], np.clip(yv[out], *ylim), "x", ms=3.5, color="red", mew=0.8)
-        ax.axhline(lo, color="gray", ls="--", lw=0.7)
-        ax.axhline(hi, color="gray", ls="--", lw=0.7)
-        ax.set_ylim(*ylim)
+            if has_rng:
+                ax.plot(x[out], np.clip(yv[out], *ylim), "x", ms=3.5, color="red", mew=0.8)
+        if has_rng:
+            ax.axhline(lo, color="gray", ls="--", lw=0.7)
+            ax.axhline(hi, color="gray", ls="--", lw=0.7)
+            ax.set_ylim(*ylim)
         ax.set_title("\n".join(textwrap.wrap(f"{v} [{d['units_abbreviation'].iloc[0]}]", 34))
-                     + f"\n{n_out} out-of-range points", fontsize=7)
+                     + (f"\n{n_out} out-of-range points" if has_rng else "\nno plausible range defined"),
+                     fontsize=7)
         ax.tick_params(labelsize=6)
         ax.xaxis.set_major_locator(mdates.YearLocator(6))
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
@@ -695,10 +631,10 @@ def page_envelopes(pdf, df, var_names):
         plt.Line2D([], [], marker=".", ls="", color="#0072b2", label="monthly minimum"),
         plt.Line2D([], [], marker=".", ls="", color="#e69f00", label="monthly maximum"),
         plt.Line2D([], [], marker="x", ls="", color="red", label="out of plausible range\n(clipped to axis edge)"),
-        plt.Line2D([], [], ls="--", color="gray", label="assumed plausible range"),
+        plt.Line2D([], [], ls="--", color="gray", label="plausible range (qc_pipeline.py)"),
     ]
     fig.legend(handles=handles, loc="lower center", ncol=4, fontsize=7, frameon=False)
-    fig.suptitle("Monthly observation envelopes vs plausible ranges", fontsize=12, weight="bold")
+    fig.suptitle("Monthly observation envelopes vs plausible ranges (qc_pipeline.py)", fontsize=12, weight="bold")
     fig.tight_layout(rect=(0, 0.05, 1, 0.97))
     pdf.savefig(fig)
     plt.close(fig)
@@ -1014,210 +950,9 @@ def page_consistency(pdf, df):
     pdf.savefig(fig)
     plt.close(fig)
 
-# ==========================================================================
-# Level-resolved out-of-bounds pages
-# ==========================================================================
-def _lower_bound_note(fig, df):
-    """Red footnote on level-resolved pages when only lower bounds are available."""
-    if not level_counts_exact(df):
-        msg = (f"LOWER BOUND: per-level counters ({COL_N_BELOW}, {COL_N_ABOVE}) are not in the input table; "
-               "counts are derived from the file minimum / maximum only and underestimate the true numbers.")
-        fig.text(0.5, 0.012, "\n".join(textwrap.wrap(msg, 150)), ha="center", va="bottom",
-                 fontsize=7.5, color="#b42318", weight="bold")
-
-
-def _fmt_pct(x):
-    if pd.isna(x):
-        return "n/a"
-    if x == 0:
-        return "0"
-    return f"{x:.2e}" if x < 1e-3 else f"{x:.3f}"
-
-
-def page_bounds_overview(pdf, df, var_names, summ):
-    """Pooled fraction of out-of-bounds levels and severity classes per variable."""
-    exact = level_counts_exact(df)
-    fig, axes = plt.subplots(1, 2, figsize=LANDSCAPE, sharey=True, gridspec_kw={"width_ratios": [1.2, 1]})
-    y = np.arange(len(var_names))
-    labs = ["\n".join(textwrap.wrap(f"{v} [{df.loc[df['observed_variable_name'] == v, 'units_abbreviation'].iloc[0]}]", 30))
-            for v in var_names]
-    n_valid = summ["Valid levels"].to_numpy(float)
-    n_out = summ["Levels out"].to_numpy(float)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        below = 100 * summ["Levels below"].to_numpy(float) / n_valid
-        above = 100 * summ["Levels above"].to_numpy(float) / n_valid
-
-    # (a) pooled fraction, log axis (zero values are annotated, not plotted)
-    ax = axes[0]
-    pos = np.concatenate([below[below > 0], above[above > 0]])
-    xmin = pos.min() / 10 if len(pos) else 1e-6
-    xmax = pos.max() * 300 if len(pos) else 1.0
-    ax.set_xscale("log")
-    ax.set_xlim(xmin, xmax)
-    for i in range(len(var_names)):
-        if np.isnan(n_out[i]):
-            ax.text(xmin * 1.5, i, "no range defined", va="center", fontsize=7, color="gray")
-        elif n_out[i] == 0:
-            ax.text(xmin * 1.5, i, "none", va="center", fontsize=7, color="#1a7f37", weight="bold")
-        else:
-            top = max(below[i], above[i])
-            ax.hlines(i, xmin, top, color="#bbbbbb", lw=0.8)
-            if below[i] > 0:
-                ax.plot(below[i], i - 0.12, "v", color="#0072b2", ms=5)
-            if above[i] > 0:
-                ax.plot(above[i], i + 0.12, "^", color="#d55e00", ms=5)
-            ax.text(top * 1.5, i, f"{int(n_out[i]):,} / {n_valid[i]:.2e}", va="center", fontsize=6.5)
-    ax.set_yticks(y)
-    ax.set_yticklabels(labs, fontsize=7)
-    ax.invert_yaxis()
-    ax.set_xlabel("Out-of-bounds levels / valid levels  [%]  (log scale)")
-    ax.set_title("(a) Pooled fraction of valid levels outside the plausible range\n"
-                 "(labels: out-of-bounds levels / valid levels)")
-    ax.legend(handles=[plt.Line2D([], [], marker="v", ls="", color="#0072b2", label="below lower bound"),
-                       plt.Line2D([], [], marker="^", ls="", color="#d55e00", label="above upper bound")],
-              fontsize=7, loc="lower right")
-
-    # (b) share of files in each severity class
-    ax = axes[1]
-    labels = severity_labels()
-    left = np.zeros(len(var_names))
-    for k in range(4):
-        share = []
-        for v in var_names:
-            sev = df.loc[df["observed_variable_name"] == v, "severity"].dropna()
-            share.append(100 * (sev == k).mean() if len(sev) else np.nan)
-        share = np.array(share)
-        ax.barh(y, np.nan_to_num(share), left=left, height=0.7, color=SEVERITY_COLORS[k],
-                label=labels[k], edgecolor="white", lw=0.3)
-        left += np.nan_to_num(share)
-    for i, v in enumerate(var_names):
-        if df.loc[df["observed_variable_name"] == v, "severity"].notna().sum() == 0:
-            ax.text(50, i, "n/a", ha="center", va="center", fontsize=7, color="gray")
-    ax.set_xlim(0, 100)
-    ax.set_xlabel("% of monthly files")
-    ax.set_title("(b) Files by severity of the out-of-bounds levels\n(share of files with valid levels)")
-    ax.legend(fontsize=7, ncol=2, loc="upper center", bbox_to_anchor=(0.5, -0.09), frameon=False)
-
-    fig.suptitle("Out-of-bounds levels: pooled fractions and severity" + ("" if exact else "  [lower bound]"),
-                 fontsize=13, weight="bold")
-    fig.tight_layout(rect=(0, 0.045, 1, 0.95))
-    _lower_bound_note(fig, df)
-    pdf.savefig(fig)
-    plt.close(fig)
-
-
-def page_bounds_heatmap(pdf, df, var_names):
-    """Heatmap: fraction of valid levels out of bounds per variable and month."""
-    mat, months = pivot_months(df, "out_frac", var_names)
-    plot = mat.clip(lower=HEATMAP_FLOOR).where(mat > 0, 1e-12).where(mat.notna())  # 0 -> "under" colour
-    labels = [df.loc[df["observed_variable_name"] == v, "label"].iloc[0] for v in var_names]
-    fig, ax = plt.subplots(figsize=LANDSCAPE)
-    im = heatmap(ax, plot, months, labels, cmap="YlOrRd", norm=LogNorm(vmin=HEATMAP_FLOOR, vmax=1.0),
-                 under="#c7e9c0")
-    cb = fig.colorbar(im, ax=ax, pad=0.015, extend="min")
-    cb.set_label(f"Out-of-bounds levels / valid levels (log; values < {HEATMAP_FLOOR:g} shown at the floor;\n"
-                 "green triangle = no out-of-bounds level; grey = no file / no valid data)")
-    ax.set_title("Fraction of valid levels outside the plausible range, per variable and month"
-                 + ("" if level_counts_exact(df) else "  [lower bound]"))
-    ax.set_xlabel("Date")
-    fig.tight_layout(rect=(0, 0.045, 1, 1))
-    _lower_bound_note(fig, df)
-    pdf.savefig(fig)
-    plt.close(fig)
-
-
-def page_bounds_timeseries(pdf, df, summ):
-    """Yearly pooled fraction and absolute number of out-of-bounds levels (variables with exceedances)."""
-    tot = summ.set_index("name")["Levels out"].fillna(0).sort_values(ascending=False)
-    top = [v for v in tot.index if tot[v] > 0][:8]
-    fig, axes = plt.subplots(2, 1, figsize=LANDSCAPE, sharex=True)
-    if not top:
-        axes[0].text(0.5, 0.5, "No out-of-bounds level found in any variable", transform=axes[0].transAxes,
-                     ha="center", va="center", fontsize=12, color="#1a7f37")
-        axes[1].axis("off")
-    else:
-        d = df[df["n_out"].notna()]
-        g = d.groupby(["observed_variable_name", "year"]).agg(n_out=("n_out", "sum"),
-                                                              n_valid=("observation_value_n_valid", "sum"))
-        cmap = plt.get_cmap("tab10")
-        for k, v in enumerate(top):
-            if v not in g.index.get_level_values(0):
-                continue
-            gv = g.loc[v]
-            frac = (100 * gv["n_out"] / gv["n_valid"]).where(gv["n_out"] > 0)
-            cnt = gv["n_out"].where(gv["n_out"] > 0)
-            axes[0].plot(gv.index, frac, "o-", ms=3, lw=1, color=cmap(k), label=v)
-            axes[1].plot(gv.index, cnt, "o-", ms=3, lw=1, color=cmap(k), label=v)
-        axes[0].set_yscale("log")
-        axes[1].set_yscale("log")
-        axes[0].set_ylabel("Out-of-bounds / valid levels [%]")
-        axes[1].set_ylabel("Out-of-bounds levels [count]")
-        axes[0].set_title("(a) Yearly pooled fraction of out-of-bounds levels")
-        axes[1].set_title("(b) Yearly number of out-of-bounds levels")
-        ymax = axes[0].get_ylim()[1]
-        axes[0].set_ylim(top=ymax * 30)  # head-room for the legend
-        axes[0].legend(fontsize=7, ncol=4, loc="upper left")
-        axes[1].xaxis.set_major_locator(plt.MaxNLocator(integer=True))
-        axes[1].set_xlabel("Year (years without out-of-bounds levels are not drawn on the log axis)")
-    fig.suptitle("Temporal evolution of out-of-bounds levels (variables with the most exceedances)"
-                 + ("" if level_counts_exact(df) else "  [lower bound]"), fontsize=13, weight="bold")
-    fig.tight_layout(rect=(0, 0.045, 1, 0.95))
-    _lower_bound_note(fig, df)
-    pdf.savefig(fig)
-    plt.close(fig)
-
-
-def page_bounds_table(pdf, summ, df):
-    """Appendix: level-resolved out-of-bounds table per variable."""
-    fig, ax = plt.subplots(figsize=LANDSCAPE)
-    ax.axis("off")
-    cols = ["Variable", "Valid levels", "Levels below", "Levels above", "Levels out (%)",
-            "Files affected (%)", "Files severe (%)"]
-    cell = []
-    for _, r in summ.iterrows():
-        def cnt(x):
-            return "n/a" if pd.isna(x) else f"{x:,.0f}"
-        cell.append([textwrap.fill(r["Variable"], 40),
-                     "n/a" if r["Valid levels"] == 0 else f"{r['Valid levels']:.3e}",
-                     cnt(r["Levels below"]), cnt(r["Levels above"]),
-                     _fmt_pct(r["Levels out (%)"]),
-                     "n/a" if pd.isna(r["Files affected (%)"]) else f"{r['Files affected (%)']:.1f}",
-                     "n/a" if pd.isna(r["Files severe (%)"]) else f"{r['Files severe (%)']:.1f}"])
-    tbl = ax.table(cellText=cell, colLabels=[textwrap.fill(c, 14) for c in cols], loc="center",
-                   cellLoc="center", colWidths=[0.30, 0.12, 0.11, 0.11, 0.12, 0.12, 0.12])
-    tbl.auto_set_font_size(False)
-    tbl.set_fontsize(7.5)
-    tbl.scale(1, 2.0)
-    for j in range(len(cols)):
-        tbl[0, j].set_facecolor("#dbe5f1")
-        tbl[0, j].set_text_props(weight="bold")
-    e1 = 100 * SEVERITY_EDGES[1]
-    for i, (_, r) in enumerate(summ.iterrows(), start=1):
-        tbl[i, 0].set_text_props(ha="left")
-        if pd.notna(r["Levels out (%)"]):
-            if r["Levels out (%)"] >= e1:
-                tbl[i, 4].set_facecolor("#f8c9c4")
-            elif r["Levels out (%)"] > 0:
-                tbl[i, 4].set_facecolor("#fde9c4")
-            else:
-                tbl[i, 4].set_facecolor("#d8efd3")
-        if pd.notna(r["Files severe (%)"]) and r["Files severe (%)"] > 0:
-            tbl[i, 6].set_facecolor("#f8c9c4")
-    ax.set_title("Appendix - out-of-bounds levels per variable, pooled over all files"
-                 + ("" if level_counts_exact(df) else "  [lower bound]")
-                 + f"\n(red: >= {e1:g} % of the levels; amber: some levels; green: none; "
-                 "severe = file with >= that fraction)", fontsize=11, weight="bold")
-    fig.tight_layout(rect=(0, 0.045, 1, 1))
-    _lower_bound_note(fig, df)
-    pdf.savefig(fig)
-    plt.close(fig)
-
-
 def page_methods(pdf, df, var_names):
     """Appendix: definitions, assumptions, limitations and input checks."""
-    e0, e1 = (100 * e for e in SEVERITY_EDGES)
     gaps = month_gaps(df)
-    exact = level_counts_exact(df)
     sections = [
         ("1. Input and scope", [
             f"Input table: {INPUT_CSV_PATH}. {len(df)} file/variable rows, {df['file'].nunique()} monthly files "
@@ -1226,30 +961,19 @@ def page_methods(pdf, df, var_names):
         ("2. Definitions", [
             "Level: one record of a monthly file; n_records is the number of levels and n_valid the number of "
             "levels with a non-missing observation.",
-            "Out-of-bounds level: a valid observation outside the closed interval [lower, upper] given for its "
-            "variable (PLAUSIBLE_RANGES_BY_CODE in the NetCDF check, copied into the input table). The bounds are "
-            "generous screening limits for gross errors, not "
-            "GRUAN-certified acceptance limits.",
-            "Out-of-bounds fraction: number of out-of-bounds levels divided by the number of valid levels "
-            "(denominator: valid levels, not records). Pooled fractions sum numerators and denominators over all "
-            "files; they are not averages of per-file fractions and therefore weight each level equally.",
-            f"Severity classes (per file and variable): clean = no level out of bounds; isolated = fraction < "
-            f"{e0:g} %; moderate = {e0:g} % to {e1:g} %; severe = >= {e1:g} %. Isolated outliers typically indicate "
-            "sporadic sensor or processing glitches, severe rows indicate a systematic failure of the file.",
-            "File-level flag (previous version of the report): minimum or maximum outside the bounds. A single "
-            "level suffices to flag a file, so it cannot distinguish isolated outliers from systematic failures."]),
-        ("3. Provenance of the level counts", [
-            ("Exact counts: read from the columns " + f"{COL_N_BELOW} and {COL_N_ABOVE} of the input table, "
-             "computed level by level by gruan_check_nc_CDM.py with the bounds listed in the same table.") if exact else
-            ("LOWER BOUNDS: the input table has no per-level counters. A minimum below the range proves at least "
-             "one level below it, and a maximum above the range proves at least one other level above it; files "
-             "with minimum and maximum inside the bounds contain exactly zero out-of-bounds levels. Counts and "
-             "fractions of flagged files are therefore underestimated and the severity classes are minimum "
-             "classes.")]),
+            "Out-of-range file: a file/variable row whose minimum is below, or whose maximum is above, the closed "
+            "interval [lower, upper] given for its variable. A single level suffices to flag a file, so the flag "
+            "cannot distinguish isolated outliers from systematic failures."]),
+        ("3. Plausible ranges", [
+            f"The ranges are the check_range values of PLAUSIBILITY_RULES in {QC_PIPELINE_PATH}, converted to the "
+            "units of the CDM files (relative humidity: fraction -> %; pressure: hPa -> Pa; water vapour mixing "
+            "ratio: ppmv -> mol/mol; see CDM_CODE_TO_RULE). Variables whose rule has no check_range, or that have "
+            "no rule (time since launch), are not assessed."]),
         ("4. Limitations", [
-            "The range test detects gross errors only; physically plausible but wrong values pass. Counts are not "
-            "stratified by altitude, pressure layer, launch time or sonde type. Uncertainty variables are not "
-            "range-tested level by level; they are assessed through file-level maxima (consistency page).",
+            "The range test detects gross errors only; physically plausible but wrong values pass. The table "
+            "stores only the minimum, maximum and number of valid values per file, so the number of out-of-range "
+            "levels cannot be determined. Uncertainty variables are not range-tested; they are assessed through "
+            "file-level maxima (consistency page).",
             "Saturation (\"cap\") of the total uncertainty of pressure and wind: only file minima and maxima are "
             "available, so a cap is inferred when the file maximum lies within "
             f"{100 * CAP_REL_TOL:g} % of a characteristic value (pressure {PRESSURE_UNC_CAP:g} Pa; wind components "
@@ -1259,7 +983,7 @@ def page_methods(pdf, df, var_names):
             "a file whose true maximum coincides with the cap by chance would also be counted. The caps were identified empirically from the pile-up of the file maxima, not from "
             "GRUAN documentation. Random and systematic components are not available for these variables, so "
             "the quadrature consistency test cannot be applied.",
-            "Missing files and files without valid levels are excluded from the fractions and shown in grey."]),
+            "Missing files are shown in grey in the heatmaps."]),
         ("5. Input checks", input_checks(df)),
     ]
     fig = plt.figure(figsize=PORTRAIT)
@@ -1285,7 +1009,8 @@ def page_table(pdf, summ):
             "Files out of range (%)", "Lowest min", "Highest max"]
     cell = []
     for _, r in summ.iterrows():
-        cell.append([textwrap.fill(r["Variable"], 40)] + [f"{r[c]:.1f}" for c in cols[1:6]]
+        cell.append([textwrap.fill(r["Variable"], 40)]
+                    + ["n/a" if pd.isna(r[c]) else f"{r[c]:.1f}" for c in cols[1:6]]
                     + [f"{r['Lowest min']:.4g}", f"{r['Highest max']:.4g}"])
     tbl = ax.table(cellText=cell, colLabels=[textwrap.fill(c, 14) for c in cols], loc="center", cellLoc="center",
                    colWidths=[0.30] + [0.10] * 7)
@@ -1304,31 +1029,11 @@ def page_table(pdf, summ):
         for j in (2, 3, 4):
             if r[cols[j]] == 0:
                 tbl[i, j].set_facecolor("#eeeeee")
-    ax.set_title("Appendix - per-variable summary (red = potential problem, grey = component absent)",
+    ax.set_title("Appendix - per-variable summary (red = potential problem, grey = component absent, n/a = no plausible range)",
                  fontsize=12, weight="bold")
     fig.tight_layout()
     pdf.savefig(fig)
     plt.close(fig)
-
-
-def export_flagged_levels(df, path):
-    """Write every file/variable row with out-of-bounds levels, worst first (QA/QC follow-up list)."""
-    out = df[df["n_out"] > 0].copy()
-    out["month"] = out["date"].dt.strftime("%Y-%m")
-    out["counts_exact"] = level_counts_exact(df)
-    out["severity_class"] = out["severity"].map(dict(enumerate(severity_labels())))
-    out = out.rename(columns={
-        "n_below": "n_levels_below_range", "n_above": "n_levels_above_range",
-        "n_out": "n_levels_out_of_bounds", "out_frac": "out_of_bounds_fraction",
-        "observation_value_n_valid": "n_valid_levels",
-    })
-    cols = ["file", "month", "observed_variable_code", "observed_variable_name", "units_abbreviation",
-            "n_records", "n_valid_levels", "n_levels_below_range", "n_levels_above_range",
-            "n_levels_out_of_bounds", "out_of_bounds_fraction", "severity_class", "range_lo", "range_hi",
-            "observation_value_min", "observation_value_max", "counts_exact"]
-    out = out[cols].sort_values(["out_of_bounds_fraction", "n_levels_out_of_bounds"], ascending=False)
-    out.to_csv(path, index=False, encoding="utf-8")
-    return len(out)
 
 
 # ==========================================================================
@@ -1348,9 +1053,6 @@ def main():
         page_validity(pdf, df, var_names)
         page_uncertainty_availability(pdf, df, var_names, summ)
         page_plausibility(pdf, df, var_names)
-        page_bounds_overview(pdf, df, var_names, summ)
-        page_bounds_heatmap(pdf, df, var_names)
-        page_bounds_timeseries(pdf, df, summ)
         page_envelopes(pdf, df, var_names)
         page_uncertainty_timeseries(pdf, df)
         page_pressure_uncertainty(pdf, df)
@@ -1358,14 +1060,11 @@ def main():
         page_uncertainty_extremes(pdf, df, var_names)
         page_consistency(pdf, df)
         page_table(pdf, summ)
-        page_bounds_table(pdf, summ, df)
         page_methods(pdf, df, var_names)
         info = pdf.infodict()
         info["Title"] = "GRUAN dataset - quality screening report"
 
-    n_flagged = export_flagged_levels(df, OUTPUT_FLAGGED_CSV_PATH)
     print(f"Report written to: {OUTPUT_PDF_PATH}")
-    print(f"{n_flagged} rows with out-of-bounds levels written to: {OUTPUT_FLAGGED_CSV_PATH}")
 
 
 if __name__ == "__main__":
