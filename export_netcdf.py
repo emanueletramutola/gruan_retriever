@@ -187,11 +187,14 @@ QC_INPUT_COLUMNS = {
 # uncertainty 'u_std_temp' is CF-1.4 only).
 #
 # The plausibility QC must know, for each profile, which uncertainty
-# columns its file format is expected to provide:
-#   * a format-specific column that is missing entirely (not provided by
-#     the format) must NOT trigger the missing-uncertainty rule;
-#   * a column that is provided but carries a NaN at individual levels
-#     MUST trigger it.
+# columns its file format is expected to provide. The missing-uncertainty
+# rule concerns the TOTAL uncertainty only (the *_uc_tot keys):
+#   * a total uncertainty that is not provided by the format must NOT
+#     trigger the rule;
+#   * a total uncertainty that is provided but carries a NaN at individual
+#     levels MUST trigger it.
+# Random and systematic uncertainties (*_uc_std / *_uc_sys) never reject a
+# value; their entries are kept only for completeness.
 # The information is derived from CDM_VARIABLES, which is the single
 # source of truth for the CF-1.4 / CF-1.7 column names.
 
@@ -268,10 +271,16 @@ QC_MAX_ALTITUDE_M = qc_pipeline.PLAUSIBILITY_MAX_ALTITUDE_M
 
 # When True, the uncertainty columns (random / systematic / total) of ANY value
 # that has been set to NULL are set to NULL as well.
-# Independently of this flag, when the TOTAL uncertainty of a level is outside
-# its plausible range (temperature 0-10 K, RH 0-100 %, pressure 0-1000 Pa, see
-# qc_pipeline.PLAUSIBILITY_UNCERTAINTY_RANGES) the value and its random,
-# systematic and total uncertainties are always set to NULL.
+# Independently of this flag:
+#   * when the TOTAL uncertainty of a level is NaN (and the file format is
+#     expected to provide it) or outside its plausible range (see the
+#     `unc_range` of qc_pipeline.PLAUSIBILITY_RULES), the value and its
+#     random, systematic and total uncertainties are always set to NULL.
+#     The total uncertainty is the ONLY uncertainty that can set the value
+#     to NULL;
+#   * when a random or systematic uncertainty is outside its plausible
+#     range, only that uncertainty is set to NULL; the value and the other
+#     uncertainties are kept.
 QC_NULLIFY_UNCERTAINTIES = False
 
 # A warning is printed when more than this fraction of the values of a
@@ -313,7 +322,7 @@ QC_RH_DEPENDENT_REPORT_VARIABLES = {
 # TIMER collects one month; export_month prints its report and folds it into
 # RUN_TIMER, which main() prints at the end (whole run).
 
-SCRIPT_REVISION = '2026-10-03e'   # shown in the log header: tells which code produced a log
+SCRIPT_REVISION = '2026-10-21a'   # shown in the log header: tells which code produced a log
 PG_SESSION_SETTINGS = []   # [(name, value)] applied with SET to every connection (--pg-set)
 LOG_PATH = None     # set by init_log(); None = no log file
 
@@ -890,7 +899,9 @@ def write_implausibility_report(df_merged: pd.DataFrame, qc_df: pd.DataFrame,
     `report_scale` / `report_unit` fields of qc_pipeline.PLAUSIBILITY_RULES
     (the same used in the reason text), not in the units of the NetCDF file;
     z_coordinate is the altitude in m.
-    Levels whose value was already NULL are not reported.
+    Levels whose value was already NULL are not reported. A random or
+    systematic uncertainty that is set to NULL on its own (out of range, value
+    kept) is not reported: the report lists only the values set to NULL.
     """
     no_reason = 'implausible (reason not available)'
     n_levels = len(qc_df)
@@ -1048,14 +1059,14 @@ def apply_plausibility_qc(df_merged: pd.DataFrame,
             max_altitude_m=max_altitude_m,
             return_reasons=report_path is not None,
             expected_uncertainties_by_profile=expected_unc_by_profile)
-        implausible, implausible_uncertainty = flags[:2]
+        implausible, implausible_uncertainty, implausible_columns = flags[:3]
 
     # 2b) record what is about to be set to NULL, and why
     if report_path is not None:
         with TIMER('plausibility_qc/implausibility_report'):
             n_reported = write_implausibility_report(
                 df_merged, qc_df, implausible, implausible_uncertainty,
-                flags[2], report_path)
+                flags[3], report_path)
         print(f"  Implausible values report: {n_reported:,} rows -> {report_path}")
 
     # 3) replace implausible values with NULL
@@ -1071,39 +1082,56 @@ def apply_plausibility_qc(df_merged: pd.DataFrame,
             print(f"    WARNING: more than "
                   f"{100 * QC_REJECTION_WARN_FRACTION:.0f}% of '{var}' rejected - "
                   f"check the units in QC_INPUT_COLUMNS.")
-        # Levels whose TOTAL uncertainty is outside the plausible range: value,
+        # Levels whose TOTAL uncertainty is unusable (NaN when the file format
+        # is expected to provide it, or outside the plausible range): value,
         # random, systematic and total uncertainty are all set to NULL.
         if var in implausible_uncertainty.columns:
-            uncertainty_mask = implausible_uncertainty[var].to_numpy()
+            total_mask = implausible_uncertainty[var].to_numpy()
         else:
-            uncertainty_mask = np.zeros(len(df_merged), dtype=bool)
-        n_uncertainty = int(uncertainty_mask.sum())
-        if n_uncertainty:
-            print(f"    {'':<18}  of which {n_uncertainty:>10,} levels with "
-                  f"at least one uncertainty (total/random/systematic) "
-                  f"out of range")
-        if n_rejected == 0 and n_uncertainty == 0:
+            total_mask = np.zeros(len(df_merged), dtype=bool)
+        n_total = int(total_mask.sum())
+        if n_total:
+            print(f"    {'':<18}  of which {n_total:>10,} levels with the total "
+                  f"uncertainty missing (NaN) or out of range")
+        # Random/systematic uncertainties outside their plausible range: only
+        # that single uncertainty is set to NULL, the value is kept.
+        column_masks = {}
+        for key in qc_pipeline.PLAUSIBILITY_RULES[var].get('other_unc_cols', []):
+            if key not in implausible_columns.columns:
+                continue
+            column_mask = implausible_columns[key].to_numpy()
+            n_column = int(column_mask.sum())
+            if n_column:
+                column_masks[key] = column_mask
+                print(f"    {'':<18}  {n_column:>10,} levels with '{key}' out of "
+                      f"range (only this uncertainty set to NULL)")
+        if n_rejected == 0 and n_total == 0 and not column_masks:
             continue
         # DB columns of the value and of all its uncertainties (random,
         # systematic, total). `_uncertainty_columns` reads CDM_VARIABLES and
         # returns every uncertainty column tied to the value column(s).
         value_columns = {c for c, _ in QC_INPUT_COLUMNS[var]}
         uncertainty_columns = _uncertainty_columns(value_columns)
-        # Values rejected by any check.
+        # Values rejected by any check (including an unusable total
+        # uncertainty).
+        value_mask = mask | total_mask
         for column in value_columns:
             if column in df_merged.columns:
-                df_merged[column] = df_merged[column].mask(
-                    mask | uncertainty_mask)
-        # Uncertainties: always for the uncertainty-range rejections, for all
-        # the rejections only if requested.
+                df_merged[column] = df_merged[column].mask(value_mask)
+        # All the uncertainties of the variable: always where the total
+        # uncertainty is unusable, for all the rejections only if requested.
         uncertainty_columns_mask = (
-            (mask | uncertainty_mask) if nullify_uncertainties
-            else uncertainty_mask)
+            value_mask if nullify_uncertainties else total_mask)
         if uncertainty_columns_mask.any():
             for column in set(uncertainty_columns):
                 if column in df_merged.columns:
                     df_merged[column] = df_merged[column].mask(
                         uncertainty_columns_mask)
+        # Single random/systematic uncertainties out of range.
+        for key, column_mask in column_masks.items():
+            for column, _ in QC_INPUT_COLUMNS[key]:
+                if column in df_merged.columns:
+                    df_merged[column] = df_merged[column].mask(column_mask)
 
     print(f"  Plausibility QC time: {time.perf_counter() - start:.2f}s")
     return df_merged
