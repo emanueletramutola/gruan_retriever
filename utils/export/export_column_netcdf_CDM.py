@@ -25,16 +25,16 @@ logging.basicConfig(
 EXPORT_CDM = True
 EXPORT_GRUAN = False
 
-# INPUT_DIR_CDM = '/storage/baron-data/GRUAN_CDS'
-INPUT_DIR_CDM = '/Data/GRUAN_TEST/ema'
+INPUT_DIR_CDM = '/storage/baron-data/GRUAN_CDS'
+# INPUT_DIR_CDM = '/Data/GRUAN_TEST/ema'
 INPUT_DIR_GRUAN = '/Data/GRUAN_TEST/netcdf'
 
-# INTERMEDIATE_DIR_CDM = '/storage/baron-data/tmp'
-INTERMEDIATE_DIR_CDM = '/Data/GRUAN_TEST/ema/tmp'
+INTERMEDIATE_DIR_CDM = '/storage/baron-data/tmp'
+# INTERMEDIATE_DIR_CDM = '/Data/GRUAN_TEST/ema/tmp'
 INTERMEDIATE_DIR_GRUAN = '/Data/GRUAN_TEST/output/csv_parts_gruan'
 
-# OUTPUT_PATH_CDM = '/storage/baron-data/tmp/CDM_data.csv'
-OUTPUT_PATH_CDM = '/Data/GRUAN_TEST/ema/CDM_data.csv'
+OUTPUT_PATH_CDM = '/storage/baron-data/GRUAN_CDS/CDM_data.csv'
+# OUTPUT_PATH_CDM = '/Data/GRUAN_TEST/ema/CDM_data.csv'
 OUTPUT_PATH_GRUAN = '/Data/GRUAN_TEST/output/GRUAN_data.csv'
 
 NETCDF_PATTERN = "*.nc"
