@@ -139,7 +139,8 @@ UNIT_TRANSFORMS: dict[str, tuple[float, float]] = {
 # If the units of your DB differ, change the scale factors here.
 QC_INPUT_COLUMNS = {
     # --- Values ---
-    'height':                     [('u_alt', 1.0), ('alt', 1.0)],
+    # 'height':                     [('u_alt', 1.0), ('alt', 1.0)],
+    'height':                     [('alt', 1.0)],
     'temperature':                [('temp', 1.0)],
     # 'relative_humidity':          [('rh', 1.0)],
     'relative_humidity':          [('rh', 0.01)],                   # percent -> fraction
@@ -155,7 +156,8 @@ QC_INPUT_COLUMNS = {
     'vertical_speed':             [('vspeed', 1.0), ('asc', 1.0)],
     'rh_resolution':              [('res_rh', 1.0), ('rh_res', 1.0)],
     # --- Total uncertainties ---
-    'height_uc_tot':              [('alt_uc', 1.0)],
+    # 'height_uc_tot':              [('alt_uc', 1.0)],
+    'height_uc_tot':              [('u_alt', 1.0), ('alt_uc', 1.0)],
     'temperature_uc_tot':         [('u_temp', 1.0), ('temp_uc', 1.0)],
     # 'relative_humidity_uc_tot':   [('u_rh', 1.0), ('rh_uc', 1.0)],
     'relative_humidity_uc_tot':   [('u_rh', 1.0), ('rh_uc', 0.01)],

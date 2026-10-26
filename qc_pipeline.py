@@ -1121,7 +1121,7 @@ CF17_UNC_FILE_COLUMNS = frozenset({
 })
 # QC uncertainty key -> file columns it can be read from.
 QC_UNCERTAINTY_SOURCES = {
-    "height_uc_tot":              ("alt_uc",),
+    "height_uc_tot":              ("u_alt", "alt_uc",),
     "temperature_uc_tot":         ("u_temp", "temp_uc"),
     "relative_humidity_uc_tot":   ("u_rh", "rh_uc"),
     "wind_speed_uc_tot":          ("u_wspeed", "wspeed_uc"),
@@ -1201,7 +1201,7 @@ def load_netcdf_profile(jar_file_path):
         mapping = {
             # Core profile
             "height":                      ["alt"],
-            "height_uc_tot":               ["alt_uc"],
+            "height_uc_tot":               ["u_alt", "alt_uc"],
             "pressure":                    ["press"],
             "pressure_uc_tot":             ["press_uc", "u_press"],
             "temperature":                 ["temp"],
