@@ -287,6 +287,16 @@ QC_NULLIFY_UNCERTAINTIES = True
 # variable is rejected in a month (usually a sign of a wrong unit).
 QC_REJECTION_WARN_FRACTION = 0.5
 
+# When True, for EVERY variable of CDM_VARIABLES, a level whose value is
+# NULL/NaN (whatever the reason: missing in the GRUAN file, missing in the DB,
+# rejected by the QC) has ALL its uncertainties (random, systematic, total) set
+# to NULL. It complements QC_NULLIFY_UNCERTAINTIES, which only covers the values
+# rejected by the plausibility QC: a value that is already NULL in the source
+# is never evaluated by the QC, so its uncertainties would otherwise survive.
+# It does not depend on apply_qc. The opposite case (valid value, missing
+# random/systematic uncertainty) is NOT affected.
+NULLIFY_UNCERTAINTIES_OF_MISSING_VALUES = True
+
 # ── implausible-values report ─────────────────────────────────────────────────
 # Every value set to NULL by the plausibility QC is recorded, with the reason,
 # in a CSV. Each month writes its own part file (safe with --jobs > 1: workers
@@ -322,7 +332,7 @@ QC_RH_DEPENDENT_REPORT_VARIABLES = {
 # TIMER collects one month; export_month prints its report and folds it into
 # RUN_TIMER, which main() prints at the end (whole run).
 
-SCRIPT_REVISION = '2026-10-21a'   # shown in the log header: tells which code produced a log
+SCRIPT_REVISION = '2026-10-26a'   # shown in the log header: tells which code produced a log
 PG_SESSION_SETTINGS = []   # [(name, value)] applied with SET to every connection (--pg-set)
 LOG_PATH = None     # set by init_log(); None = no log file
 
@@ -1137,6 +1147,41 @@ def apply_plausibility_qc(df_merged: pd.DataFrame,
     return df_merged
 
 
+def nullify_uncertainties_of_missing_values(df_merged: pd.DataFrame) -> pd.DataFrame:
+    """Set to NULL all the uncertainty columns (random, systematic, total) of
+    every CDM variable at the levels where its value is NULL/NaN.
+
+    The "value" is computed exactly as build_cdm_long does (_col_or_nan: CF-1.4
+    column first, CF-1.7 as fallback; non-numeric -> NaN), so a level is
+    considered missing here if and only if observation_value will be NaN in the
+    NetCDF. Must be called BEFORE UNIT_TRANSFORMS (NaN is unaffected by them,
+    but the same order as the QC keeps the logic simple).
+    """
+    print("  Uncertainties of missing values:")
+    for entry in CDM_VARIABLES:
+        (code, name_cf_1_4, name_cf_1_7, _, _,
+         uc_rand, uc_sys_cf_1_4, uc_sys_cf_1_7,
+         uc_tot_cf_1_4, uc_tot_cf_1_7) = entry
+        uc_columns = {c for c in (uc_rand, uc_sys_cf_1_4, uc_sys_cf_1_7,
+                                  uc_tot_cf_1_4, uc_tot_cf_1_7)
+                      if c and c in df_merged.columns}
+        if not uc_columns:
+            continue
+        missing_value = _col_or_nan(df_merged, name_cf_1_4,
+                                    name_cf_1_7).isna().to_numpy()
+        if not missing_value.any():
+            continue
+        n_changed = 0
+        for column in uc_columns:
+            had_uncertainty = df_merged[column].notna().to_numpy()
+            n_changed = max(n_changed, int((missing_value & had_uncertainty).sum()))
+            df_merged[column] = df_merged[column].mask(missing_value)
+        if n_changed:
+            print(f"    {ALL_CDM_LABELS.get(code, code):<28}: up to {n_changed:>10,} "
+                  f"levels with a NULL value and a non-NULL uncertainty -> uncertainties set to NULL")
+    return df_merged
+
+
 # ── CDM pivot logic ───────────────────────────────────────────────────────────
 def _col_or_nan(df: pd.DataFrame,
                 column_name_cf_1_4: Optional[str] = None,
@@ -1925,6 +1970,10 @@ def export_month(conn_params, year, month, output_dir,
                 df_merged,
                 report_path=(_implausibility_part_path(output_dir, year, month)
                              if implausibility_report else None))
+
+    if NULLIFY_UNCERTAINTIES_OF_MISSING_VALUES:
+        with TIMER('nullify_uncertainties_of_missing_values'):
+            df_merged = nullify_uncertainties_of_missing_values(df_merged)
 
     with TIMER('unit_transforms'):
         for col, (scale, offset) in UNIT_TRANSFORMS.items():
