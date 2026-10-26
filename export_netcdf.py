@@ -281,7 +281,7 @@ QC_MAX_ALTITUDE_M = qc_pipeline.PLAUSIBILITY_MAX_ALTITUDE_M
 #   * when a random or systematic uncertainty is outside its plausible
 #     range, only that uncertainty is set to NULL; the value and the other
 #     uncertainties are kept.
-QC_NULLIFY_UNCERTAINTIES = False
+QC_NULLIFY_UNCERTAINTIES = True
 
 # A warning is printed when more than this fraction of the values of a
 # variable is rejected in a month (usually a sign of a wrong unit).
