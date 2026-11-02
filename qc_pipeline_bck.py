@@ -26,7 +26,10 @@ CTH_TEMPERATURE_THR_K = 268.15
 # ==========================================
 # NETCDF PRODUCT-SPECIFIC NAMES AND UNITS
 # ==========================================
+# Geometric altitude first (the same quantity as the `height` levels it is
+# compared with); the older attributes are only fallbacks.
 TROPOPAUSE_ATTRIBUTE_CANDIDATES = (
+    "g.Measurement.TropopauseAltitude",
     "g.Measurement.TropopauseGeopotHeight",
     "g.Ascent.TropopauseHeight",
 )
@@ -59,10 +62,15 @@ PLAUSIBILITY_MAX_ALTITUDE_M = 47000.0
 # For every variable:
 #   val_col         : column holding the value
 #   unc_total_col   : column holding the total uncertainty (or None)
-#   other_unc_cols  : additional uncertainty columns (random/systematic)
-#                     to be nulled together with the value
-#   unc_range       : (lo, hi) plausible range of the total uncertainty,
-#                     both bounds included; None to skip the check
+#   other_unc_cols  : additional uncertainty columns (random/systematic).
+#                     They NEVER cause the value to be rejected: they are
+#                     set to NULL together with the value when the level is
+#                     rejected, and a single one is set to NULL on its own
+#                     when it is outside `unc_range`
+#   unc_range       : (lo, hi) plausible range applied to EVERY uncertainty
+#                     of the variable (total, random, systematic), both
+#                     bounds included; None to skip the check. Only the
+#                     total uncertainty can reject the value
 #   check_range     : (lo, hi) physical plausibility range of the value,
 #                     evaluated together with the total uncertainty as
 #                     [value - unc, value + unc]; None to skip the check
@@ -279,17 +287,34 @@ def zhang_cold_cloud_layers(rh, height, temperature,
     alt_agl = alt_msl - alt_msl[0]
     alt_km = alt_agl / 1000.0
     rh_calc = rh_over_ice(temp_k, rh_w)
+
+    # OLD - START
+    # min_rh = np.select(
+    #     [(alt_km >= 2) & (alt_km < 6), (alt_km >= 6) & (alt_km <= 12),
+    #      alt_km > 12], [0.90, 0.88, 0.80], default=np.nan)
+    # max_rh = np.select(
+    #     [(alt_km >= 2) & (alt_km < 6), (alt_km >= 6) & (alt_km <= 12),
+    #      alt_km > 12], [0.93, 0.90, 0.70], default=np.nan)
+    # inter_rh = np.select(
+    #     [(alt_km >= 2) & (alt_km < 6), (alt_km >= 6) & (alt_km <= 12),
+    #      alt_km > 12], [0.80, 0.75, 0.70], default=np.nan)
+    # is_moist = ((alt_km >= 2.0) & ~np.isnan(min_rh)
+    #             & (rh_calc >= min_rh) & (temp_k <= temp_max_k))
+    # OLD - END
+
+    # NEW - START
     min_rh = np.select(
-        [(alt_km >= 2) & (alt_km < 6), (alt_km >= 6) & (alt_km <= 12),
-         alt_km > 12], [0.90, 0.88, 0.80], default=np.nan)
+        [alt_km < 6, (alt_km >= 6) & (alt_km <= 12), alt_km > 12],
+        [0.90, 0.88, 0.80], default=np.nan)
     max_rh = np.select(
-        [(alt_km >= 2) & (alt_km < 6), (alt_km >= 6) & (alt_km <= 12),
-         alt_km > 12], [0.93, 0.90, 0.70], default=np.nan)
+        [alt_km < 6, (alt_km >= 6) & (alt_km <= 12), alt_km > 12],
+        [0.93, 0.90, 0.70], default=np.nan)
     inter_rh = np.select(
-        [(alt_km >= 2) & (alt_km < 6), (alt_km >= 6) & (alt_km <= 12),
-         alt_km > 12], [0.80, 0.75, 0.70], default=np.nan)
-    is_moist = ((alt_km >= 2.0) & ~np.isnan(min_rh)
-                & (rh_calc >= min_rh) & (temp_k <= temp_max_k))
+        [alt_km < 6, (alt_km >= 6) & (alt_km <= 12), alt_km > 12],
+        [0.80, 0.75, 0.70], default=np.nan)
+    is_moist = ((~np.isnan(min_rh)) & (rh_calc >= min_rh) & (temp_k <= temp_max_k))
+    # NEW - END
+
     diffs = np.diff(is_moist.astype(int))
     starts = np.where(diffs == 1)[0] + 1
     ends = np.where(diffs == -1)[0]
@@ -351,7 +376,10 @@ def check_cloud_top(rh, height, pressure, temperature):
     valid_pressure = pressure[valid]
     top_pressure = (valid_pressure[top_layer["end_idx"]]
                     if top_layer["end_idx"] < len(valid_pressure) else np.nan)
-    return {"index": top_layer["end_idx"], "height": top_layer["top_msl"],
+    # `end_idx` refers to the compacted (valid-only) arrays used by the
+    # Zhang algorithm: map it back to the index of the original profile.
+    original_index = int(np.flatnonzero(valid)[top_layer["end_idx"]])
+    return {"index": original_index, "height": top_layer["top_msl"],
             "pressure": top_pressure, "flag": True}
 
 
@@ -404,38 +432,56 @@ def evaluate_level_plausibility(profile_data,
 
     `expected_uncertainties` is an optional dict {qc_unc_key: bool} telling
     the evaluator which uncertainty columns the source file format of this
-    profile is expected to provide. The missing-uncertainty rule is applied
-    only to the columns marked True. A column the format does not provide
-    is not flagged as missing, and only the value-range check applies to
-    it. When None, every declared uncertainty column is checked
-    (backwards-compatible behaviour).
+    profile is expected to provide. The missing-uncertainty rule concerns
+    the TOTAL uncertainty only and is applied only when the total
+    uncertainty of the variable is marked True. A total uncertainty the
+    format does not provide is not flagged as missing, and only the
+    value-range check applies to the variable. When None, every declared
+    total uncertainty is expected (backwards-compatible behaviour).
 
-    Returns (evaluated_levels, rejected, uncertainty_rejected):
+    Returns (evaluated_levels, rejected, uncertainty_rejected,
+    column_rejected):
       - evaluated_levels    : boolean array, True for evaluated levels;
       - rejected            : {variable: boolean array | None}; True where
-                              the level is rejected. None = variable could
-                              not be evaluated (missing column, error, no
-                              valid data);
+                              the level is rejected, i.e. the value must be
+                              set to NULL. None = variable could not be
+                              evaluated (missing column, error, no valid
+                              data);
       - uncertainty_rejected: {variable: boolean array | None}; True where
-                              AT LEAST ONE of the uncertainty columns of the
-                              variable (total, random, systematic) is
-                              outside its plausible `unc_range`. These levels
-                              are also True in `rejected`. None means the
-                              check could not be performed (no uncertainty
-                              column available).
-    With return_reasons=True, a 4th item is returned:
+                              the TOTAL uncertainty of the variable is
+                              unusable: NaN (when the file format is
+                              expected to provide it) or outside its
+                              plausible `unc_range`. These levels are also
+                              True in `rejected`. The value AND all the
+                              uncertainties of the variable (total, random,
+                              systematic) must be set to NULL. None means
+                              there is no total uncertainty to evaluate;
+      - column_rejected     : {uncertainty key: boolean array | None} for
+                              the random/systematic uncertainty columns
+                              (`other_unc_cols`); True where that single
+                              uncertainty is outside `unc_range`. ONLY that
+                              uncertainty must be set to NULL: the value and
+                              the other uncertainties are not affected, and
+                              these levels are NOT in `rejected`. None means
+                              the check could not be performed (column not
+                              available, or no `unc_range`).
+    With return_reasons=True, a 5th item is returned:
       - reasons             : {variable: object array | None} with the text
                               explaining each rejection ("" for accepted
                               levels). None if no level of the variable has
                               a reason.
 
     Rules applied (per variable):
-      1. Missing uncertainty: every uncertainty column the file format is
-         expected to provide (see `expected_uncertainties`) must be
-         non-NaN at the level; otherwise the level is rejected.
+      1. Missing total uncertainty: if the file format is expected to
+         provide the total uncertainty (see `expected_uncertainties`), it
+         must be non-NaN at the level; otherwise the level is rejected.
+         Random and systematic uncertainties that are NaN never reject a
+         level.
       2. Uncertainty range: every available uncertainty column (total,
-         random, systematic) is compared with `unc_range`; the level is
-         rejected if at least one of them is outside the range.
+         random, systematic) is compared with `unc_range`.
+           * total uncertainty outside the range: the level is rejected;
+           * random/systematic uncertainty outside the range: only that
+             uncertainty is flagged in `column_rejected`.
       3. Value plausibility: for out-of-range values the interval
          [value - unc, value + unc] is compared with `check_range`:
              value - unc > hi   OR   value + unc < lo
@@ -462,111 +508,106 @@ def evaluate_level_plausibility(profile_data,
                           for var in rules}
         early_unc = {var: np.zeros(n_levels, dtype=bool)
                      for var, info in rules.items()
-                     if info.get("unc_range") is not None}
+                     if info.get("unc_total_col") is not None}
+        early_columns = {col: np.zeros(n_levels, dtype=bool)
+                         for info in rules.values()
+                         if info.get("unc_range") is not None
+                         for col in info.get("other_unc_cols", [])}
         if return_reasons:
             return (evaluated_levels, early_rejected, early_unc,
-                    {var: None for var in rules})
-        return evaluated_levels, early_rejected, early_unc
+                    early_columns, {var: None for var in rules})
+        return evaluated_levels, early_rejected, early_unc, early_columns
 
     n_evaluated = int(evaluated_levels.sum())
     rejected = {}
     uncertainty_rejected = {}
+    column_rejected = {}
     reasons = {}
 
     # -------------------------------------------------------------
-    # Phase 1: missing-uncertainty + uncertainty range + value check
+    # Phase 1: missing total uncertainty + uncertainty range + value check
     # -------------------------------------------------------------
     for var, info in rules.items():
         val_col = info["val_col"]
         unc_col = info.get("unc_total_col")
+        other_unc_cols = list(info.get("other_unc_cols", []))
         unc_range = info.get("unc_range")
         check_range = info.get("check_range")
         scale = info.get("report_scale", 1.0)
         unit = info.get("report_unit", "")
 
         value_parts = []
-        uncertainty_parts = []
-        missing_unc_parts = []
-        uncertainty_range_rejected = None
-        missing_unc_rejected = None
+        missing_parts = []
+        total_range_parts = []
+        # Over the evaluated levels: True where the TOTAL uncertainty is
+        # unusable (missing or out of range). None = nothing to evaluate.
+        total_unusable = None
 
-        unc_cols_declared = []
+        # --- Missing total uncertainty check ---
+        # A measurement value is invalid whenever its TOTAL uncertainty is
+        # missing (NaN). Random and systematic uncertainties never reject
+        # the value. Whether the total uncertainty is "expected" depends on
+        # the file format (CF-1.4 / CF-1.7): the caller passes
+        # expected_uncertainties to restrict the rule to the profiles whose
+        # format is supposed to provide it. A total uncertainty the format
+        # does not provide is not flagged as missing; one the format does
+        # provide and that carries NaN at an individual level is.
         if unc_col is not None:
-            unc_cols_declared.append(unc_col)
-        unc_cols_declared.extend(info.get("other_unc_cols", []))
-
-        # --- Missing-uncertainty check ---
-        # A measurement value is invalid whenever any of its declared
-        # uncertainties is missing (NaN). Which uncertainties are
-        # "declared" depends on the file format (CF-1.4 / CF-1.7): the
-        # caller passes expected_uncertainties to restrict the rule to
-        # the columns the current profile's format is supposed to
-        # provide. A column the format does not provide is not flagged
-        # as missing; a column the format does provide and that carries
-        # NaN at an individual level is.
-        if unc_cols_declared:
-            if expected_uncertainties is not None:
-                checked_cols = [c for c in unc_cols_declared
-                                if expected_uncertainties.get(c, True)]
-            else:
-                checked_cols = list(unc_cols_declared)
-
-            if checked_cols:
-                missing_cols = [c for c in checked_cols
-                                if c not in profile_data.columns]
-                if missing_cols:
-                    missing_unc_rejected = np.ones(n_evaluated, dtype=bool)
-                    if return_reasons:
-                        missing_unc_parts.append((
-                            missing_unc_rejected,
-                            "no uncertainty column available (expected: "
-                            + ", ".join(f"'{c}'" for c in missing_cols)
-                            + ")"
-                        ))
+            total_expected = (expected_uncertainties is None
+                              or expected_uncertainties.get(unc_col, True))
+            if total_expected:
+                if unc_col not in profile_data.columns:
+                    missing_total = np.ones(n_evaluated, dtype=bool)
+                    missing_text = (f"no total uncertainty column available "
+                                    f"(expected: '{unc_col}')")
                 else:
-                    rej_missing = np.zeros(n_evaluated, dtype=bool)
-                    for col in checked_cols:
-                        vals = profile_data[col].to_numpy()[evaluated_levels]
-                        rej_missing |= np.isnan(vals)
-                    missing_unc_rejected = rej_missing
-                    if return_reasons:
-                        missing_unc_parts.append((
-                            rej_missing,
-                            "missing uncertainty (NaN) in one or more of: "
-                            + ", ".join(f"'{c}'" for c in checked_cols)
-                        ))
+                    missing_total = np.isnan(
+                        profile_data[unc_col].to_numpy()[evaluated_levels])
+                    missing_text = (f"missing total uncertainty (NaN) in "
+                                    f"'{unc_col}'")
+                total_unusable = missing_total
+                if return_reasons:
+                    missing_parts.append((missing_total, missing_text))
 
         # --- Uncertainty range check on EVERY available uncertainty ---
         if unc_range is not None:
             unc_lo, unc_hi = unc_range
-            present = [c for c in unc_cols_declared
-                       if c in profile_data.columns]
-            missing = [c for c in unc_cols_declared
-                       if c not in profile_data.columns]
+            declared = ([unc_col] if unc_col is not None else []) \
+                + other_unc_cols
+            missing = [c for c in declared if c not in profile_data.columns]
             if missing:
                 logging.warning(
                     f"Missing uncertainty column(s) for '{var}': "
                     f"{missing}; their range check is skipped")
 
-            if present:
-                rej_any = np.zeros(n_evaluated, dtype=bool)
-                for col in present:
-                    vals = profile_data[col].to_numpy()[evaluated_levels]
-                    rej_col = (vals < unc_lo) | (vals > unc_hi)
-                    rej_any |= rej_col
+            for col in declared:
+                if col not in profile_data.columns:
+                    continue
+                vals = profile_data[col].to_numpy()[evaluated_levels]
+                rej_col = (vals < unc_lo) | (vals > unc_hi)
+                if col == unc_col:
+                    # Total uncertainty out of range: the level is rejected.
+                    total_unusable = (rej_col if total_unusable is None
+                                      else total_unusable | rej_col)
                     if return_reasons:
-                        label = ("total uncertainty" if col == unc_col
-                                 else f"uncertainty '{col}'")
-                        uncertainty_parts.append((
+                        total_range_parts.append((
                             rej_col,
-                            f"{label} outside plausible range "
-                            f"[{unc_lo * scale:g}, {unc_hi * scale:g}] {unit}"))
-                full = np.zeros(n_levels, dtype=bool)
-                full[evaluated_levels] = rej_any
-                uncertainty_rejected[var] = full
-                uncertainty_range_rejected = rej_any
-            else:
-                uncertainty_rejected[var] = None
+                            f"total uncertainty outside plausible range "
+                            f"[{unc_lo * scale:g}, {unc_hi * scale:g}] "
+                            f"{unit}"))
+                else:
+                    # Random/systematic uncertainty out of range: only this
+                    # uncertainty is flagged, the value is not rejected.
+                    full_col = np.zeros(n_levels, dtype=bool)
+                    full_col[evaluated_levels] = rej_col
+                    column_rejected[col] = full_col
+        for col in other_unc_cols:
+            column_rejected.setdefault(col, None)
+
+        if total_unusable is not None:
+            full = np.zeros(n_levels, dtype=bool)
+            full[evaluated_levels] = total_unusable
+            uncertainty_rejected[var] = full
         else:
             uncertainty_rejected[var] = None
 
@@ -585,15 +626,15 @@ def evaluate_level_plausibility(profile_data,
             if return_reasons:
                 reasons[var] = _compose_reasons(
                     n_levels, evaluated_levels,
-                    missing_unc_parts + uncertainty_parts)
+                    missing_parts + total_range_parts)
             continue
 
         level_rejected = np.zeros_like(var_data, dtype=bool)
 
-        # Missing-uncertainty rejections come first: a level whose
-        # uncertainty budget is incomplete is not evaluated further.
-        if missing_unc_rejected is not None:
-            level_rejected |= missing_unc_rejected
+        # An unusable total uncertainty (missing or out of range) rejects
+        # the level: it is not evaluated further.
+        if total_unusable is not None:
+            level_rejected |= total_unusable
 
         if check_range is not None:
             c_min, c_max = check_range
@@ -611,7 +652,7 @@ def evaluate_level_plausibility(profile_data,
                 # CF-1.4 files for vertical_speed, where 'vspeed_uc'
                 # exists only in CF-1.7), or when the format does
                 # provide it but the level already failed the
-                # missing-uncertainty rule above. In both cases fall
+                # missing-total-uncertainty rule above. In both cases fall
                 # back to a plain value check, so out-of-range values
                 # are still caught.
                 missing_unc = np.isnan(unc)
@@ -642,9 +683,6 @@ def evaluate_level_plausibility(profile_data,
                     ))
             level_rejected |= invalid
 
-        if uncertainty_range_rejected is not None:
-            level_rejected |= uncertainty_range_rejected
-
         full = np.zeros(n_levels, dtype=bool)
         full[evaluated_levels] = level_rejected
         rejected[var] = full
@@ -652,12 +690,7 @@ def evaluate_level_plausibility(profile_data,
         if return_reasons:
             reasons[var] = _compose_reasons(
                 n_levels, evaluated_levels,
-                missing_unc_parts + value_parts + uncertainty_parts)
-
-    # Ensure every variable with unc_range has an entry.
-    for var, info in rules.items():
-        if info.get("unc_range") is not None:
-            uncertainty_rejected.setdefault(var, None)
+                missing_parts + value_parts + total_range_parts)
 
     # -------------------------------------------------------------
     # Phase 2: dependency propagation (until stability)
@@ -710,9 +743,10 @@ def evaluate_level_plausibility(profile_data,
     if return_reasons:
         for var in rules:
             reasons.setdefault(var, None)
-        return evaluated_levels, rejected, uncertainty_rejected, reasons
+        return (evaluated_levels, rejected, uncertainty_rejected,
+                column_rejected, reasons)
 
-    return evaluated_levels, rejected, uncertainty_rejected
+    return evaluated_levels, rejected, uncertainty_rejected, column_rejected
 
 
 def check_plausibility(profile_data,
@@ -722,8 +756,8 @@ def check_plausibility(profile_data,
     variable is plausible (True) only if NO level is rejected; np.nan means
     the variable has no valid data at all.
     """
-    evaluated_levels, rejected, _ = evaluate_level_plausibility(
-        profile_data, max_altitude_m)
+    evaluated_levels, rejected = evaluate_level_plausibility(
+        profile_data, max_altitude_m)[:2]
     if not evaluated_levels.any():
         return {var: False for var in PLAUSIBILITY_RULES}
     return {
@@ -732,17 +766,27 @@ def check_plausibility(profile_data,
     }
 
 
-def apply_plausibility_nulling(df_profile, rejected, uncertainty_rejected):
+def apply_plausibility_nulling(df_profile, rejected, uncertainty_rejected,
+                               column_rejected=None):
     """
-    Sets to NULL the value, the total uncertainty and any other uncertainty
-    column of every level rejected by the plausibility checks.
+    Sets to NULL:
+      - the value, the total uncertainty and every other uncertainty column
+        (random/systematic) of every level rejected by the plausibility
+        checks (`rejected`) or whose total uncertainty is unusable, i.e.
+        NaN or out of range (`uncertainty_rejected`);
+      - ONLY the single random/systematic uncertainty column of the levels
+        where it is outside its plausible range (`column_rejected`). The
+        value and the other uncertainties are kept.
 
-    `rejected` and `uncertainty_rejected` are the outputs of
-    evaluate_level_plausibility.
+    `rejected`, `uncertainty_rejected` and `column_rejected` are the outputs
+    of evaluate_level_plausibility.
     """
     df = df_profile.copy()
     for var, info in PLAUSIBILITY_RULES.items():
-        mask = rejected.get(var)
+        mask = None
+        for level_mask in (rejected.get(var), uncertainty_rejected.get(var)):
+            if level_mask is not None:
+                mask = level_mask if mask is None else mask | level_mask
         if mask is None:
             continue
         cols = [info["val_col"]]
@@ -752,6 +796,10 @@ def apply_plausibility_nulling(df_profile, rejected, uncertainty_rejected):
         for col in cols:
             if col in df.columns:
                 df.loc[mask, col] = np.nan
+
+    for col, mask in (column_rejected or {}).items():
+        if mask is not None and col in df.columns:
+            df.loc[mask, col] = np.nan
     return df
 
 
@@ -762,14 +810,27 @@ def flag_implausible_levels(data, profile_id_column="profile_id",
     """
     Level-by-level plausibility flags for a DataFrame stacking MANY profiles.
 
-    Returns (implausible, implausible_uncertainty):
+    Returns (implausible, implausible_uncertainty, implausible_columns):
       - implausible            : one column per checked variable, True where
-                                 the level is NOT plausible;
-      - implausible_uncertainty: one column per variable with unc_range,
-                                 True where the total uncertainty is outside
-                                 its plausible range.
+                                 the level is NOT plausible (the value must
+                                 be set to NULL);
+      - implausible_uncertainty: one column per variable with a total
+                                 uncertainty, True where the TOTAL
+                                 uncertainty is unusable (NaN when the file
+                                 format is expected to provide it, or
+                                 outside its plausible range). These levels
+                                 are also True in `implausible`: value and
+                                 all the uncertainties of the variable must
+                                 be set to NULL;
+      - implausible_columns    : one column per random/systematic
+                                 uncertainty (named by its QC key, e.g.
+                                 'temperature_uc_std'), True where that
+                                 single uncertainty is outside its plausible
+                                 range. ONLY that uncertainty must be set to
+                                 NULL: these levels do not make the value
+                                 implausible.
     Levels that could not be evaluated are False.
-    With return_reasons=True, a dict {variable: Series} is returned as 3rd
+    With return_reasons=True, a dict {variable: Series} is returned as 4th
     item with the text of the reason for the rejected levels only (indexed
     by positional row numbers of `data`).
 
@@ -777,8 +838,9 @@ def flag_implausible_levels(data, profile_id_column="profile_id",
         Optional dict {profile_id: {qc_unc_key: bool} | None}. It tells the
         evaluator, for every profile, which uncertainty columns the file
         format of that profile is expected to provide. The missing-
-        uncertainty rule is applied only to the columns marked True; a
-        column that the format does not provide is not flagged as missing.
+        uncertainty rule (total uncertainty only) is applied only when the
+        total uncertainty is marked True; a total uncertainty that the
+        format does not provide is not flagged as missing.
         A per-profile value of None (or a profile_id absent from the dict)
         means "expect all" (backwards-compatible behaviour).
     """
@@ -788,7 +850,13 @@ def flag_implausible_levels(data, profile_id_column="profile_id",
     implausible_uncertainty = {
         var: np.zeros(n_rows, dtype=bool)
         for var, info in PLAUSIBILITY_RULES.items()
+        if info.get("unc_total_col") is not None
+    }
+    implausible_columns = {
+        col: np.zeros(n_rows, dtype=bool)
+        for info in PLAUSIBILITY_RULES.values()
         if info.get("unc_range") is not None
+        for col in info.get("other_unc_cols", [])
     }
     rows_by_profile = data.groupby(profile_id_column, sort=False).indices
     reason_rows = {var: [] for var in PLAUSIBILITY_RULES}
@@ -803,9 +871,9 @@ def flag_implausible_levels(data, profile_id_column="profile_id",
             data.iloc[rows], max_altitude_m,
             return_reasons=return_reasons,
             expected_uncertainties=expected_unc)
-        _, rejected, uncertainty_rejected = result[:3]
+        _, rejected, uncertainty_rejected, column_rejected = result[:4]
         if return_reasons:
-            for var, reason_array in result[3].items():
+            for var, reason_array in result[4].items():
                 if reason_array is None:
                     continue
                 has_reason = reason_array != ""
@@ -817,9 +885,13 @@ def flag_implausible_levels(data, profile_id_column="profile_id",
         for var, level_mask in uncertainty_rejected.items():
             if level_mask is not None:
                 implausible_uncertainty[var][rows] = level_mask
+        for col, level_mask in column_rejected.items():
+            if level_mask is not None:
+                implausible_columns[col][rows] = level_mask
 
     flags = (pd.DataFrame(implausible, index=data.index),
-             pd.DataFrame(implausible_uncertainty, index=data.index))
+             pd.DataFrame(implausible_uncertainty, index=data.index),
+             pd.DataFrame(implausible_columns, index=data.index))
     if not return_reasons:
         return flags
     reasons = {}
@@ -884,6 +956,37 @@ def parse_numeric_attribute(attr_value):
     return float(match.group()) if match else np.nan
 
 
+def parse_altitude_attribute_m(attr_value):
+    """
+    Parses an altitude attribute such as '8995.3 gpm', '9042.2 m' or
+    '9.0 km' and returns it in metres. Missing values, unknown units,
+    sentinels (e.g. -999) and values outside (0, PLAUSIBILITY_MAX_ALTITUDE_M)
+    return NaN.
+    """
+    if attr_value is None:
+        return np.nan
+    match = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?\s*([A-Za-z]*)",
+                      str(attr_value))
+    if not match:
+        return np.nan
+    value = parse_numeric_attribute(attr_value)
+    unit = match.group(1).strip().lower()
+    if unit in ("", "m", "gpm"):
+        scale = 1.0
+    elif unit == "km":
+        scale = 1000.0
+    else:
+        print(f"[WARNING] Unrecognised unit '{unit}' in the tropopause "
+              f"attribute '{attr_value}': tropopause set to NaN.")
+        return np.nan
+    value *= scale
+    if not (0.0 < value < PLAUSIBILITY_MAX_ALTITUDE_M):
+        print(f"[WARNING] Tropopause attribute '{attr_value}' is outside "
+              f"the valid range: tropopause set to NaN.")
+        return np.nan
+    return value
+
+
 # ==========================================
 # README
 # ==========================================
@@ -905,20 +1008,51 @@ considered. RH is converted from w.r.t. water to w.r.t. ice for
 temperatures below 0 degC.
 
 ## Completeness
-Completeness is the fraction of missing data records.
+Despite its name, `Completeness_*` is the FRACTION OF MISSING data
+records: 0 means a fully complete variable, 1 means that every record
+is missing. Lower values are therefore better.
 HIGH: < 0.10
 GOOD: 0.10 <= C < 0.20
 FAIL: >= 0.20
 
+Notes:
+- It is computed after the plausibility check, so levels rejected by
+  the plausibility rules (set to NULL) count as missing.
+- `Ntotal_<var>` is the number of levels of the whole profile.
+  `Ntotal_<var>_troposphere` / `_stratosphere` count only the levels
+  with a known height, split at the tropopause altitude, so their sum
+  can be lower than `Ntotal_<var>`. If the tropopause is unknown the
+  two layers are reported as N/A with Ntotal = 0.
+- For the whole profile a level is missing if the variable or its
+  height is missing; for the two layers only the variable is checked.
+- The tropopause altitude (metres) is read from the file attributes:
+  the geometric altitude of the tropopause
+  (g.Measurement.TropopauseAltitude), which is the same quantity as the
+  profile heights it is compared with. Only if it is missing, the
+  geopotential height or the older g.Ascent.TropopauseHeight attribute
+  is used instead.
+
 ## Plausibility
 A variable is plausible (1) if no level up to 47 km is rejected, not
-plausible (0) otherwise. For each variable the following rules are
+plausible (0) otherwise. If no level can be evaluated (e.g. all heights
+are unknown) the flag is NaN. For each variable the following rules are
 applied level by level:
 
+0. Missing total uncertainty: a level is rejected if the TOTAL
+   uncertainty of the variable is NaN at that level and the file format
+   (CF-1.4 or CF-1.7) is expected to provide it. A total uncertainty that
+   exists in the other format only is not treated as missing. The
+   expectations per format are the same used by the NetCDF exporter. If
+   the format cannot be determined, the total uncertainty is expected.
+   Random and systematic uncertainties that are NaN never reject a level.
 1. Uncertainty range: every available uncertainty column of the variable
    (total, random, systematic) is compared with the plausible range of
-   the variable. The level is rejected if at least one of them is outside
-   the range, regardless of the value.
+   the variable.
+   - Total uncertainty outside the range: the level is rejected,
+     regardless of the value.
+   - Random or systematic uncertainty outside the range: only that
+     uncertainty is set to NULL; the value and the other uncertainties
+     are kept.
 2. Value plausibility: for out-of-range values the interval
    [value - unc, value + unc] is compared with the physical range. The
    level is rejected only if the whole interval is outside the range:
@@ -933,7 +1067,9 @@ applied level by level:
    - rh_resolution -> relative_humidity
 
 When the data is exported, the value, its random, systematic and total
-uncertainties are set to NULL for the rejected levels.
+uncertainties are set to NULL for the rejected levels and for the levels
+where the total uncertainty is NaN or out of range. A random or systematic
+uncertainty that is out of range is set to NULL on its own.
 """
     readme_path = os.path.join(os.path.dirname(OUTPUT_LOG_PATH), "README.md")
     with open(readme_path, "w", encoding="utf-8") as f:
@@ -965,6 +1101,69 @@ def extract_netcdf_bytes_from_jar(jar_path):
     return nc_bytes, nc_entry.filename
 
 
+# ------------------------------------------------------------------
+# Uncertainty columns expected from each file format (CF-1.4 / CF-1.7).
+# This mirrors the logic of gruan_exporter.py (QC_UNCERTAINTIES_BY_FORMAT,
+# _detect_profile_formats), so that the log and the exported data apply
+# the missing-total-uncertainty rule in the same way. Keep it in sync with
+# the exporter: CDM_VARIABLES / QC_INPUT_COLUMNS are the source of truth.
+# ------------------------------------------------------------------
+# NetCDF/DB columns holding uncertainties that exist in one format only.
+CF14_UNC_FILE_COLUMNS = frozenset({
+    "u_alt", "u_cor_rh", "u_cor_temp", "u_press", "u_rh", "u_std_rh",
+    "u_std_temp", "u_swrad", "u_temp", "u_wdir", "u_wspeed",
+})
+CF17_UNC_FILE_COLUMNS = frozenset({
+    "alt_gph_uc", "alt_gph_uc_tcor", "alt_uc", "fp_uc", "press_uc",
+    "rh_uc", "rh_uc_tcor", "temp_uc", "temp_uc_tcor", "vspeed_uc",
+    "wdir_uc", "wmeri_uc", "wspeed_uc", "wvmr_vol_uc", "wvmr_vol_uc_tcor",
+    "wzon_uc",
+})
+# QC uncertainty key -> file columns it can be read from.
+QC_UNCERTAINTY_SOURCES = {
+    "height_uc_tot":              ("u_alt", "alt_uc",),
+    "temperature_uc_tot":         ("u_temp", "temp_uc"),
+    "relative_humidity_uc_tot":   ("u_rh", "rh_uc"),
+    "wind_speed_uc_tot":          ("u_wspeed", "wspeed_uc"),
+    "wind_direction_uc_tot":      ("u_wdir", "wdir_uc"),
+    "u_uc_tot":                   ("wzon_uc",),
+    "v_uc_tot":                   ("wmeri_uc",),
+    "pressure_uc_tot":            ("u_press", "press_uc"),
+    "geopot_uc_tot":              ("alt_gph_uc",),
+    "wvmr_uc_tot":                ("wvmr_vol_uc",),
+    "frost_point_uc_tot":         ("fp_uc",),
+    "shortwave_radiation_uc_tot": ("u_swrad",),
+    "vertical_speed_uc_tot":      ("vspeed_uc",),
+    "temperature_uc_std":         ("u_std_temp",),
+    "relative_humidity_uc_std":   ("u_std_rh",),
+    "temperature_uc_sys":         ("temp_uc_tcor", "u_cor_temp"),
+    "relative_humidity_uc_sys":   ("rh_uc_tcor", "u_cor_rh"),
+    "wvmr_uc_sys":                ("wvmr_vol_uc_tcor",),
+    "geopot_uc_sys":              ("alt_gph_uc_tcor",),
+}
+QC_UNCERTAINTIES_BY_FORMAT = {
+    "CF-1.4": {k: bool(set(v) & CF14_UNC_FILE_COLUMNS)
+               for k, v in QC_UNCERTAINTY_SOURCES.items()},
+    "CF-1.7": {k: bool(set(v) & CF17_UNC_FILE_COLUMNS)
+               for k, v in QC_UNCERTAINTY_SOURCES.items()},
+}
+UNC_FORMAT_COLUMN = "uncertainty_format"
+
+
+def detect_uncertainty_format(columns_with_data):
+    """
+    'CF-1.7' if any CF-1.7-only uncertainty column carries data, else
+    'CF-1.4' if any CF-1.4-only one does, else None (undetermined).
+    Same precedence as the exporter.
+    """
+    cols = set(columns_with_data)
+    if cols & CF17_UNC_FILE_COLUMNS:
+        return "CF-1.7"
+    if cols & CF14_UNC_FILE_COLUMNS:
+        return "CF-1.4"
+    return None
+
+
 def load_netcdf_profile(jar_file_path):
     print(f"[INFO] Opening jar archive: {os.path.basename(jar_file_path)}")
     try:
@@ -979,25 +1178,30 @@ def load_netcdf_profile(jar_file_path):
         if dt_str == "UNKNOWN":
             dt_str = ds.attrs.get("g.Ascent.StandardTime", "UNKNOWN")
         try:
-            dt = datetime.strptime(dt_str.split(".")[0],
-                                   "%Y-%m-%dT%H:%M:%S").strftime(
-                "%Y-%m-%d %H:%M:%S")
+            dt = datetime.strptime(
+                str(dt_str).split(".")[0].rstrip("Zz"),
+                "%Y-%m-%dT%H:%M:%S").strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
-            dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # Never substitute the processing time for the measurement
+            # time: flag the profile as having an unknown date instead.
+            print(f"[WARNING] Cannot parse the profile date "
+                  f"'{dt_str}' in {os.path.basename(jar_file_path)}: "
+                  f"Date set to UNKNOWN.")
+            dt = "UNKNOWN"
 
         tropopause_attr = None
         for attr_name in TROPOPAUSE_ATTRIBUTE_CANDIDATES:
             if attr_name in ds.attrs:
                 tropopause_attr = ds.attrs[attr_name]
                 break
-        tropopause_altitude = parse_numeric_attribute(tropopause_attr)
+        tropopause_altitude = parse_altitude_attribute_m(tropopause_attr)
 
         # Variable mapping: internal name -> candidate NetCDF names.
         # The first candidate found wins (CF-1.4 first, then CF-1.7).
         mapping = {
             # Core profile
             "height":                      ["alt"],
-            "height_uc_tot":               ["alt_uc"],
+            "height_uc_tot":               ["u_alt", "alt_uc"],
             "pressure":                    ["press"],
             "pressure_uc_tot":             ["press_uc", "u_press"],
             "temperature":                 ["temp"],
@@ -1026,10 +1230,10 @@ def load_netcdf_profile(jar_file_path):
             "geopot_uc_sys":               ["alt_gph_uc_tcor"],
             "geopot_uc_tot":               ["alt_gph_uc"],
             # Other
-            "frost_point":                 ["fp"],
+            "frost_point":                 ["fp", "FP"],
             "frost_point_uc_tot":          ["fp_uc"],
-            "shortwave_radiation":         ["swrad"],
-            "shortwave_radiation_uc_tot":  ["u_swrad"],
+            "shortwave_radiation":         ["swrad", "SWrad"],
+            "shortwave_radiation_uc_tot":  ["u_swrad", "u_SWrad"],
             "vertical_speed":              ["vspeed", "asc"],
             "vertical_speed_uc_tot":       ["vspeed_uc"],
             # "Air relative humidity effective vertical resolution":
@@ -1051,6 +1255,21 @@ def load_netcdf_profile(jar_file_path):
             else:
                 extracted_data[internal_key] = None
 
+        # File format (CF-1.4 / CF-1.7), from the format-specific
+        # uncertainty columns that carry data. It drives the
+        # `expected_uncertainties` argument of the plausibility check.
+        cols_with_data = set()
+        lower_to_real = {name.lower(): name for name in ds.variables}
+        for _col in CF14_UNC_FILE_COLUMNS | CF17_UNC_FILE_COLUMNS:
+            _real = lower_to_real.get(_col)
+            if _real is not None:
+                try:
+                    if np.isfinite(ds[_real].values.astype(float)).any():
+                        cols_with_data.add(_col)
+                except (TypeError, ValueError):
+                    pass
+        uncertainty_format = detect_uncertainty_format(cols_with_data)
+
         ref_len = 0
         for k in ["pressure", "height", "temperature"]:
             if isinstance(extracted_data.get(k), np.ndarray):
@@ -1069,9 +1288,13 @@ def load_netcdf_profile(jar_file_path):
                        "relative_humidity_uc_std",
                        "relative_humidity_uc_sys",
                        "relative_humidity_uc_tot"):
-            rh_units = extracted_units.get(rh_key)
+            if rh_key not in extracted_units:
+                continue  # variable absent from the file
+            rh_units = extracted_units[rh_key]
             if rh_units is None:
-                continue
+                raise ValueError(
+                    f"Missing 'units' attribute for '{rh_key}': cannot "
+                    f"determine whether RH is a percentage or a fraction.")
             rh_units_norm = str(rh_units).strip().lower()
             if rh_units_norm in RH_PERCENT_UNITS:
                 extracted_data[rh_key] = extracted_data[rh_key] / 100.0
@@ -1083,9 +1306,13 @@ def load_netcdf_profile(jar_file_path):
 
         # WVMR unit conversion (fraction -> ppmv).
         for wv_key in ("wvmr", "wvmr_uc_sys", "wvmr_uc_tot"):
-            wv_units = extracted_units.get(wv_key)
+            if wv_key not in extracted_units:
+                continue  # variable absent from the file
+            wv_units = extracted_units[wv_key]
             if wv_units is None:
-                continue
+                raise ValueError(
+                    f"Missing 'units' attribute for '{wv_key}': cannot "
+                    f"convert to ppmv.")
             wv_units_norm = str(wv_units).strip().lower()
             if wv_units_norm in WVMR_FRACTION_UNITS:
                 extracted_data[wv_key] = extracted_data[wv_key] * 1.0e6
@@ -1099,6 +1326,8 @@ def load_netcdf_profile(jar_file_path):
         df_profile["station"] = station
         df_profile["source_file"] = os.path.basename(jar_file_path)
         df_profile["tropopause_altitude"] = tropopause_altitude
+        df_profile[UNC_FORMAT_COLUMN] = (uncertainty_format
+                                         if uncertainty_format else "")
 
         ds.close()
         try:
@@ -1114,6 +1343,22 @@ def load_netcdf_profile(jar_file_path):
 # ==========================================
 # MAIN PROCESSING
 # ==========================================
+def expected_uncertainties_from_profile(profile):
+    """
+    Builds the `expected_uncertainties` dict {uncertainty key: bool} for one
+    profile, from the file format of the profile (see
+    QC_UNCERTAINTIES_BY_FORMAT, same rule as gruan_exporter.py). Returns
+    None ("expect all", the evaluator's default) when the format is
+    undetermined or not available.
+    """
+    if UNC_FORMAT_COLUMN not in profile.columns:
+        return None
+    fmt = profile[UNC_FORMAT_COLUMN].iloc[0]
+    if not isinstance(fmt, str) or fmt not in QC_UNCERTAINTIES_BY_FORMAT:
+        return None
+    return dict(QC_UNCERTAINTIES_BY_FORMAT[fmt])
+
+
 def process_gruan_profiles(data_source, output_log_path=OUTPUT_LOG_PATH):
     log_records = []
     group_keys = ["datetime", "station"]
@@ -1133,10 +1378,14 @@ def process_gruan_profiles(data_source, output_log_path=OUTPUT_LOG_PATH):
         # -------------------------------------------------------------
         # Plausibility: level-by-level evaluation and NULLing
         # -------------------------------------------------------------
-        evaluated_levels, rejected, uncertainty_rejected = (
-            evaluate_level_plausibility(profile))
+        (evaluated_levels, rejected, uncertainty_rejected,
+         column_rejected) = evaluate_level_plausibility(
+            profile,
+            expected_uncertainties=expected_uncertainties_from_profile(
+                profile))
         profile = apply_plausibility_nulling(profile, rejected,
-                                             uncertainty_rejected)
+                                             uncertainty_rejected,
+                                             column_rejected)
 
         # Re-read arrays after NULLing for downstream checks.
         p_arr = profile["pressure"].to_numpy()
@@ -1157,8 +1406,11 @@ def process_gruan_profiles(data_source, output_log_path=OUTPUT_LOG_PATH):
         # -------------------------------------------------------------
         # Per-variable plausibility flags
         # -------------------------------------------------------------
+        # With no evaluable level (e.g. all heights unknown) nothing was
+        # checked: the flags are NaN ("not evaluated"), not 1 ("plausible").
+        any_level_evaluated = bool(np.any(evaluated_levels))
         plaus_flags = {
-            var: (np.nan if level_mask is None
+            var: (np.nan if (level_mask is None or not any_level_evaluated)
                   else not np.any(level_mask))
             for var, level_mask in rejected.items()
         }
