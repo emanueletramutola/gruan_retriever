@@ -1024,6 +1024,7 @@ The pipeline processes GRUAN NetCDF radiosonde profiles packaged inside .jar arc
 | **FLAG_PLAUSIBILITY_{PVAR}** | Physical consistency check of variable PVAR (one column per variable, see the list below) | `1` if no level up to 47 km altitude is rejected, `0` if at least one level is rejected, `NaN` if no level could be evaluated (e.g. all heights are unknown) |
 | **Tropopause_Height (m)** | Tropopause height | Geometric altitude read from the first available global attribute among `g.Measurement.TropopauseAltitude`, `g.Measurement.TropopauseGeopotHeight` and `g.Ascent.TropopauseHeight`. `NaN` if none is available or the value is invalid (sentinel or outside 0-47000 m) |
 | **Ntotal_{VAR}** | Total number of levels/records considered for variable VAR's completeness check | Integer count, always $\\ge$ 0 |
+| **Nvalid_{VAR}** | Number of valid (non-missing/non-NaN) data records for variable VAR in the completeness check | $N_{valid\\_VAR} = N_{total\\_VAR} - N_{missing\\_VAR}$. Integer count, always in [0, Ntotal_{VAR}] |
 | **Completeness_{VAR}** | Vertical completeness index for variable VAR, i.e. the fraction of missing data records | $N_{missing\\_VAR} / N_{total\\_VAR}$, always in [0, 1]. 0 = fully complete, 1 = every record missing: lower values are better |
 | **FLAG_COMPLETENESS_{VAR}** | Completeness test outcome for variable VAR | `HIGH` if Completeness < 0.10, `GOOD` if 0.10 $\\le$ Completeness < 0.20, `FAIL` if Completeness $\\ge$ 0.20 (or if there are no levels to evaluate); `N/A` if no tropopause was detected (troposphere/stratosphere only) |
 
@@ -1033,7 +1034,7 @@ VAR is repeated for each profile variable (**Press**: pressure, **Temp**: temper
 **RH**: relative humidity, **Wspeed**: wind speed, **Wdir**: wind direction, **WVMR**: water vapor
 mixing ratio) and for each layer: whole profile (no suffix), troposphere (`_troposphere`
 suffix) and stratosphere (`_stratosphere` suffix). For example: `Ntotal_RH`,
-`Completeness_Temp_troposphere`, `FLAG_COMPLETENESS_WVMR_stratosphere`.
+`Nvalid_RH`, `Completeness_Temp_troposphere`, `FLAG_COMPLETENESS_WVMR_stratosphere`.
 
 Notes:
 - Completeness is computed after the plausibility check, so levels rejected by
@@ -1043,7 +1044,9 @@ Notes:
 - `Ntotal_{VAR}_troposphere` / `_stratosphere` count only the levels with a known
   height, split at the tropopause height, so their sum can be lower than
   `Ntotal_{VAR}`. If the tropopause is unknown the two layers are reported as
-  `N/A` with Ntotal = 0 and Completeness = `NaN`.
+  `N/A` with Ntotal = 0, Nvalid = 0 and Completeness = `NaN`.
+- `Nvalid_{VAR}` uses the same Nmissing as the completeness index, so
+  `Completeness_{VAR}` = (Ntotal_{VAR} - Nvalid_{VAR}) / Ntotal_{VAR}.
 
 ## Plausibility Variables and Ranges
 
@@ -1479,17 +1482,22 @@ def process_gruan_profiles(data_source, output_log_path=OUTPUT_LOG_PATH):
             (n_tot_full, n_miss_full, compl_full, f_compl_full) = (
                 check_variable_completeness(var_arr, z_arr))
             completeness_record[f"Ntotal_{label}"] = n_tot_full
+            # Nvalid = Ntotal - Nmissing (number of non-missing records).
+            completeness_record[f"Nvalid_{label}"] = n_tot_full - n_miss_full
             completeness_record[f"Completeness_{label}"] = (
                 round(compl_full, 4) if not np.isnan(compl_full) else np.nan)
             completeness_record[f"FLAG_COMPLETENESS_{label}"] = f_compl_full
 
             if not np.isnan(tropopause_height):
-                (n_tot_tropo, _, compl_tropo, f_compl_tropo) = (
+                (n_tot_tropo, n_miss_tropo, compl_tropo, f_compl_tropo) = (
                     check_variable_completeness(
                         var_arr, z_arr, zmax=tropopause_height))
             else:
-                n_tot_tropo, compl_tropo, f_compl_tropo = 0, np.nan, "N/A"
+                n_tot_tropo, n_miss_tropo = 0, 0
+                compl_tropo, f_compl_tropo = np.nan, "N/A"
             completeness_record[f"Ntotal_{label}_troposphere"] = n_tot_tropo
+            completeness_record[f"Nvalid_{label}_troposphere"] = (
+                n_tot_tropo - n_miss_tropo)
             completeness_record[f"Completeness_{label}_troposphere"] = (
                 round(compl_tropo, 4)
                 if not np.isnan(compl_tropo) else np.nan)
@@ -1497,12 +1505,16 @@ def process_gruan_profiles(data_source, output_log_path=OUTPUT_LOG_PATH):
                 f"FLAG_COMPLETENESS_{label}_troposphere"] = f_compl_tropo
 
             if not np.isnan(tropopause_height):
-                (n_tot_strato, _, compl_strato, f_compl_strato) = (
+                (n_tot_strato, n_miss_strato, compl_strato,
+                 f_compl_strato) = (
                     check_variable_completeness(
                         var_arr, z_arr, zmin=tropopause_height))
             else:
-                n_tot_strato, compl_strato, f_compl_strato = 0, np.nan, "N/A"
+                n_tot_strato, n_miss_strato = 0, 0
+                compl_strato, f_compl_strato = np.nan, "N/A"
             completeness_record[f"Ntotal_{label}_stratosphere"] = n_tot_strato
+            completeness_record[f"Nvalid_{label}_stratosphere"] = (
+                n_tot_strato - n_miss_strato)
             completeness_record[f"Completeness_{label}_stratosphere"] = (
                 round(compl_strato, 4)
                 if not np.isnan(compl_strato) else np.nan)
