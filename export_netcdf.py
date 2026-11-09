@@ -299,6 +299,15 @@ QC_REJECTION_WARN_FRACTION = 0.5
 # random/systematic uncertainty) is NOT affected.
 NULLIFY_UNCERTAINTIES_OF_MISSING_VALUES = True
 
+# Levels where ALL of these variables are NULL/NaN are removed before the
+# NetCDF is written, so the output never contains a level in which temp, rh,
+# wdir and wspeed are all missing. The check is done AFTER the plausibility QC
+# (values rejected by the QC count as missing) and uses the same CF-1.4 /
+# CF-1.7 fallback logic as build_cdm_long (_col_or_nan).
+# Set DROP_LEVELS_WITHOUT_CORE_VARIABLES to False to disable the filter.
+DROP_LEVELS_WITHOUT_CORE_VARIABLES = True
+CORE_VARIABLES = ('temp', 'rh', 'wdir', 'wspeed')
+
 # ── implausible-values report ─────────────────────────────────────────────────
 # Every value set to NULL by the plausibility QC is recorded, with the reason,
 # in a CSV. Each month writes its own part file (safe with --jobs > 1: workers
@@ -334,7 +343,7 @@ QC_RH_DEPENDENT_REPORT_VARIABLES = {
 # TIMER collects one month; export_month prints its report and folds it into
 # RUN_TIMER, which main() prints at the end (whole run).
 
-SCRIPT_REVISION = '2026-10-26a'   # shown in the log header: tells which code produced a log
+SCRIPT_REVISION = '2026-11-09a'   # shown in the log header: tells which code produced a log
 PG_SESSION_SETTINGS = []   # [(name, value)] applied with SET to every connection (--pg-set)
 LOG_PATH = None     # set by init_log(); None = no log file
 
@@ -1184,6 +1193,34 @@ def nullify_uncertainties_of_missing_values(df_merged: pd.DataFrame) -> pd.DataF
     return df_merged
 
 
+def drop_levels_without_core_variables(df_merged: pd.DataFrame,
+                                       core_variables=CORE_VARIABLES) -> pd.DataFrame:
+    """Remove the levels in which ALL the core variables (temp, rh, wdir,
+    wspeed) are NULL/NaN.
+
+    A level is kept if at least one of the core variables has a value. The
+    values are read with _col_or_nan, exactly as build_cdm_long does (CF-1.4
+    column first, CF-1.7 as fallback; non-numeric -> NaN), so a level is
+    dropped here if and only if all these variables would be NaN in the
+    NetCDF. Must be called AFTER the plausibility QC (which can set values
+    to NULL) and BEFORE the CDM build.
+
+    Returns the filtered DataFrame with a fresh 0..n-1 index. If nothing has
+    to be dropped, the input DataFrame is returned untouched (no copy).
+    """
+    has_value = np.zeros(len(df_merged), dtype=bool)
+    for name in core_variables:
+        if name in df_merged.columns:
+            has_value |= _col_or_nan(df_merged, name, name).notna().to_numpy()
+
+    n_drop = int((~has_value).sum())
+    print(f"  Levels with {'/'.join(core_variables)} all NULL: "
+          f"{n_drop:,} / {len(df_merged):,} dropped")
+    if n_drop == 0:
+        return df_merged
+    return df_merged.loc[has_value].reset_index(drop=True)
+
+
 # ── CDM pivot logic ───────────────────────────────────────────────────────────
 def _col_or_nan(df: pd.DataFrame,
                 column_name_cf_1_4: Optional[str] = None,
@@ -1976,6 +2013,16 @@ def export_month(conn_params, year, month, output_dir,
     if NULLIFY_UNCERTAINTIES_OF_MISSING_VALUES:
         with TIMER('nullify_uncertainties_of_missing_values'):
             df_merged = nullify_uncertainties_of_missing_values(df_merged)
+
+    if DROP_LEVELS_WITHOUT_CORE_VARIABLES:
+        with TIMER('drop_levels_without_core_variables'):
+            df_merged = drop_levels_without_core_variables(df_merged)
+        if len(df_merged) == 0:
+            print(f"  No levels left after dropping levels with "
+                  f"{'/'.join(CORE_VARIABLES)} all NULL — skipping.")
+            log(f"\n{year:04d}-{month:02d}: no levels left after dropping levels with "
+                f"{'/'.join(CORE_VARIABLES)} all NULL, skipped")
+            return
 
     with TIMER('unit_transforms'):
         for col, (scale, offset) in UNIT_TRANSFORMS.items():
