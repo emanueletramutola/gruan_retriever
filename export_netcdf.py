@@ -306,7 +306,7 @@ NULLIFY_UNCERTAINTIES_OF_MISSING_VALUES = True
 # CF-1.7 fallback logic as build_cdm_long (_col_or_nan).
 # Set DROP_LEVELS_WITHOUT_CORE_VARIABLES to False to disable the filter.
 DROP_LEVELS_WITHOUT_CORE_VARIABLES = True
-CORE_VARIABLES = ('temp', 'rh', 'wdir', 'wspeed')
+CORE_VARIABLES = ('press', 'temp', 'rh', 'wdir', 'wspeed')
 
 # ── implausible-values report ─────────────────────────────────────────────────
 # Every value set to NULL by the plausibility QC is recorded, with the reason,
