@@ -991,84 +991,117 @@ def parse_altitude_attribute_m(attr_value):
 # README
 # ==========================================
 def generate_readme():
-    readme_content = """# GRUAN Quality Control Pipeline
+    """Automatically generates the explanatory README.md file for log flag decoding"""
+    readme_content = """# GRUAN Quality Control Pipeline - Data Compression & Flags Explanatory File
 
-## Input
-The pipeline processes GRUAN NetCDF radiosonde profiles packaged inside
-.jar archives.
+This repository contains the quality control logs executed on GRUAN radiosonde launches.
+To optimize storage space and file compression, columns use concise flags detailed in this reference guide.
 
-## CBH
-Cloud Base Height is identified as the first level belonging to at least
-three consecutive levels with RH >= 0.99.
+The pipeline processes GRUAN NetCDF radiosonde profiles packaged inside .jar archives.
 
-## CTH - Zhang cold cloud detection
-Cold-cloud detection is applied only above 2 km AGL. Altitude bands:
-2-6 km, 6-12 km, >12 km. Only clouds with temperature <= -5 degC are
-considered. RH is converted from w.r.t. water to w.r.t. ice for
-temperatures below 0 degC.
+## Flag Definitions and Log Fields
 
-## Completeness
-Despite its name, `Completeness_*` is the FRACTION OF MISSING data
-records: 0 means a fully complete variable, 1 means that every record
-is missing. Lower values are therefore better.
-HIGH: < 0.10
-GOOD: 0.10 <= C < 0.20
-FAIL: >= 0.20
+| Field / Flag Name | Technical Description | Criterion / Threshold |
+| :--- | :--- | :--- |
+| **Date** | Launch date and time in UTC format | YYYY-MM-DD HH:MM:SS. `UNKNOWN` if the date cannot be parsed |
+| **Station** | Unique GRUAN station identifier | Alphanumeric Code |
+| **File** | Name of the source .jar archive the profile was extracted from | File basename (e.g. `STATION_..._YYYYMMDDThhmmss_....jar`) |
+| **CBH (m)** | Calculated Cloud Base Height | First level of the first run of at least 3 consecutive levels with RH $\\ge$ 99%. If missing: `NaN` |
+| **CBH_Index** | Position of the cloud base level in the profile | Integer level index. `NaN` if no cloud base was found |
+| **CBH_Temperature (K)** | Temperature at the cloud base level | `NaN` if no cloud base was found |
+| **CBH_RH** | Relative humidity (w.r.t. water, fraction 0-1) at the cloud base level | `NaN` if no cloud base was found |
+| **CBH_RH_Ice** | Relative humidity w.r.t. ice (fraction 0-1) at the cloud base level | RH is converted from water to ice for T < 273.15 K. `NaN` if no cloud base was found |
+| **CBH_Flag** | Cloud base identification status | `1` if a cloud base was found, `0` if the profile is cloud-free |
+| **CTH (m)** | Calculated Cloud Top Height (Zhang cold-cloud method) | Topmost cold cloud layer found by the Zhang algorithm with RH-over-ice correction, altitude-dependent RH thresholds (bands <6 km, 6-12 km, >12 km AGL), and layer merging, restricted to layers at least 100 m thick with mean temperature < 268.15 K (-5 &deg;C). If missing: `NaN` |
+| **CTH_Index** | Position of the cloud top level in the profile | Integer level index. `NaN` if no cloud top was found |
+| **CTH_Temperature (K)** | Temperature at the cloud top level | `NaN` if no cloud top was found |
+| **CTH_RH** | Relative humidity (w.r.t. water, fraction 0-1) at the cloud top level | `NaN` if no cloud top was found |
+| **CTH_RH_Ice** | Relative humidity w.r.t. ice (fraction 0-1) at the cloud top level | `NaN` if no cloud top was found |
+| **CTH_Flag** | Cloud top identification status | `1` if a (cold) cloud top was found, `0` if none was found |
+| **Pmin (hPa)** | Minimum recorded pressure in the profile | Minimum numerical value in hPa |
+| **FLAG_P10** | Binary flag for 10 hPa threshold | `1` if Pmin $\\le$ 10 hPa, otherwise `0` |
+| **FLAG_P5** | Binary flag for 5 hPa threshold | `1` if Pmin $\\le$ 5 hPa, otherwise `0` |
+| **FLAG_PLAUSIBILITY_{PVAR}** | Physical consistency check of variable PVAR (one column per variable, see the list below) | `1` if no level up to 47 km altitude is rejected, `0` if at least one level is rejected, `NaN` if no level could be evaluated (e.g. all heights are unknown) |
+| **Tropopause_Height (m)** | Tropopause height | Geometric altitude read from the first available global attribute among `g.Measurement.TropopauseAltitude`, `g.Measurement.TropopauseGeopotHeight` and `g.Ascent.TropopauseHeight`. `NaN` if none is available or the value is invalid (sentinel or outside 0-47000 m) |
+| **Ntotal_{VAR}** | Total number of levels/records considered for variable VAR's completeness check | Integer count, always $\\ge$ 0 |
+| **Nvalid_{VAR}** | Number of valid (non-missing/non-NaN) data records for variable VAR in the completeness check | $N_{valid\\_VAR} = N_{total\\_VAR} - N_{missing\\_VAR}$. Integer count, always in [0, Ntotal_{VAR}] |
+| **Completeness_{VAR}** | Vertical completeness index for variable VAR, i.e. the fraction of missing data records | $N_{missing\\_VAR} / N_{total\\_VAR}$, always in [0, 1]. 0 = fully complete, 1 = every record missing: lower values are better |
+| **FLAG_COMPLETENESS_{VAR}** | Completeness test outcome for variable VAR | `HIGH` if Completeness < 0.10, `GOOD` if 0.10 $\\le$ Completeness < 0.20, `FAIL` if Completeness $\\ge$ 0.20 (or if there are no levels to evaluate); `N/A` if no tropopause was detected (troposphere/stratosphere only) |
+
+## Completeness Variables
+
+VAR is repeated for each profile variable (**Press**: pressure, **Temp**: temperature,
+**RH**: relative humidity, **Wspeed**: wind speed, **Wdir**: wind direction, **WVMR**: water vapor
+mixing ratio) and for each layer: whole profile (no suffix), troposphere (`_troposphere`
+suffix) and stratosphere (`_stratosphere` suffix). For example: `Ntotal_RH`,
+`Nvalid_RH`, `Completeness_Temp_troposphere`, `FLAG_COMPLETENESS_WVMR_stratosphere`.
 
 Notes:
-- It is computed after the plausibility check, so levels rejected by
+- Completeness is computed after the plausibility check, so levels rejected by
   the plausibility rules (set to NULL) count as missing.
-- `Ntotal_<var>` is the number of levels of the whole profile.
-  `Ntotal_<var>_troposphere` / `_stratosphere` count only the levels
-  with a known height, split at the tropopause altitude, so their sum
-  can be lower than `Ntotal_<var>`. If the tropopause is unknown the
-  two layers are reported as N/A with Ntotal = 0.
-- For the whole profile a level is missing if the variable or its
-  height is missing; for the two layers only the variable is checked.
-- The tropopause altitude (metres) is read from the file attributes:
-  the geometric altitude of the tropopause
-  (g.Measurement.TropopauseAltitude), which is the same quantity as the
-  profile heights it is compared with. Only if it is missing, the
-  geopotential height or the older g.Ascent.TropopauseHeight attribute
-  is used instead.
+- For the whole profile a level is missing if the variable or its height is
+  missing; for the two layers only the variable is checked.
+- `Ntotal_{VAR}_troposphere` / `_stratosphere` count only the levels with a known
+  height, split at the tropopause height, so their sum can be lower than
+  `Ntotal_{VAR}`. If the tropopause is unknown the two layers are reported as
+  `N/A` with Ntotal = 0, Nvalid = 0 and Completeness = `NaN`.
+- `Nvalid_{VAR}` uses the same Nmissing as the completeness index, so
+  `Completeness_{VAR}` = (Ntotal_{VAR} - Nvalid_{VAR}) / Ntotal_{VAR}.
 
-## Plausibility
-A variable is plausible (1) if no level up to 47 km is rejected, not
-plausible (0) otherwise. If no level can be evaluated (e.g. all heights
-are unknown) the flag is NaN. For each variable the following rules are
-applied level by level:
+## Plausibility Variables and Ranges
 
-0. Missing total uncertainty: a level is rejected if the TOTAL
-   uncertainty of the variable is NaN at that level and the file format
-   (CF-1.4 or CF-1.7) is expected to provide it. A total uncertainty that
-   exists in the other format only is not treated as missing. The
-   expectations per format are the same used by the NetCDF exporter. If
-   the format cannot be determined, the total uncertainty is expected.
-   Random and systematic uncertainties that are NaN never reject a level.
+PVAR is the upper-case name of the checked variable. The check is applied level by
+level, only up to 47 km altitude, with the following physical ranges:
+
+| PVAR | Physical range | Unit |
+| :--- | :--- | :--- |
+| **TEMPERATURE** | [178.15, 323.15] | K |
+| **RELATIVE_HUMIDITY** | [0.0, 100.0] | % |
+| **WIND_SPEED** | [0.0, 180.0] | m s-1 |
+| **WIND_DIRECTION** | [0.0, 360.0] | degree |
+| **U** | [0.0, 180.0] | m s-1 |
+| **V** | [0.0, 180.0] | m s-1 |
+| **PRESSURE** | [1.0, 1080.0] | hPa |
+| **GEOPOT** | [-10.0, 47000.0] | m |
+| **WVMR** | [0.0, 50000.0] | ppmv |
+| **FROST_POINT** | [150.0, 330.0] | K |
+| **SHORTWAVE_RADIATION** | [0.0, 1600.0] | W m-2 |
+| **VERTICAL_SPEED** | [-10.0, 30.0] | m s-1 |
+| **HEIGHT** | [-10.0, 47000.0] | m |
+| **RH_RESOLUTION** | no own range (follows RELATIVE_HUMIDITY) | s |
+
+## Plausibility Rules
+
+The following rules are applied level by level to each variable:
+
+0. Missing total uncertainty: a level is rejected if the TOTAL uncertainty of
+   the variable is NaN at that level and the file format (CF-1.4 or CF-1.7) is
+   expected to provide it. A total uncertainty that exists in the other format
+   only is not treated as missing. The expectations per format are the same
+   used by the NetCDF exporter. If the format cannot be determined, the total
+   uncertainty is expected. Random and systematic uncertainties that are NaN
+   never reject a level.
 1. Uncertainty range: every available uncertainty column of the variable
-   (total, random, systematic) is compared with the plausible range of
-   the variable.
-   - Total uncertainty outside the range: the level is rejected,
-     regardless of the value.
+   (total, random, systematic) is compared with the plausible range of the
+   variable.
+   - Total uncertainty outside the range: the level is rejected, regardless
+     of the value.
    - Random or systematic uncertainty outside the range: only that
-     uncertainty is set to NULL; the value and the other uncertainties
-     are kept.
+     uncertainty is set to NULL; the value and the other uncertainties are kept.
 2. Value plausibility: for out-of-range values the interval
-   [value - unc, value + unc] is compared with the physical range. The
-   level is rejected only if the whole interval is outside the range:
-       value - unc > hi   OR   value + unc < lo
-   Otherwise the value is accepted (consistent within its uncertainty).
+   [value - unc, value + unc] is compared with the physical range. The level
+   is rejected only if the whole interval is outside the range:
+   `value - unc > hi` OR `value + unc < lo`. Otherwise the value is accepted
+   (consistent within its uncertainty).
 3. Dependencies: if a parent variable is invalid, the variable itself is
-   invalid too. Dependencies:
-   - u             -> wind_speed
-   - v             -> wind_speed
-   - geopot        -> pressure
-   - wvmr          -> relative_humidity
-   - rh_resolution -> relative_humidity
+   invalid too:
+   - `u` and `v` depend on `wind_speed`
+   - `geopot` depends on `pressure`
+   - `wvmr` and `rh_resolution` depend on `relative_humidity`
 
 When the data is exported, the value, its random, systematic and total
-uncertainties are set to NULL for the rejected levels and for the levels
-where the total uncertainty is NaN or out of range. A random or systematic
+uncertainties are set to NULL for the rejected levels and for the levels where
+the total uncertainty is NaN or out of range. A random or systematic
 uncertainty that is out of range is set to NULL on its own.
 """
     readme_path = os.path.join(os.path.dirname(OUTPUT_LOG_PATH), "README.md")
@@ -1174,7 +1207,7 @@ def load_netcdf_profile(jar_file_path):
         station = ds.attrs.get("g.Site.Key", "UNKNOWN")
         if station == "UNKNOWN":
             station = ds.attrs.get("g.General.SiteCode", "UNKNOWN")
-        dt_str = ds.attrs.get("g.Measurement.StandardTime", "UNKNOWN")
+        dt_str = ds.attrs.get("g.Measurement.StartTimeManufacturer", "UNKNOWN")
         if dt_str == "UNKNOWN":
             dt_str = ds.attrs.get("g.Ascent.StandardTime", "UNKNOWN")
         try:
@@ -1194,7 +1227,7 @@ def load_netcdf_profile(jar_file_path):
             if attr_name in ds.attrs:
                 tropopause_attr = ds.attrs[attr_name]
                 break
-        tropopause_altitude = parse_altitude_attribute_m(tropopause_attr)
+        tropopause_height = parse_altitude_attribute_m(tropopause_attr)
 
         # Variable mapping: internal name -> candidate NetCDF names.
         # The first candidate found wins (CF-1.4 first, then CF-1.7).
@@ -1325,7 +1358,7 @@ def load_netcdf_profile(jar_file_path):
         df_profile["datetime"] = dt
         df_profile["station"] = station
         df_profile["source_file"] = os.path.basename(jar_file_path)
-        df_profile["tropopause_altitude"] = tropopause_altitude
+        df_profile["tropopause_height"] = tropopause_height
         df_profile[UNC_FORMAT_COLUMN] = (uncertainty_format
                                          if uncertainty_format else "")
 
@@ -1414,7 +1447,7 @@ def process_gruan_profiles(data_source, output_log_path=OUTPUT_LOG_PATH):
                   else not np.any(level_mask))
             for var, level_mask in rejected.items()
         }
-        tropopause_altitude = profile["tropopause_altitude"].iloc[0]
+        tropopause_height = profile["tropopause_height"].iloc[0]
 
         cbh_index = (int(cbh_res["index"])
                      if not np.isnan(cbh_res["index"]) else np.nan)
@@ -1449,30 +1482,39 @@ def process_gruan_profiles(data_source, output_log_path=OUTPUT_LOG_PATH):
             (n_tot_full, n_miss_full, compl_full, f_compl_full) = (
                 check_variable_completeness(var_arr, z_arr))
             completeness_record[f"Ntotal_{label}"] = n_tot_full
+            # Nvalid = Ntotal - Nmissing (number of non-missing records).
+            completeness_record[f"Nvalid_{label}"] = n_tot_full - n_miss_full
             completeness_record[f"Completeness_{label}"] = (
                 round(compl_full, 4) if not np.isnan(compl_full) else np.nan)
             completeness_record[f"FLAG_COMPLETENESS_{label}"] = f_compl_full
 
-            if not np.isnan(tropopause_altitude):
-                (n_tot_tropo, _, compl_tropo, f_compl_tropo) = (
+            if not np.isnan(tropopause_height):
+                (n_tot_tropo, n_miss_tropo, compl_tropo, f_compl_tropo) = (
                     check_variable_completeness(
-                        var_arr, z_arr, zmax=tropopause_altitude))
+                        var_arr, z_arr, zmax=tropopause_height))
             else:
-                n_tot_tropo, compl_tropo, f_compl_tropo = 0, np.nan, "N/A"
+                n_tot_tropo, n_miss_tropo = 0, 0
+                compl_tropo, f_compl_tropo = np.nan, "N/A"
             completeness_record[f"Ntotal_{label}_troposphere"] = n_tot_tropo
+            completeness_record[f"Nvalid_{label}_troposphere"] = (
+                n_tot_tropo - n_miss_tropo)
             completeness_record[f"Completeness_{label}_troposphere"] = (
                 round(compl_tropo, 4)
                 if not np.isnan(compl_tropo) else np.nan)
             completeness_record[
                 f"FLAG_COMPLETENESS_{label}_troposphere"] = f_compl_tropo
 
-            if not np.isnan(tropopause_altitude):
-                (n_tot_strato, _, compl_strato, f_compl_strato) = (
+            if not np.isnan(tropopause_height):
+                (n_tot_strato, n_miss_strato, compl_strato,
+                 f_compl_strato) = (
                     check_variable_completeness(
-                        var_arr, z_arr, zmin=tropopause_altitude))
+                        var_arr, z_arr, zmin=tropopause_height))
             else:
-                n_tot_strato, compl_strato, f_compl_strato = 0, np.nan, "N/A"
+                n_tot_strato, n_miss_strato = 0, 0
+                compl_strato, f_compl_strato = np.nan, "N/A"
             completeness_record[f"Ntotal_{label}_stratosphere"] = n_tot_strato
+            completeness_record[f"Nvalid_{label}_stratosphere"] = (
+                n_tot_strato - n_miss_strato)
             completeness_record[f"Completeness_{label}_stratosphere"] = (
                 round(compl_strato, 4)
                 if not np.isnan(compl_strato) else np.nan)
@@ -1501,7 +1543,7 @@ def process_gruan_profiles(data_source, output_log_path=OUTPUT_LOG_PATH):
             "Pmin (hPa)": pmin,
             "FLAG_P10": as_binary_flag(f_p10),
             "FLAG_P5": as_binary_flag(f_p5),
-            "Tropopause_Altitude (m)": tropopause_altitude,
+            "Tropopause_Height (m)": tropopause_height,
         }
         # One plausibility flag per variable in PLAUSIBILITY_RULES.
         for var in PLAUSIBILITY_RULES:

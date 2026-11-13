@@ -88,7 +88,8 @@ GRUAN_SORT_COLUMNS = ["press"]
 # -----------------------------------------------------------------------------
 # Parallelism & memory
 # -----------------------------------------------------------------------------
-N_WORKERS = min(os.cpu_count() or 8, 16)
+# N_WORKERS = min(os.cpu_count() or 8, 16)
+N_WORKERS = 4
 KEEP_PARTIAL_CSV = False
 
 

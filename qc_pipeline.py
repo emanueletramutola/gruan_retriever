@@ -8,7 +8,6 @@ import glob
 import logging
 import os
 import re
-import zipfile
 from datetime import datetime
 
 import netCDF4 as nc4
@@ -68,7 +67,11 @@ PLAUSIBILITY_MAX_ALTITUDE_M = 47000.0
 #                     rejected, and a single one is set to NULL on its own
 #                     when it is outside `unc_range`
 #   unc_range       : (lo, hi) plausible range applied to EVERY uncertainty
-#                     of the variable (total, random, systematic), both
+#                     of the variable (total, random, systematic). Defined
+#                     for coverage factor k=2: the total uncertainties are
+#                     brought to k=2 before the check (see
+#                     SENSOR_NATIVE_COVERAGE_FACTOR); random and systematic
+#                     ones are used as they are. Both
 #                     bounds included; None to skip the check. Only the
 #                     total uncertainty can reject the value
 #   check_range     : (lo, hi) physical plausibility range of the value,
@@ -230,8 +233,8 @@ PLAUSIBILITY_RULES = {
 # ==========================================
 # INPUT/OUTPUT CONFIGURATION
 # ==========================================
-INPUT_DIRECTORY = "/Data/GRUAN/backup/gfa/archive/prodata/RS41-GDP_001/POT/POT-RS-01/2025"
-JAR_FILE_PATTERN = "*.jar"
+NC_FILE_PATTERN = "*.nc"
+# Default output path, used only when this file is run as a script.
 OUTPUT_LOG_PATH = "qc_log.csv"
 logger = logging.getLogger(__name__)
 
@@ -990,14 +993,14 @@ def parse_altitude_attribute_m(attr_value):
 # ==========================================
 # README
 # ==========================================
-def generate_readme():
+def generate_readme(output_dir=None):
     """Automatically generates the explanatory README.md file for log flag decoding"""
     readme_content = """# GRUAN Quality Control Pipeline - Data Compression & Flags Explanatory File
 
 This repository contains the quality control logs executed on GRUAN radiosonde launches.
 To optimize storage space and file compression, columns use concise flags detailed in this reference guide.
 
-The pipeline processes GRUAN NetCDF radiosonde profiles packaged inside .jar archives.
+The pipeline processes GRUAN NetCDF radiosonde profiles stored as .nc files.
 
 ## Flag Definitions and Log Fields
 
@@ -1005,7 +1008,7 @@ The pipeline processes GRUAN NetCDF radiosonde profiles packaged inside .jar arc
 | :--- | :--- | :--- |
 | **Date** | Launch date and time in UTC format | YYYY-MM-DD HH:MM:SS. `UNKNOWN` if the date cannot be parsed |
 | **Station** | Unique GRUAN station identifier | Alphanumeric Code |
-| **File** | Name of the source .jar archive the profile was extracted from | File basename (e.g. `STATION_..._YYYYMMDDThhmmss_....jar`) |
+| **File** | Name of the source NetCDF file the profile was read from | File basename (e.g. `STATION_..._YYYYMMDDThhmmss_....nc`) |
 | **CBH (m)** | Calculated Cloud Base Height | First level of the first run of at least 3 consecutive levels with RH $\\ge$ 99%. If missing: `NaN` |
 | **CBH_Index** | Position of the cloud base level in the profile | Integer level index. `NaN` if no cloud base was found |
 | **CBH_Temperature (K)** | Temperature at the cloud base level | `NaN` if no cloud base was found |
@@ -1104,7 +1107,9 @@ uncertainties are set to NULL for the rejected levels and for the levels where
 the total uncertainty is NaN or out of range. A random or systematic
 uncertainty that is out of range is set to NULL on its own.
 """
-    readme_path = os.path.join(os.path.dirname(OUTPUT_LOG_PATH), "README.md")
+    if output_dir is None:
+        output_dir = os.path.dirname(OUTPUT_LOG_PATH)
+    readme_path = os.path.join(output_dir, "README.md")
     with open(readme_path, "w", encoding="utf-8") as f:
         f.write(readme_content)
     print(f"[INFO] README.md written to: {readme_path}")
@@ -1113,27 +1118,6 @@ uncertainty that is out of range is set to NULL on its own.
 # ==========================================
 # NETCDF LOADING
 # ==========================================
-def extract_netcdf_bytes_from_jar(jar_path):
-    """
-    Reads the single embedded NetCDF (.nc) file from a .jar archive fully
-    in memory, without writing to disk.
-    Returns (nc_bytes, internal_nc_name).
-    """
-    with zipfile.ZipFile(jar_path, "r") as zf:
-        nc_entries = [info for info in zf.infolist()
-                      if info.filename.lower().endswith(".nc")]
-        if not nc_entries:
-            raise FileNotFoundError(
-                f"No .nc file found inside jar archive: {jar_path}")
-        if len(nc_entries) > 1:
-            logging.warning(
-                f"Multiple .nc files found inside '{jar_path}'; using the "
-                f"first one found: {nc_entries[0].filename}")
-        nc_entry = nc_entries[0]
-        nc_bytes = zf.read(nc_entry.filename)
-    return nc_bytes, nc_entry.filename
-
-
 # ------------------------------------------------------------------
 # Uncertainty columns expected from each file format (CF-1.4 / CF-1.7).
 # This mirrors the logic of gruan_exporter.py (QC_UNCERTAINTIES_BY_FORMAT,
@@ -1183,6 +1167,43 @@ QC_UNCERTAINTIES_BY_FORMAT = {
 UNC_FORMAT_COLUMN = "uncertainty_format"
 
 
+# ------------------------------------------------------------------
+# Coverage factor (k) of the TOTAL uncertainties.
+# GRUAN files give it with a sonde-dependent k: RS41 -> k=2, RS92 / RS-11G /
+# IMS-100 -> k=1. The PLAUSIBILITY_RULES ranges are defined for k=2, so the
+# total uncertainties of the k=1 sondes are multiplied by
+# TARGET_COVERAGE_FACTOR / k_native right after reading (see
+# load_netcdf_profile). Random and systematic uncertainties are NOT scaled.
+# This table is the single source of truth: export_netcdf.py imports it.
+#
+# The sonde is recognised from a product code. Matching is case-insensitive,
+# ignores '-', '_' and spaces and looks for the pattern anywhere in the code
+# (e.g. 'RS92-GDP.2' -> 'RS92GDP.2' contains 'RS92'). A code matching no (or
+# more than one) pattern is "unknown": callers must stop instead of guessing.
+# ------------------------------------------------------------------
+TARGET_COVERAGE_FACTOR = 2.0
+SENSOR_NATIVE_COVERAGE_FACTOR = (       # (normalised pattern, native k)
+    ("RS41",   2.0),
+    ("RS92",   1.0),
+    ("RS11G",  1.0),
+    ("IMS100", 1.0),
+)
+# Global attributes of a GRUAN file that carry the product code (they
+# correspond to the g_product_code / g_product_key columns of the header table).
+PRODUCT_CODE_ATTRIBUTE_CANDIDATES = ("g.Product.Code", "g.Product.Key")
+
+
+def native_coverage_factor(product_code):
+    """Native k of the total uncertainties for a product code, or None if the
+    code is missing, matches no pattern or is ambiguous."""
+    if product_code is None:
+        return None
+    norm = "".join(ch for ch in str(product_code).upper() if ch not in "-_ ")
+    matched = [(pat, k) for pat, k in SENSOR_NATIVE_COVERAGE_FACTOR
+               if pat in norm]
+    return matched[0][1] if len(matched) == 1 else None
+
+
 def detect_uncertainty_format(columns_with_data):
     """
     'CF-1.7' if any CF-1.7-only uncertainty column carries data, else
@@ -1197,11 +1218,10 @@ def detect_uncertainty_format(columns_with_data):
     return None
 
 
-def load_netcdf_profile(jar_file_path):
-    print(f"[INFO] Opening jar archive: {os.path.basename(jar_file_path)}")
+def load_netcdf_profile(nc_file_path):
+    print(f"[INFO] Opening NetCDF file: {os.path.basename(nc_file_path)}")
     try:
-        nc_bytes, internal_nc_name = extract_netcdf_bytes_from_jar(jar_file_path)
-        nc4_dataset = nc4.Dataset(internal_nc_name, memory=nc_bytes)
+        nc4_dataset = nc4.Dataset(nc_file_path, mode="r")
         ds = xr.open_dataset(xr.backends.NetCDF4DataStore(nc4_dataset))
 
         station = ds.attrs.get("g.Site.Key", "UNKNOWN")
@@ -1218,7 +1238,7 @@ def load_netcdf_profile(jar_file_path):
             # Never substitute the processing time for the measurement
             # time: flag the profile as having an unknown date instead.
             print(f"[WARNING] Cannot parse the profile date "
-                  f"'{dt_str}' in {os.path.basename(jar_file_path)}: "
+                  f"'{dt_str}' in {os.path.basename(nc_file_path)}: "
                   f"Date set to UNKNOWN.")
             dt = "UNKNOWN"
 
@@ -1354,10 +1374,47 @@ def load_netcdf_profile(jar_file_path):
                     f"Unrecognised units '{wv_units}' for '{wv_key}': "
                     f"cannot convert to ppmv.")
 
+        # Coverage factor: bring the TOTAL uncertainties to k=2 (the unit of
+        # the PLAUSIBILITY_RULES ranges). The sonde comes from the product
+        # code of the file (global attributes, then the file name, e.g.
+        # 'LIN-RS-01_2_RS92-GDP_002_...nc'). An unrecognised sonde is an error:
+        # the file is skipped rather than evaluated with a wrong k.
+        product_candidates = [ds.attrs.get(a)
+                              for a in PRODUCT_CODE_ATTRIBUTE_CANDIDATES]
+        product_candidates.append(os.path.basename(nc_file_path))
+        native_k, product_used = None, None
+        for candidate in product_candidates:
+            native_k = native_coverage_factor(candidate)
+            if native_k is not None:
+                product_used = candidate
+                break
+        if native_k is None:
+            raise ValueError(
+                f"Cannot determine the sonde (coverage factor) from "
+                f"{[c for c in product_candidates if c is not None]}: add it "
+                f"to SENSOR_NATIVE_COVERAGE_FACTOR.")
+        # Cross-check with the explicit per-variable attribute, when present.
+        for key in ("temperature_uc_tot",):
+            for candidate in mapping[key]:
+                if candidate in ds.variables:
+                    declared = ds[candidate].attrs.get("g_coverage_factor")
+                    if declared is not None and float(declared) != native_k:
+                        print(f"[WARNING] {os.path.basename(nc_file_path)}: "
+                              f"'{candidate}' declares g_coverage_factor="
+                              f"{float(declared):g} but product '{product_used}' "
+                              f"implies k={native_k:g}.")
+                    break
+        k_factor = TARGET_COVERAGE_FACTOR / native_k
+        if k_factor != 1.0:
+            for key, values in extracted_data.items():
+                if key.endswith("_uc_tot") and values is not None:
+                    extracted_data[key] = values * k_factor
+
         df_profile = pd.DataFrame(extracted_data)
+        df_profile["native_coverage_factor"] = native_k
         df_profile["datetime"] = dt
         df_profile["station"] = station
-        df_profile["source_file"] = os.path.basename(jar_file_path)
+        df_profile["source_file"] = os.path.basename(nc_file_path)
         df_profile["tropopause_height"] = tropopause_height
         df_profile[UNC_FORMAT_COLUMN] = (uncertainty_format
                                          if uncertainty_format else "")
@@ -1369,7 +1426,7 @@ def load_netcdf_profile(jar_file_path):
             pass
         return df_profile
     except Exception as e:
-        print(f"[ERROR] Failed to process NetCDF {jar_file_path}: {e}")
+        print(f"[ERROR] Failed to process NetCDF {nc_file_path}: {e}")
         return pd.DataFrame()
 
 
@@ -1392,7 +1449,8 @@ def expected_uncertainties_from_profile(profile):
     return dict(QC_UNCERTAINTIES_BY_FORMAT[fmt])
 
 
-def process_gruan_profiles(data_source, output_log_path=OUTPUT_LOG_PATH):
+def process_gruan_profiles(data_source, output_log_path=OUTPUT_LOG_PATH,
+                           write_readme=True):
     log_records = []
     group_keys = ["datetime", "station"]
     if "source_file" in data_source.columns:
@@ -1554,35 +1612,39 @@ def process_gruan_profiles(data_source, output_log_path=OUTPUT_LOG_PATH):
         log_records.append(record)
 
     df_log = pd.DataFrame(log_records)
+    output_dir = os.path.dirname(os.path.abspath(output_log_path))
+    os.makedirs(output_dir, exist_ok=True)
     df_log.to_csv(output_log_path, index=False, na_rep="NaN")
     print(f"[SUCCESS] QC complete. Log written to: {output_log_path}")
-    generate_readme()
+    if write_readme:
+        generate_readme(output_dir)
+    return output_log_path
 
 
 # ==========================================
 # BATCH LOADING
 # ==========================================
 def load_all_profiles_from_directory(input_directory,
-                                     file_pattern=JAR_FILE_PATTERN):
-    """Loads every .jar archive matching `file_pattern` into one DataFrame."""
+                                     file_pattern=NC_FILE_PATTERN):
+    """Loads every NetCDF file matching `file_pattern` into one DataFrame."""
     search_path = os.path.join(input_directory, file_pattern)
-    jar_files = sorted(glob.glob(search_path))
+    nc_files = sorted(glob.glob(search_path))
 
-    if not jar_files:
-        print(f"[WARNING] No jar archives found in '{input_directory}' "
+    if not nc_files:
+        print(f"[WARNING] No NetCDF files found in '{input_directory}' "
               f"matching pattern '{file_pattern}'.")
         return pd.DataFrame()
 
-    print(f"[INFO] Found {len(jar_files)} jar archive(s) in "
+    print(f"[INFO] Found {len(nc_files)} NetCDF file(s) in "
           f"'{input_directory}'.")
 
     profile_frames = []
-    for jar_file_path in jar_files:
-        profile_df = load_netcdf_profile(jar_file_path)
+    for nc_file_path in nc_files:
+        profile_df = load_netcdf_profile(nc_file_path)
         if profile_df is not None and not profile_df.empty:
             profile_frames.append(profile_df)
         else:
-            print(f"[WARNING] Skipping empty/invalid profile: {jar_file_path}")
+            print(f"[WARNING] Skipping empty/invalid profile: {nc_file_path}")
 
     if not profile_frames:
         return pd.DataFrame()
@@ -1591,19 +1653,48 @@ def load_all_profiles_from_directory(input_directory,
 
 
 # ==========================================
+# PUBLIC ENTRY POINT
+# ==========================================
+def run_qc(input_directory, output_log_path, write_readme=True,
+           file_pattern=NC_FILE_PATTERN):
+    """
+    Runs the whole QC on the NetCDF files of `input_directory`.
+
+    The README.md describing the log is always written next to the CSV log,
+    even when no valid profile could be loaded.
+
+    Returns the path of the CSV log, or None when no valid profile could be
+    loaded (in which case no CSV is written).
+    """
+    all_profiles_df = load_all_profiles_from_directory(input_directory,
+                                                       file_pattern)
+    if all_profiles_df is None or all_profiles_df.empty:
+        if write_readme:
+            output_dir = os.path.dirname(os.path.abspath(output_log_path))
+            os.makedirs(output_dir, exist_ok=True)
+            generate_readme(output_dir)
+        return None
+    return process_gruan_profiles(data_source=all_profiles_df,
+                                  output_log_path=output_log_path,
+                                  write_readme=write_readme)
+
+
+# ==========================================
 # MAIN
 # ==========================================
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="GRUAN quality control of a directory of NetCDF files.")
+    parser.add_argument("--input-dir", required=True,
+                        help="Directory containing the .nc files.")
+    parser.add_argument("--output", default=OUTPUT_LOG_PATH,
+                        help="Output CSV log (default: %(default)s).")
+    cli_args = parser.parse_args()
+
     print("[INFO] Starting GRUAN Quality Control Pipeline...")
-
-    all_profiles_df = load_all_profiles_from_directory(INPUT_DIRECTORY,
-                                                       JAR_FILE_PATTERN)
-
-    if all_profiles_df is not None and not all_profiles_df.empty:
-        process_gruan_profiles(data_source=all_profiles_df,
-                               output_log_path=OUTPUT_LOG_PATH)
-    else:
-        print("[ERROR] No valid jar archives were successfully loaded. "
+    if run_qc(cli_args.input_dir, cli_args.output) is None:
+        print("[ERROR] No valid NetCDF files were successfully loaded. "
               "Execution aborted.")
-        print("[INFO] Generating documentation file anyway...")
-        generate_readme()
+        raise SystemExit(1)

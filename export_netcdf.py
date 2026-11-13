@@ -116,6 +116,29 @@ UNIT_TRANSFORMS: dict[str, tuple[float, float]] = {
     'u_rh':             (100.0, 0.0),
 }
 
+# ── coverage-factor harmonisation (k=2) ───────────────────────────────────────
+# GRUAN files give the TOTAL uncertainty with a coverage factor that depends on
+# the sonde: RS41 -> k=2, RS92 / RS-11G / IMS-100 -> k=1. Before the plausibility
+# QC and the export, the total uncertainties of the k=1 sondes are multiplied by
+# TARGET_COVERAGE_FACTOR / k_native, so the whole dataset is at k=2.
+#   * ONLY the total uncertainties are scaled (uc_tot_cf_1_4 / uc_tot_cf_1_7 of
+#     CDM_VARIABLES, i.e. uncertainty_value5). Random (uncertainty_value1) and
+#     systematic (uncertainty_value2) uncertainties are NOT touched.
+#   * The unc_range / check_range of qc_pipeline are defined for k=2 and are
+#     NOT changed.
+# The sonde is recognised from g_product_code / g_product_key (the same columns
+# as sensor_id). Matching is case-insensitive, ignores '-', '_' and spaces and
+# looks for the pattern anywhere in the product code (e.g. 'RS92-GDP.2' ->
+# 'RS92GDP.2' contains 'RS92'). A product code that matches no pattern (or a
+# missing one) STOPS the export: a wrong k would silently corrupt the data.
+# The sonde -> k table and the matching rule live in qc_pipeline (single source
+# of truth, also used by qc_pipeline.load_netcdf_profile on the native files).
+TARGET_COVERAGE_FACTOR = qc_pipeline.TARGET_COVERAGE_FACTOR
+SENSOR_NATIVE_COVERAGE_FACTOR = qc_pipeline.SENSOR_NATIVE_COVERAGE_FACTOR
+# DB columns of the total uncertainties, derived from CDM_VARIABLES (single source of truth)
+COVERAGE_HARMONIZED_COLUMNS = tuple(sorted(
+    {c for entry in CDM_VARIABLES for c in (entry[8], entry[9]) if c}))
+
 # ── plausibility QC configuration ─────────────────────────────────────────────
 # Before writing the NetCDF, every level of every sounding (profile identified
 # by g_product_id) is checked with the plausibility rules of qc_pipeline.py.
@@ -343,7 +366,7 @@ QC_RH_DEPENDENT_REPORT_VARIABLES = {
 # TIMER collects one month; export_month prints its report and folds it into
 # RUN_TIMER, which main() prints at the end (whole run).
 
-SCRIPT_REVISION = '2026-11-09a'   # shown in the log header: tells which code produced a log
+SCRIPT_REVISION = '2026-11-12a'   # shown in the log header: tells which code produced a log
 PG_SESSION_SETTINGS = []   # [(name, value)] applied with SET to every connection (--pg-set)
 LOG_PATH = None     # set by init_log(); None = no log file
 
@@ -1045,6 +1068,50 @@ def merge_implausibility_reports(output_dir):
     return final_path, n_rows
 
 
+def harmonize_coverage_factor(df_merged: pd.DataFrame,
+                              target_k: float = TARGET_COVERAGE_FACTOR) -> pd.DataFrame:
+    """Bring the TOTAL uncertainties of every sounding to coverage factor
+    `target_k` (multiplying by target_k / k_native). Random and systematic
+    uncertainties are left untouched. Must run BEFORE the plausibility QC.
+
+    Raises ValueError if a product code is missing or not in
+    SENSOR_NATIVE_COVERAGE_FACTOR."""
+    code = df_merged['g_product_code']
+    if 'g_product_key' in df_merged.columns:
+        code = code.fillna(df_merged['g_product_key'])
+    codes, uniques = pd.factorize(code.fillna('').astype(str))
+
+    native = {u: qc_pipeline.native_coverage_factor(u) for u in uniques}
+    unknown = sorted(u or '<empty>' for u, k in native.items() if k is None)
+    if unknown:
+        raise ValueError(
+            f"Coverage factor unknown for product code(s) {unknown}: add them to "
+            f"qc_pipeline.SENSOR_NATIVE_COVERAGE_FACTOR (no data written for this month).")
+
+    factor_per_code = np.array([target_k / native[u] for u in uniques])
+    factor = factor_per_code[codes]                       # one factor per level
+    to_scale = factor != 1.0
+
+    print("  Coverage factor (target k=%g):" % target_k)
+    for i, u in enumerate(uniques):
+        n = int((codes == i).sum())
+        action = ('unchanged' if factor_per_code[i] == 1.0
+                  else f"total uncertainties x {factor_per_code[i]:g}")
+        print(f"    {u:<24} native k={native[u]:g}  {n:>12,} levels  -> {action}")
+    if not to_scale.any():
+        return df_merged
+
+    for column in COVERAGE_HARMONIZED_COLUMNS:
+        if column not in df_merged.columns:
+            continue
+        col = df_merged[column]
+        if not (isinstance(col.dtype, np.dtype) and col.dtype.kind == 'f'):
+            col = pd.to_numeric(col, errors='coerce')
+        # factor is 1.0 or 2.0: exact in floating point, dtype (float32/64) kept
+        df_merged[column] = col * factor.astype(col.dtype)
+    return df_merged
+
+
 def apply_plausibility_qc(df_merged: pd.DataFrame,
                           nullify_uncertainties: bool = QC_NULLIFY_UNCERTAINTIES,
                           max_altitude_m=QC_MAX_ALTITUDE_M,
@@ -1555,7 +1622,11 @@ def _write_cdm_netcdf_to(cdm, output_file: Path, threads: int = None):
 
         # ── uncertainties ─────────────────────────────────────────────────────
         for idx in (1, 2, 5):
-            w.float32(f'uncertainty_value{idx}', cdm[f'uncertainty_value{idx}'])
+            extra = ({'comment': f'total uncertainty harmonised to coverage factor '
+                                 f'k={TARGET_COVERAGE_FACTOR:g}',
+                      'coverage_factor': np.float32(TARGET_COVERAGE_FACTOR)}
+                     if idx == 5 else {})
+            w.float32(f'uncertainty_value{idx}', cdm[f'uncertainty_value{idx}'], **extra)
             w.uint8(f'uncertainty_type{idx}',    cdm[f'uncertainty_type{idx}'])
             w.uint16(f'uncertainty_units{idx}',  cdm[f'uncertainty_units{idx}'])
 
@@ -2002,6 +2073,10 @@ def export_month(conn_params, year, month, output_dir,
     del df_data, df_header                  # free ~1.7 KB per level before the CDM build
     print(f"  Merged rows : {len(df_merged):,}")
 
+    # ── coverage factor -> k=2 (BEFORE the QC, whose ranges are defined for k=2)
+    with TIMER('harmonize_coverage_factor'):
+        df_merged = harmonize_coverage_factor(df_merged)
+
     # ── plausibility QC (must run BEFORE the unit transforms) ─────────────────
     if apply_qc:
         with TIMER('plausibility_qc'):
@@ -2357,6 +2432,7 @@ def main():
             f"read={args.read_method}, cdm={'legacy' if args.legacy_cdm else 'lean'}, jobs={args.jobs}, "
             f"pg_set={dict(PG_SESSION_SETTINGS) or '-'}, "
             f"deflate={DEFLATE_LEVEL}, qc={'off' if args.skip_qc else 'on'}, "
+            f"total_uc_k={TARGET_COVERAGE_FACTOR:g} (native: {dict(SENSOR_NATIVE_COVERAGE_FACTOR)}), "
             f"max_alt={MAX_ALTITUDE_M} m",
             f"output  : {output_dir}",
         ])
